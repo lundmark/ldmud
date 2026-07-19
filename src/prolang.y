@@ -11552,12 +11552,18 @@ statement:
 
               ins_f_code(F_FBRANCH);
               ins_jump_offset(current_break_address & BREAK_ADDRESS_MASK);
-              if ((uint64_t)CURRENT_PROGRAM_SIZE >= (uint64_t)INT32_MAX)
+              if ((CURRENT_PROGRAM_SIZE - sizeof(int32)) > (p_uint)BREAK_ADDRESS_MASK
+               || (uint64_t)CURRENT_PROGRAM_SIZE >= (uint64_t)INT32_MAX)
+              {
+                  /* The program is too large to encode the break back-patch
+                   * address. Abort with a clean error and terminate the chain
+                   * so the (now doomed) compilation cannot walk a corrupted
+                   * offset. */
                   yyerror("program too large: bytecode offset overflow");
-              current_break_address = CURRENT_PROGRAM_SIZE - sizeof(int32);
-              if (current_break_address > BREAK_ADDRESS_MASK)
-                  yyerrorf("Compiler limit: (L_BREAK) value too large: %"PRIdPINT
-                          , current_break_address);
+                  current_break_address = BREAK_DELIMITER;
+              }
+              else
+                  current_break_address = CURRENT_PROGRAM_SIZE - sizeof(int32);
           }
           $$ = (struct statement_s){ .may_return = false, .may_break = true, .may_continue = false, .may_finish = false, .is_empty = false, .warned_dead_code = false };
       }
