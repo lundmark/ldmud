@@ -348,6 +348,19 @@ mdb_log_sbrk (p_int size)
 #  include "smalloc.c"
 #elif defined(MALLOC_slaballoc)
 #  include "valgrind/memcheck.h"
+#  ifdef NVALGRIND
+     /* The disabled client request macros expand to their bare default
+      * value, which -Wunused-value objects to when they are used as
+      * statements. Replace the ones the allocator uses with real no-ops
+      * that still evaluate their arguments.
+      */
+#    undef VALGRIND_MAKE_MEM_NOACCESS
+#    undef VALGRIND_MAKE_MEM_UNDEFINED
+#    undef VALGRIND_MAKE_MEM_DEFINED
+#    define VALGRIND_MAKE_MEM_NOACCESS(_qzz_addr,_qzz_len)  ((void)(_qzz_addr), (void)(_qzz_len))
+#    define VALGRIND_MAKE_MEM_UNDEFINED(_qzz_addr,_qzz_len) ((void)(_qzz_addr), (void)(_qzz_len))
+#    define VALGRIND_MAKE_MEM_DEFINED(_qzz_addr,_qzz_len)   ((void)(_qzz_addr), (void)(_qzz_len))
+#  endif
 #  include "slaballoc.c"
 #elif defined(MALLOC_sysmalloc)
 #  define NVALGRIND
