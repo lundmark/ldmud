@@ -338,6 +338,10 @@ mdb_log_sbrk (p_int size)
  * otherwise we are in trouble...
  */
 
+#ifndef SUPPORT_VALGRIND
+#  define NVALGRIND
+#endif
+
 #if defined(MALLOC_smalloc)
 #  define NVALGRIND
 #  include "valgrind/memcheck.h"
@@ -351,10 +355,6 @@ mdb_log_sbrk (p_int size)
 #  include "sysmalloc.c"
 #else
 #  error "No allocator specified."
-#endif
-
-#ifndef SUPPORT_VALGRIND
-#  define NVALGRIND
 #endif
 
 #ifndef GRANULARITY
