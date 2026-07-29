@@ -40,6 +40,11 @@ void run_test()
     msg("\nRunning restore tests:\n"
           "----------------------\n");
 
+    /* Fail-safe: if an uncaught error aborts run_test(), still
+     * shut down (as failure) instead of hanging.
+     */
+    call_out(#'shutdown, 0, 1);
+
     /* --- Round trip through save_object()/restore_object() --- */
 
     m = ([ "outer": ([ "inner": ({ 1, 2, ({ 3, "four" }) }),
@@ -141,6 +146,11 @@ void run_test()
           restore_object("#1:0\nzzz_gone ([\"p\":1,])\na <1>=({4,})\nb <1>\n") == 1
           && a == b && deep_eq(a, ({4})));
 
+    reset_vars();
+    check("restore: malformed value on unknown variable line is skipped",
+          restore_object("#1:0\nzzz_gone ([\"broken\":1\nx 3\n") == 1
+          && x == 3);
+
     /* --- restore_value() uses the same mapping parser --- */
 
     check("restore_value: nested mapping round trip",
@@ -163,6 +173,8 @@ void run_test()
     reset_vars();
     check("restore: unterminated mapping on known variable throws",
           catch(restore_object("#1:0\nm ([\"a\":1,")) != 0);
+
+    remove_call_out(#'shutdown);
 
     if (errors)
         shutdown(1);

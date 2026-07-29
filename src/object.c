@@ -10636,10 +10636,17 @@ static int nesting = 0;  /* Used to detect recursive calls */
              * not found in the shared string table or in the object.
              * That means we can eventually discard this line, but first
              * we have to parse it in case it contains the definition
-             * of a shared array some other variable might use.
-             *
-             * Therefore we create a dummy variable and initialize
-             * it to svalue-int, so that it can be freed without remorse.
+             * of a shared value some other variable might use. Shared
+             * value definitions and references are written as '<id>',
+             * so a line without any '<' character can't affect them
+             * and is skipped without parsing.
+             */
+
+            if (strchr(space+1, '<') == NULL)
+                break; /* Leaves v == NULL: skip the line. */
+
+            /* Create a dummy variable and initialize it to svalue-int,
+             * so that it can be freed without remorse.
              */
 
             {
@@ -10669,6 +10676,21 @@ static int nesting = 0;  /* Used to detect recursive calls */
             }
 
         } while (MY_FALSE);
+
+        /* Skip the line of an unknown variable whose value can't
+         * contain shared value definitions.
+         */
+        if (v == NULL)
+        {
+            if (!file)
+            {
+                char *nl = strchr(space+1, '\n');
+                if (!nl)
+                    break;
+                cur = nl+1;
+            }
+            continue;
+        }
 
         /* Get rid of the old value in v */
 
