@@ -49,6 +49,15 @@ DESCRIPTION
 
         Telnet Related Information:
 
+        <what> == IC_MXP:
+          Returns the MXP/Pueblo state of <ob> as a bitmask. The request
+          bits MXP_TELOPT and MXP_PUEBLO indicate which driver-assisted
+          protocol detection was configured with configure_interactive().
+          The active bits MXP_TELOPT_ACTIVE and MXP_PUEBLO_ACTIVE indicate
+          that the client acknowledged TELOPT_MXP or sent the Pueblo
+          client response line. There is no default IC_MXP query for
+          future interactives.
+
         <what> == II_MCCP_STATS:
           Statistics about the current compression of <ob> given
           as an array ({ uncompressed bytes, compressed bytes }).
@@ -112,6 +121,7 @@ DESCRIPTION
 
 HISTORY
         Introduced in LDMud 3.5.0.
+        IC_MXP introduced in LDMud 3.6.8.
 
 SEE ALSO
         configure_interactive(E), object_info(E), driver_info(E)

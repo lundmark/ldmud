@@ -95,6 +95,27 @@ DESCRIPTION
           part of the user input. Also INPUT_NOECHO won't be effective
           as the driver won't send any telnet negotiations itself.
 
+        <what> == IC_MXP
+          Configures driver-assisted MXP/Pueblo detection for <ob>.
+          <data> is a bitmask of request bits from <configuration.h>.
+
+          MXP_TELOPT asks the driver to negotiate the MXP telnet option
+          by sending IAC DO TELOPT_MXP when the telnet machine is
+          enabled. If the client answers WILL TELOPT_MXP, the driver
+          sets MXP_TELOPT_ACTIVE. If H_NOECHO lets the mudlib handle
+          telnet negotiation, this request bit is only stored and the
+          driver does not negotiate TELOPT_MXP.
+
+          MXP_PUEBLO asks the driver to recognize an initial Pueblo
+          client response line whose first token is PUEBLOCLIENT. The
+          line is consumed, MXP_PUEBLO_ACTIVE is set, and the driver
+          sends the Pueblo HTML-mode switch sequence.
+
+          Only MXP_TELOPT and MXP_PUEBLO may be configured. The active
+          bits MXP_TELOPT_ACTIVE and MXP_PUEBLO_ACTIVE are reported by
+          interactive_info() and cannot be set directly. There is no
+          default IC_MXP setting for future interactives.
+
         <what> == IC_MCCP
           Starts oder ends MCCP compression of the driver -> client traffic.
           <data> must be the MCCP version (either TELOPT_COMPRESS or
@@ -147,6 +168,7 @@ DESCRIPTION
 HISTORY
         Introduced in LDMud 3.3.719.
         IC_ENCODING introduced in LDMud 3.6.0.
+        IC_MXP introduced in LDMud 3.6.8.
 
 
 SEE ALSO

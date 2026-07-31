@@ -204,6 +204,7 @@ struct interactive_s {
 
     CBool closing;              /* True when closing this socket. */
     CBool tn_enabled;           /* True: telnet machine enabled */
+    char mxp;                   /* MXP/Pueblo requested and active state. */
     char do_close;              /* Bitflags: Close this down; Proto-ERQ. */
     char noecho;                /* Input mode bitflags */
 

@@ -443,6 +443,13 @@ static void (*telopts_do  [NTELOPTS])(int);
 static void (*telopts_dont[NTELOPTS])(int);
 static void (*telopts_will[NTELOPTS])(int);
 static void (*telopts_wont[NTELOPTS])(int);
+static Bool telopts_are_driver_owned = MY_TRUE;
+
+#define MXP_REQUEST_MASK (MXP_TELOPT|MXP_PUEBLO)
+#define MXP_ACTIVE_MASK  (MXP_TELOPT_ACTIVE|MXP_PUEBLO_ACTIVE)
+#define MXP_PUBLIC_MASK  (MXP_REQUEST_MASK|MXP_ACTIVE_MASK)
+#define MXP_TELOPT_SENT    0x10
+#define MXP_PUEBLO_CHECKED 0x20
 
   /* Tables with the telnet statemachine handlers.
    */
@@ -740,6 +747,7 @@ comm_fatal (interactive_t *ip, char *fmt, ...)
       dump_bytes(&(ip->addr), sizeof(ip->addr), 21);
     fprintf(stderr, "  .closing:           %02hhx\n", (unsigned char)ip->closing);
     fprintf(stderr, "  .tn_enabled:        %02hhx\n", (unsigned char)ip->tn_enabled);
+    fprintf(stderr, "  .mxp:               %02hhx\n", (unsigned char)ip->mxp);
     fprintf(stderr, "  .do_close:          %02hhx", (unsigned char)ip->do_close);
       if (ip->do_close & (FLAG_DO_CLOSE|FLAG_PROTO_ERQ)) fprintf(stderr, " (");
       if (ip->do_close & FLAG_DO_CLOSE) fprintf(stderr, "DO_CLOSE");
@@ -3673,6 +3681,7 @@ new_player ( object_t *ob, SOCKET_T new_socket
     new_interactive->modify_command = NULL;
     new_interactive->closing = MY_FALSE;
     new_interactive->tn_enabled = MY_TRUE;
+    new_interactive->mxp = 0;
     new_interactive->do_close = 0;
     new_interactive->noecho = 0;
     new_interactive->supress_go_ahead = MY_FALSE;
@@ -4664,6 +4673,97 @@ send_do (int option)
 
 /*-------------------------------------------------------------------------*/
 static void
+send_bytes_to_interactive (interactive_t *ip, const char *bytes, size_t len)
+
+/* Send <bytes> directly to <ip>, preserving the previous command_giver.
+ */
+
+{
+    object_t *save_command_giver = command_giver;
+
+    if (ip == NULL || ip->ob == NULL || (ip->ob->flags & O_DESTRUCTED))
+        return;
+
+    command_giver = ip->ob;
+    add_message_bytes(bytes, len);
+    add_message_flush();
+    command_giver = save_command_giver;
+} /* send_bytes_to_interactive() */
+
+/*-------------------------------------------------------------------------*/
+static void
+send_telnet_option_to_interactive (interactive_t *ip, char action, char option)
+
+/* Send IAC <action> <option> directly to <ip>.
+ */
+
+{
+    char msg[3];
+
+    msg[0] = (char) IAC;
+    msg[1] = action;
+    msg[2] = option;
+
+    send_bytes_to_interactive(ip, msg, sizeof(msg));
+} /* send_telnet_option_to_interactive() */
+
+/*-------------------------------------------------------------------------*/
+static void
+request_mxp_telopt (interactive_t *ip)
+
+/* Request MXP telnet support from <ip>, if configured and possible.
+ */
+
+{
+    if (ip->tn_enabled
+     && telopts_are_driver_owned
+     && (ip->mxp & MXP_TELOPT)
+     && !(ip->mxp & (MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE)))
+    {
+        send_telnet_option_to_interactive(ip, (char)DO, (char)TELOPT_MXP);
+        ip->mxp |= MXP_TELOPT_SENT;
+    }
+} /* request_mxp_telopt() */
+
+/*-------------------------------------------------------------------------*/
+static bool
+is_pueblo_client_command (const char *str, size_t len)
+
+/* Return true if <str> is the Pueblo client response line.
+ */
+
+{
+    static const char pueblo[] = "PUEBLOCLIENT";
+    size_t pueblo_len = sizeof(pueblo) - 1;
+
+    if (len < pueblo_len)
+        return false;
+
+    if (memcmp(str, pueblo, pueblo_len) != 0)
+        return false;
+
+    return len == pueblo_len
+        || str[pueblo_len] == ' '
+        || str[pueblo_len] == '\t'
+        || str[pueblo_len] == '\v'
+        || str[pueblo_len] == '\f';
+} /* is_pueblo_client_command() */
+
+/*-------------------------------------------------------------------------*/
+static void
+send_pueblo_html_mode (interactive_t *ip)
+
+/* Send the Pueblo sequence that switches the client to HTML mode.
+ */
+
+{
+    static const char mode[] = "</xch_mudtext><xch_mode=html>";
+
+    send_bytes_to_interactive(ip, mode, sizeof(mode) - 1);
+} /* send_pueblo_html_mode() */
+
+/*-------------------------------------------------------------------------*/
+static void
 reply_to_do_echo (int option)
 
 /* Send IAC WONT <option> if we don't want noecho mode.
@@ -4857,6 +4957,48 @@ mccp_telnet_neg (int option)
 } /* mccp_telnet_neg() */
 
 /*-------------------------------------------------------------------------*/
+static void
+mxp_telnet_neg (int option)
+
+/* Handle MXP telnet option negotiation.
+ */
+
+{
+    interactive_t *ip = O_GET_INTERACTIVE(command_giver);
+
+    switch (ip->tn_state)
+    {
+    case TS_WILL:
+        if (ip->mxp & MXP_TELOPT)
+        {
+            if (!(ip->mxp & MXP_TELOPT_SENT))
+            {
+                send_do(option);
+                ip->mxp |= MXP_TELOPT_SENT;
+            }
+            ip->mxp |= MXP_TELOPT_ACTIVE;
+        }
+        else
+        {
+            send_dont(option);
+        }
+        break;
+
+    case TS_WONT:
+        ip->mxp &= ~(MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE);
+        break;
+
+    case TS_DO:
+        send_wont(option);
+        break;
+
+    case TS_DONT:
+        ip->mxp &= ~(MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE);
+        break;
+    }
+} /* mxp_telnet_neg() */
+
+/*-------------------------------------------------------------------------*/
 static svalue_t *
 h_telnet_neg (int n)
 
@@ -4952,6 +5094,8 @@ init_telopts (void)
 {
     int i;
 
+    telopts_are_driver_owned = MY_TRUE;
+
     /* Pass all telnet options that we're not
      * able to handle to the mudlib.
      */
@@ -4993,6 +5137,11 @@ init_telopts (void)
     telopts_dont[TELOPT_COMPRESS2] = mccp_telnet_neg;
     telopts_will[TELOPT_COMPRESS2] = mccp_telnet_neg;
     telopts_wont[TELOPT_COMPRESS2] = mccp_telnet_neg;
+
+    telopts_do[TELOPT_MXP] = mxp_telnet_neg;
+    telopts_dont[TELOPT_MXP] = mxp_telnet_neg;
+    telopts_will[TELOPT_MXP] = mxp_telnet_neg;
+    telopts_wont[TELOPT_MXP] = mxp_telnet_neg;
 } /* init_telopts() */
 
 /*-------------------------------------------------------------------------*/
@@ -5008,6 +5157,7 @@ mudlib_telopts (void)
     int i;
 
     DT(("All telnet options set to the mudlib.\n"));
+    telopts_are_driver_owned = MY_FALSE;
     for (i = NTELOPTS; --i >= 0; ) {
         telopts_do[i] = telopts_dont[i] =
           telopts_will[i] = telopts_wont[i] = reply_h_telnet_neg;
@@ -5146,6 +5296,7 @@ telnet_neg (interactive_t *ip)
                 char *command_to = command_from;                                /* Where to put the processed chars. */
                 char *command_end = ip->command + ip->command_unprocessed_end;  /* End of the unprocessed chars. */
                 bool ready = false;                                             /* Whether we have a command to return. */
+                bool line_ready = false;                                        /* Whether a line mode command is ready. */
 
                 if (ip->command_start > 1)
                 {
@@ -5269,6 +5420,8 @@ telnet_neg (interactive_t *ip)
 
                             set_tn_state(ip, TS_READY);
 
+                            if (!charmode)
+                                line_ready = true;
                             ready = true;
                             break;
                         }
@@ -5279,7 +5432,36 @@ telnet_neg (interactive_t *ip)
                     }
 
                     if (ready)
+                    {
+                        if (line_ready
+                         && !(ip->mxp & MXP_PUEBLO_CHECKED))
+                        {
+                            ip->mxp |= MXP_PUEBLO_CHECKED;
+
+                            if ((ip->mxp & MXP_PUEBLO)
+                             && !(ip->mxp & MXP_PUEBLO_ACTIVE)
+                             && is_pueblo_client_command(ip->command + ip->command_start,
+                                    command_to - (ip->command + ip->command_start)))
+                            {
+                                size_t remaining = command_end - command_from;
+                                char *line_start = ip->command + ip->command_start;
+
+                                ip->mxp |= MXP_PUEBLO_ACTIVE;
+                                send_pueblo_html_mode(ip);
+
+                                memmove(line_start, command_from, remaining);
+                                command_from = line_start;
+                                command_to = line_start;
+                                command_end = line_start + remaining;
+                                ready = false;
+                                line_ready = false;
+                                set_tn_state(ip, TS_DATA);
+                                continue;
+                            }
+                        }
+
                         break;
+                    }
 
                     command_from++;
 
@@ -8867,6 +9049,41 @@ f_configure_interactive (svalue_t *sp)
             efun_exp_arg_error(3, TF_NUMBER, sp, sp);
 
         ip->tn_enabled = (sp->u.number != 0);
+        if (ip->tn_enabled)
+            request_mxp_telopt(ip);
+        else
+            ip->mxp &= ~(MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE);
+        break;
+
+    case IC_MXP:
+        if (!ip)
+            errorf("Default value for IC_MXP is not supported.\n");
+
+        if (sp->type != T_NUMBER)
+            efun_exp_arg_error(3, TF_NUMBER, sp, sp);
+
+        if (sp->u.number & ~(p_int)MXP_REQUEST_MASK)
+            errorf("Illegal value to arg 3 of configure_interactive with IC_MXP: %ld.\n",
+                (long)sp->u.number);
+
+        {
+            char old_mxp = ip->mxp;
+            char new_mxp = (char)((sp->u.number & MXP_REQUEST_MASK)
+                              | (old_mxp & MXP_PUEBLO_CHECKED));
+
+            if (new_mxp & MXP_TELOPT)
+                new_mxp |= old_mxp & (MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE);
+            else if (ip->tn_enabled
+                  && telopts_are_driver_owned
+                  && (old_mxp & (MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE)))
+                send_telnet_option_to_interactive(ip, (char)DONT, (char)TELOPT_MXP);
+
+            if (new_mxp & MXP_PUEBLO)
+                new_mxp |= old_mxp & (MXP_PUEBLO_ACTIVE|MXP_PUEBLO_CHECKED);
+
+            ip->mxp = new_mxp;
+            request_mxp_telopt(ip);
+        }
         break;
 
 #ifdef USE_MCCP
@@ -9134,6 +9351,12 @@ f_interactive_info (svalue_t *sp)
         if (!ip)
             errorf("Default value for IC_TELNET_ENABLED is not supported.\n");
         put_number(&result, ip->tn_enabled != 0);
+        break;
+
+    case IC_MXP:
+        if (!ip)
+            errorf("Default value for IC_MXP is not supported.\n");
+        put_number(&result, ip->mxp & MXP_PUBLIC_MASK);
         break;
 
 #ifdef USE_MCCP
