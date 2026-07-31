@@ -19,6 +19,14 @@
 #define IC_MAX_COMMANDS                 10
 #define IC_MODIFY_COMMAND               11
 #define IC_ENCODING                     12
+#define IC_MXP                          13
+
+/* Bit values for IC_MXP.
+ */
+#define MXP_TELOPT                      0x01
+#define MXP_PUEBLO                      0x02
+#define MXP_TELOPT_ACTIVE               0x04
+#define MXP_PUEBLO_ACTIVE               0x08
 
 /* Possible options for configure_object().
  */
