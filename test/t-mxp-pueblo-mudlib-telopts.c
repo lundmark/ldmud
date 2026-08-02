@@ -2,6 +2,7 @@
 
 #include "/inc/base.inc"
 #include "/inc/client.inc"
+#include "/inc/deep_eq.inc"
 
 #include "/sys/input_to.h"
 #include "/sys/telnet.h"
@@ -13,10 +14,16 @@
 
 int server_done;
 int client_done;
-string html_expected = "</xch_mudtext><xch_mode=html>";
+int test_failed;
+string html_expected = "</xch_mudtext><img xch_mode=html>";
 object client;
 
 void check_done();
+
+void record_failure()
+{
+    test_failed = 1;
+}
 
 void set_client(object ob)
 {
@@ -31,6 +38,7 @@ object get_client()
 void fail(string text)
 {
     msg("FAILURE: %s\n", text);
+    __MASTER_OBJECT__->record_failure();
     shutdown(1);
 }
 
@@ -57,7 +65,7 @@ void client_success()
 
 void check_done()
 {
-    if (server_done && client_done)
+    if (!test_failed && server_done && client_done)
     {
         msg("Success.\n");
         shutdown(0);
@@ -68,6 +76,7 @@ void timeout()
 {
     msg("FAILURE: Timed out, server_done=%d, client_done=%d.\n",
         server_done, client_done);
+    __MASTER_OBJECT__->record_failure();
     shutdown(1);
 }
 
@@ -79,6 +88,7 @@ void receive_server_command(string str)
     if (str != "look")
     {
         msg("FAILURE: Server received %O instead of %O.\n", str, "look");
+        __MASTER_OBJECT__->record_failure();
         shutdown(1);
     }
 
@@ -87,6 +97,7 @@ void receive_server_command(string str)
     if (state != expected)
     {
         msg("FAILURE: MXP state is 0x%x instead of 0x%x.\n", state, expected);
+        __MASTER_OBJECT__->record_failure();
         shutdown(1);
     }
 
@@ -106,6 +117,7 @@ void receive_client_line(string str)
     {
         msg("FAILURE: Client received %O instead of %O.\n",
             received, expected);
+        __MASTER_OBJECT__->record_failure();
         shutdown(1);
     }
 

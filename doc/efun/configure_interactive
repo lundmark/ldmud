@@ -100,11 +100,17 @@ DESCRIPTION
           <data> is a bitmask of request bits from <configuration.h>.
 
           MXP_TELOPT asks the driver to negotiate the MXP telnet option
-          by sending IAC DO TELOPT_MXP when the telnet machine is
-          enabled. If the client answers WILL TELOPT_MXP, the driver
+          by sending IAC WILL TELOPT_MXP when the telnet machine is
+          enabled. If the client answers DO TELOPT_MXP, the driver
           sets MXP_TELOPT_ACTIVE. If H_NOECHO lets the mudlib handle
           telnet negotiation, this request bit is only stored and the
-          driver does not negotiate TELOPT_MXP.
+          driver does not negotiate TELOPT_MXP. Clearing MXP_TELOPT
+          sends IAC WONT TELOPT_MXP if the driver previously offered
+          the option.
+
+          MXP_TELOPT_ACTIVE reports only that the client accepted the
+          option. The mudlib remains responsible for sending MXP mode
+          escapes and markup.
 
           MXP_PUEBLO asks the driver to recognize an initial Pueblo
           client response line whose first token is PUEBLOCLIENT. The
