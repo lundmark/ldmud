@@ -876,6 +876,34 @@ set_socket_nonblocking (SOCKET_T new_socket)
 
 /*-------------------------------------------------------------------------*/
 static void
+write_socket_best_effort (SOCKET_T socket, const char *message, size_t length)
+
+/* Write as much of <message> as the nonblocking <socket> currently accepts.
+ * Retry interrupted writes and stop on any other error.
+ */
+
+{
+    int retries = 6;
+
+    while (length > 0)
+    {
+        ssize_t written = (ssize_t)socket_write(socket, message, length);
+
+        if (written > 0)
+        {
+            message += written;
+            length -= written;
+            retries = 6;
+        }
+        else if (written < 0 && errno == EINTR && --retries > 0)
+            continue;
+        else
+            break;
+    }
+} /* write_socket_best_effort() */
+
+/*-------------------------------------------------------------------------*/
+static void
 set_close_on_exec (SOCKET_T new_socket)
 
 /* Set that <new_socket> is closed when the driver performs an exec()
@@ -1299,7 +1327,7 @@ urgent_data_handler (int signo)
 
 {
     if (d_flag)
-        write(2, "received urgent data\n", 21);
+        write_bytes(2, "received urgent data\n", 21);
     urgent_data = MY_TRUE;
     urgent_data_time = current_time;
 }
@@ -2873,10 +2901,10 @@ get_message (char *buff, size_t *bufflength)
                     char buf[MAX_TEXT];
 #ifdef USE_TLS
                     if (ip->tls_status != TLS_INACTIVE)
-                        tls_read(ip, buf, MAX_TEXT);
+                        l = tls_read(ip, buf, MAX_TEXT);
                     else
 #endif
-                        socket_read(ip->socket, buf, MAX_TEXT);
+                        l = socket_read(ip->socket, buf, MAX_TEXT);
 
                     continue;
                 }
@@ -3312,7 +3340,8 @@ remove_interactive (object_t *ob, Bool force)
 
         erq_demon = interactive->socket;
         erq_proto_demon = -1;
-        socket_write(erq_demon, erq_welcome, sizeof erq_welcome);
+        write_socket_best_effort(erq_demon, (char *)erq_welcome,
+                                 sizeof erq_welcome);
     }
     else
 #endif
@@ -3589,8 +3618,8 @@ new_player ( object_t *ob, SOCKET_T new_socket
 
     if (message)
     {
-        socket_write(new_socket, message, strlen(message));
-        socket_write(new_socket, "\r\n", 2);
+        write_socket_best_effort(new_socket, message, strlen(message));
+        write_socket_best_effort(new_socket, "\r\n", 2);
         socket_close(new_socket);
         return;
     }
@@ -3609,12 +3638,12 @@ new_player ( object_t *ob, SOCKET_T new_socket
             string_t *msg;
 
             msg = driver_hook[H_NO_IPC_SLOT].u.str;
-            socket_write(new_socket, get_txt(msg), mstrsize(msg));
+            write_socket_best_effort(new_socket, get_txt(msg), mstrsize(msg));
         }
         else
         {
             message = "The mud is full. Come back later.\r\n";
-            socket_write(new_socket, message, strlen(message));
+            write_socket_best_effort(new_socket, message, strlen(message));
         }
         socket_close(new_socket);
         debug_message("%s Out of IPC slots for new connection.\n"
@@ -3627,7 +3656,7 @@ new_player ( object_t *ob, SOCKET_T new_socket
     if (O_IS_INTERACTIVE(master_ob))
     {
         message = "Cannot accept connections. Come back later.\r\n";
-        socket_write(new_socket, message, strlen(message));
+        write_socket_best_effort(new_socket, message, strlen(message));
         socket_close(new_socket);
         debug_message("%s Master still busy with previous new connection.\n"
                      , time_stamp());
@@ -3640,7 +3669,7 @@ new_player ( object_t *ob, SOCKET_T new_socket
     if (!new_interactive)
     {
         message = "Cannot accept connection (out of memory). Come back later.\r\n";
-        socket_write(new_socket, message, strlen(message));
+        write_socket_best_effort(new_socket, message, strlen(message));
         socket_close(new_socket);
         debug_message("%s Out of memory (%zu bytes) for new connection.\n"
                      , time_stamp(), sizeof(interactive_t));
@@ -3730,7 +3759,7 @@ new_player ( object_t *ob, SOCKET_T new_socket
             debug_message("%s Error setting up initial encoding: %s.\n", time_stamp(), strerror(errno));
 
         message = "Error setting up encoding.\r\n";
-        socket_write(new_socket, message, strlen(message));
+        write_socket_best_effort(new_socket, message, strlen(message));
         socket_close(new_socket);
 
         O_GET_INTERACTIVE(master_ob) = NULL;
@@ -4709,9 +4738,9 @@ send_telnet_option_to_interactive (interactive_t *ip, char action, char option)
 
 /*-------------------------------------------------------------------------*/
 static void
-request_mxp_telopt (interactive_t *ip)
+offer_mxp_telopt (interactive_t *ip)
 
-/* Request MXP telnet support from <ip>, if configured and possible.
+/* Offer MXP telnet support to <ip>, if configured and possible.
  */
 
 {
@@ -4720,10 +4749,10 @@ request_mxp_telopt (interactive_t *ip)
      && (ip->mxp & MXP_TELOPT)
      && !(ip->mxp & (MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE)))
     {
-        send_telnet_option_to_interactive(ip, (char)DO, (char)TELOPT_MXP);
+        send_telnet_option_to_interactive(ip, (char)WILL, (char)TELOPT_MXP);
         ip->mxp |= MXP_TELOPT_SENT;
     }
-} /* request_mxp_telopt() */
+} /* offer_mxp_telopt() */
 
 /*-------------------------------------------------------------------------*/
 static bool
@@ -4757,7 +4786,7 @@ send_pueblo_html_mode (interactive_t *ip)
  */
 
 {
-    static const char mode[] = "</xch_mudtext><xch_mode=html>";
+    static const char mode[] = "</xch_mudtext><img xch_mode=html>";
 
     send_bytes_to_interactive(ip, mode, sizeof(mode) - 1);
 } /* send_pueblo_html_mode() */
@@ -4968,32 +4997,31 @@ mxp_telnet_neg (int option)
 
     switch (ip->tn_state)
     {
-    case TS_WILL:
+    case TS_DO:
         if (ip->mxp & MXP_TELOPT)
         {
             if (!(ip->mxp & MXP_TELOPT_SENT))
             {
-                send_do(option);
+                send_will(option);
                 ip->mxp |= MXP_TELOPT_SENT;
             }
             ip->mxp |= MXP_TELOPT_ACTIVE;
         }
         else
         {
-            send_dont(option);
+            send_wont(option);
         }
-        break;
-
-    case TS_WONT:
-        ip->mxp &= ~(MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE);
-        break;
-
-    case TS_DO:
-        send_wont(option);
         break;
 
     case TS_DONT:
         ip->mxp &= ~(MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE);
+        break;
+
+    case TS_WILL:
+        send_dont(option);
+        break;
+
+    case TS_WONT:
         break;
     }
 } /* mxp_telnet_neg() */
@@ -5934,6 +5962,7 @@ start_erq_demon (const char *suffix, size_t suffixlen)
     int sockets[2];
     int pid, i;
     char c = 0;
+    ssize_t received;
 
     /* Create the freelist in pending_erq[] */
     pending_erq[0].fun.type = T_INVALID;
@@ -5969,8 +5998,12 @@ start_erq_demon (const char *suffix, size_t suffixlen)
     if ((pid = fork()) == 0)
     {
         /* Child */
-        dup2(sockets[0], 0);
-        dup2(sockets[0], 1);
+        if (dup2(sockets[0], 0) < 0 || dup2(sockets[0], 1) < 0)
+        {
+            write_bytes(sockets[0], "0", 1);
+            _exit(1);
+        }
+
         close(sockets[0]);
         close(sockets[1]);
 
@@ -5982,7 +6015,7 @@ start_erq_demon (const char *suffix, size_t suffixlen)
             else
                 execl((char *)path, "erq", "--forked", (char*)0);
         }
-        write(1, "0", 1);  /* indicate failure back to the driver */
+        write_bytes(1, "0", 1);  /* indicate failure back to the driver */
         _exit(1);
     }
 
@@ -6009,8 +6042,11 @@ start_erq_demon (const char *suffix, size_t suffixlen)
     /* Read the first character from the ERQ. If it's '0', the ERQ
      * didn't start.
      */
-    read(sockets[1], &c, 1);
-    if (c == '0') {
+    do
+        received = read(sockets[1], &c, 1);
+    while (received < 0 && errno == EINTR);
+
+    if (received != 1 || c == '0') {
         close(sockets[1]);
 
         printf("%s Failed to start erq.\n", time_stamp());
@@ -9050,7 +9086,7 @@ f_configure_interactive (svalue_t *sp)
 
         ip->tn_enabled = (sp->u.number != 0);
         if (ip->tn_enabled)
-            request_mxp_telopt(ip);
+            offer_mxp_telopt(ip);
         else
             ip->mxp &= ~(MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE);
         break;
@@ -9076,13 +9112,13 @@ f_configure_interactive (svalue_t *sp)
             else if (ip->tn_enabled
                   && telopts_are_driver_owned
                   && (old_mxp & (MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE)))
-                send_telnet_option_to_interactive(ip, (char)DONT, (char)TELOPT_MXP);
+                send_telnet_option_to_interactive(ip, (char)WONT, (char)TELOPT_MXP);
 
             if (new_mxp & MXP_PUEBLO)
                 new_mxp |= old_mxp & (MXP_PUEBLO_ACTIVE|MXP_PUEBLO_CHECKED);
 
             ip->mxp = new_mxp;
-            request_mxp_telopt(ip);
+            offer_mxp_telopt(ip);
         }
         break;
 

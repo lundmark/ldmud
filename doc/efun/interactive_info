@@ -54,9 +54,9 @@ DESCRIPTION
           bits MXP_TELOPT and MXP_PUEBLO indicate which driver-assisted
           protocol detection was configured with configure_interactive().
           The active bits MXP_TELOPT_ACTIVE and MXP_PUEBLO_ACTIVE indicate
-          that the client acknowledged TELOPT_MXP or sent the Pueblo
-          client response line. There is no default IC_MXP query for
-          future interactives.
+          that the client accepted the server's WILL TELOPT_MXP offer
+          with DO TELOPT_MXP or sent the Pueblo client response line.
+          There is no default IC_MXP query for future interactives.
 
         <what> == II_MCCP_STATS:
           Statistics about the current compression of <ob> given
