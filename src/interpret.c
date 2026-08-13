@@ -20186,7 +20186,9 @@ apply_prog (string_t *fun, program_t *progp, svalue_t ob, int num_arg, bool b_ig
  * left on the stack.
  */
 {
+#ifdef DEBUG
     struct control_stack *save_csp;
+#endif
     bytecode_p funstart;
     int fx;
 
@@ -20340,7 +20342,9 @@ apply_prog (string_t *fun, program_t *progp, svalue_t ob, int num_arg, bool b_ig
 
     previous_ob = current_object;
     current_object = ob;
+#ifdef DEBUG
     save_csp = csp;
+#endif
     eval_instruction(inter_pc, inter_sp);
 #ifdef DEBUG
     if (save_csp-1 != csp)
@@ -20491,7 +20495,9 @@ retry_for_shadow:
         goto retry_for_shadow;
     }
 
+#ifdef DEBUG
 failure:
+#endif
     if (get_txt(fun)[0] == ':')
         errorf("Illegal function call\n");
 
