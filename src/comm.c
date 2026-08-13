@@ -4709,9 +4709,9 @@ send_telnet_option_to_interactive (interactive_t *ip, char action, char option)
 
 /*-------------------------------------------------------------------------*/
 static void
-request_mxp_telopt (interactive_t *ip)
+offer_mxp_telopt (interactive_t *ip)
 
-/* Request MXP telnet support from <ip>, if configured and possible.
+/* Offer MXP telnet support to <ip>, if configured and possible.
  */
 
 {
@@ -4720,10 +4720,10 @@ request_mxp_telopt (interactive_t *ip)
      && (ip->mxp & MXP_TELOPT)
      && !(ip->mxp & (MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE)))
     {
-        send_telnet_option_to_interactive(ip, (char)DO, (char)TELOPT_MXP);
+        send_telnet_option_to_interactive(ip, (char)WILL, (char)TELOPT_MXP);
         ip->mxp |= MXP_TELOPT_SENT;
     }
-} /* request_mxp_telopt() */
+} /* offer_mxp_telopt() */
 
 /*-------------------------------------------------------------------------*/
 static bool
@@ -4757,7 +4757,7 @@ send_pueblo_html_mode (interactive_t *ip)
  */
 
 {
-    static const char mode[] = "</xch_mudtext><xch_mode=html>";
+    static const char mode[] = "</xch_mudtext><img xch_mode=html>";
 
     send_bytes_to_interactive(ip, mode, sizeof(mode) - 1);
 } /* send_pueblo_html_mode() */
@@ -4968,32 +4968,31 @@ mxp_telnet_neg (int option)
 
     switch (ip->tn_state)
     {
-    case TS_WILL:
+    case TS_DO:
         if (ip->mxp & MXP_TELOPT)
         {
             if (!(ip->mxp & MXP_TELOPT_SENT))
             {
-                send_do(option);
+                send_will(option);
                 ip->mxp |= MXP_TELOPT_SENT;
             }
             ip->mxp |= MXP_TELOPT_ACTIVE;
         }
         else
         {
-            send_dont(option);
+            send_wont(option);
         }
-        break;
-
-    case TS_WONT:
-        ip->mxp &= ~(MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE);
-        break;
-
-    case TS_DO:
-        send_wont(option);
         break;
 
     case TS_DONT:
         ip->mxp &= ~(MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE);
+        break;
+
+    case TS_WILL:
+        send_dont(option);
+        break;
+
+    case TS_WONT:
         break;
     }
 } /* mxp_telnet_neg() */
@@ -9050,7 +9049,7 @@ f_configure_interactive (svalue_t *sp)
 
         ip->tn_enabled = (sp->u.number != 0);
         if (ip->tn_enabled)
-            request_mxp_telopt(ip);
+            offer_mxp_telopt(ip);
         else
             ip->mxp &= ~(MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE);
         break;
@@ -9076,13 +9075,13 @@ f_configure_interactive (svalue_t *sp)
             else if (ip->tn_enabled
                   && telopts_are_driver_owned
                   && (old_mxp & (MXP_TELOPT_SENT|MXP_TELOPT_ACTIVE)))
-                send_telnet_option_to_interactive(ip, (char)DONT, (char)TELOPT_MXP);
+                send_telnet_option_to_interactive(ip, (char)WONT, (char)TELOPT_MXP);
 
             if (new_mxp & MXP_PUEBLO)
                 new_mxp |= old_mxp & (MXP_PUEBLO_ACTIVE|MXP_PUEBLO_CHECKED);
 
             ip->mxp = new_mxp;
-            request_mxp_telopt(ip);
+            offer_mxp_telopt(ip);
         }
         break;
 

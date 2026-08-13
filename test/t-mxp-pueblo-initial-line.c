@@ -8,10 +8,22 @@
  */
 
 object client;
+int test_failed;
+
+void record_failure()
+{
+    test_failed = 1;
+}
+
+int has_failed()
+{
+    return test_failed;
+}
 
 void fail(string text)
 {
     msg("FAILURE: %s\n", text);
+    __MASTER_OBJECT__->record_failure();
     shutdown(1);
 }
 
@@ -33,6 +45,7 @@ object get_client()
 void timeout()
 {
     msg("FAILURE: Timed out.\n");
+    __MASTER_OBJECT__->record_failure();
     shutdown(1);
 }
 
@@ -44,6 +57,7 @@ void receive_second_command(string str)
     {
         msg("FAILURE: Server received %O instead of %O.\n",
             str, "PUEBLOCLIENT 2.50");
+        __MASTER_OBJECT__->record_failure();
         shutdown(1);
     }
 
@@ -52,6 +66,7 @@ void receive_second_command(string str)
     {
         msg("FAILURE: MXP state is 0x%x instead of 0x%x.\n",
             state, MXP_PUEBLO);
+        __MASTER_OBJECT__->record_failure();
         shutdown(1);
     }
 
@@ -63,6 +78,7 @@ void receive_first_command(string str)
     if (str != "hello")
     {
         msg("FAILURE: Server received %O instead of %O.\n", str, "hello");
+        __MASTER_OBJECT__->record_failure();
         shutdown(1);
     }
 
@@ -75,11 +91,15 @@ void receive_client_line(string str)
     if (str != "READY")
     {
         msg("FAILURE: Client received %O instead of %O.\n", str, "READY");
+        __MASTER_OBJECT__->record_failure();
         shutdown(1);
     }
 
-    msg("Success.\n");
-    shutdown(0);
+    if (!__MASTER_OBJECT__->has_failed())
+    {
+        msg("Success.\n");
+        shutdown(0);
+    }
 }
 
 void send_client_protocol()
