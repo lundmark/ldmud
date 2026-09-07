@@ -57,16 +57,28 @@ static program_update_request_t *active;
 static p_int last_id;
 
 static void
-unlink_work(program_update_request_t **list, program_update_request_t *request)
+unlink_work (program_update_request_t **list, program_update_request_t *request)
+
+/* Remove <request> from the work chain headed by <list>, if present.
+ * Neither request ownership nor its references change. The caller must keep
+ * <request> rooted until any subsequent release is complete.
+ */
+
 {
     while (*list && *list != request)
         list = &(*list)->work_next;
     if (*list)
         *list = request->work_next;
-}
+} /* unlink_work() */
 
 static void
-unlink_owner(program_update_request_t *request)
+unlink_owner (program_update_request_t *request)
+
+/* Remove <request> from its owner's non-owning reverse chain and clear
+ * both owner links. An already unlinked request is unchanged. No object
+ * reference is released and no mudlib code is called.
+ */
+
 {
     program_update_request_t **link;
     if (!request->owner)
@@ -78,10 +90,21 @@ unlink_owner(program_update_request_t *request)
         *link = request->owner_next;
     request->owner = NULL;
     request->owner_next = NULL;
-}
+} /* unlink_owner() */
 
 static void
-release_inputs(program_update_request_t *request)
+release_inputs (program_update_request_t *request)
+
+/* Release and zero the source and fixed target references of <request>,
+ * then release its independently pinned program. The origin and reserved
+ * terminal record survive. Repeated calls are harmless after completion.
+ *
+ * These native releases must not reenter LPC or garbage collection while
+ * the record is being dismantled. TODO: Future compiler cleanup or native
+ * finalizer hooks require a rooted retirement state and pointers cleared
+ * before potentially reentrant releases, rather than this current contract.
+ */
+
 {
     int i;
     for (i = UPDATE_SOURCE; i < UPDATE_NUM_ROOTS; i++)
@@ -94,10 +117,20 @@ release_inputs(program_update_request_t *request)
         free_prog(request->source_program, MY_TRUE);
         request->source_program = NULL;
     }
-}
+} /* release_inputs() */
 
 static void
-free_request(program_update_request_t *request)
+free_request (program_update_request_t *request)
+
+/* Unlink the globally rooted <request> from all work and owner chains,
+ * release its remaining references, and free the record. The caller must
+ * ensure no stack handler or active evaluation will use it afterwards.
+ *
+ * This teardown is currently synchronous and non-reentrant. Once removed
+ * from requests, the record is no longer a GC root. Future cleanup hooks
+ * must provide a separate rooted retirement phase before changing this.
+ */
+
 {
     program_update_request_t **link = &requests;
     unlink_owner(request);
@@ -109,18 +142,31 @@ free_request(program_update_request_t *request)
     release_inputs(request);
     free_svalue(&request->roots[UPDATE_ORIGIN]);
     xfree(request);
-}
+} /* free_request() */
 
 static void
-admission_cleanup(error_handler_t *handler)
+admission_cleanup (error_handler_t *handler)
+
+/* Clean the request whose first member is <handler> when the interpreter
+ * pops its admission error handler. An unpublished request (id zero) is
+ * freed; successful admission leaves its globally rooted record intact.
+ */
+
 {
     program_update_request_t *request = (program_update_request_t *)handler;
     if (!request->id)
         free_request(request);
-}
+} /* admission_cleanup() */
 
 static void
-expire_reports(void)
+expire_reports (void)
+
+/* Drop terminal reports older than the retention interval, then evict
+ * the oldest remaining terminal reports until the cache fits its bound.
+ * Pending, admitted, and currently executing requests remain rooted.
+ * Only non-reentrant native teardown is allowed from this routine.
+ */
+
 {
     program_update_request_t *request, *next, *oldest;
     size_t count = 0;
@@ -146,16 +192,31 @@ expire_reports(void)
         free_request(oldest);
         count--;
     }
-}
+} /* expire_reports() */
 
 static Bool
-same_family(object_t *object, string_t *origin)
+same_family (object_t *object, string_t *origin)
+
+/* Return true if <object>'s canonical load name equals <origin>.
+ * Both arguments are borrowed references; no lookup or loading occurs.
+ */
+
 {
     return object->load_name && mstreq(object->load_name, origin);
-}
+} /* same_family() */
 
 static void
-validate_object(object_t *object, string_t *origin, Bool source)
+validate_object (object_t *object, string_t *origin, Bool source)
+
+/* Require <object> to be a supported, live member of canonical family
+ * <origin>. With <source> true it must be the actual ordinary blueprint;
+ * otherwise a same-family clone is also accepted. Reject special roles,
+ * virtual/replaced objects, and pending replace_program conflicts.
+ *
+ * May unswap an existing object but never loads a missing blueprint.
+ * Return normally on success; raise an LPC error on invalidity or failure.
+ */
+
 {
     const char *name, *program_name;
     size_t length;
@@ -196,13 +257,17 @@ validate_object(object_t *object, string_t *origin, Bool source)
     for (replacement = obj_list_replace; replacement; replacement = replacement->next)
         if (same_family(replacement->ob, origin))
             errorf("update_blueprint(): pending replace_program conflict.\n");
-}
+} /* validate_object() */
 
-/* Admission and execution share the same captured source contract. A new
- * blueprint at the same pathname cannot replace the admitted identity.
- */
 static void
-validate_source(program_update_request_t *request)
+validate_source (program_update_request_t *request)
+
+/* Require <request>'s captured source to remain live and supported with
+ * its exact pinned program. Admission and execution share this check; a
+ * new blueprint at the same pathname cannot replace the captured identity.
+ * Return normally on success, otherwise raise an LPC error.
+ */
+
 {
     object_t *source;
 
@@ -212,10 +277,21 @@ validate_source(program_update_request_t *request)
     validate_object(source, request->roots[UPDATE_ORIGIN].u.str, MY_TRUE);
     if (source->prog != request->source_program)
         errorf("update_blueprint(): captured source program changed.\n");
-}
+} /* validate_source() */
 
 static void
-validate_targets(program_update_request_t *request, Bool admission)
+validate_targets (program_update_request_t *request, Bool admission)
+
+/* Validate <request>'s copied explicit selection or scan all currently
+ * loaded matching clones. Enforce target, scan, variable-slot, and retained
+ * storage bounds. With <admission> true, a destroyed explicit target is an
+ * error; after admission it is skipped without extending the fixed set.
+ *
+ * The source program must still be pinned and non-NULL. No selection or
+ * object program is changed. Invalid input or exceeded limits raise an
+ * LPC error; otherwise return normally.
+ */
+
 {
     string_t *origin = request->roots[UPDATE_ORIGIN].u.str;
     size_t count = 0, scanned = 0, slots = 0, retained;
@@ -261,10 +337,17 @@ validate_targets(program_update_request_t *request, Bool admission)
          || slots > (BLUEPRINT_UPDATE_MAX_BYTES - retained) / sizeof(svalue_t))
             errorf("update_blueprint(): variable storage limit exceeded.\n");
     }
-}
+} /* validate_targets() */
 
 static void
-validate_capacity(program_update_request_t *self)
+validate_capacity (program_update_request_t *self)
+
+/* Check whether the rooted, unpublished request <self> can be admitted.
+ * Ignore terminal reports and <self> while counting driver-wide and owner
+ * requests; reject any other request reserving the same canonical family.
+ * Return normally when all limits hold, or raise an LPC error.
+ */
+
 {
     program_update_request_t *request;
     size_t inflight = 0, owned = 0;
@@ -282,10 +365,30 @@ validate_capacity(program_update_request_t *self)
     }
     if (inflight >= BLUEPRINT_UPDATE_MAX_INFLIGHT || owned >= BLUEPRINT_UPDATE_MAX_OWNER)
         errorf("update_blueprint(): pending request limit exceeded.\n");
-}
+} /* validate_capacity() */
 
 svalue_t *
-v_update_blueprint(svalue_t *sp, int num_arg)
+v_update_blueprint (svalue_t *sp, int num_arg)
+
+/* LPC efun: int update_blueprint(string|object source,
+ *                                void|int|object* targets)
+ *
+ * Queue a deferred request using an already loaded ordinary blueprint.
+ * String sources resolve an existing canonical identity; object sources
+ * must be actual blueprints. Omitted targets or integer zero select all
+ * matching clones at execution. An array selects a copied, deduplicated
+ * fixed set; an empty array selects no clones.
+ *
+ * Check master privilege and revalidate mutable facts before assigning a
+ * positive driver-lifetime ID. Invalid admission raises without consuming
+ * an ID. This prototype performs no compilation or migration: the backend
+ * produces a failed report on the next eligible periodic tick.
+ *
+ * Consume <num_arg> values ending at <sp>, replacing them with the ID,
+ * and return the new stack pointer. Admission failures are cleaned through
+ * a stack error handler while the record remains on the global root list.
+ */
+
 {
     svalue_t *arg = sp - num_arg + 1;
     program_update_request_t *request, **tail;
@@ -376,21 +479,48 @@ v_update_blueprint(svalue_t *sp, int num_arg)
     sp = pop_n_elems(num_arg, sp);
     push_number(sp, request->id);
     return sp;
-}
+} /* v_update_blueprint() */
 
-/* The key and report stay rooted on the normal interpreter error stack. */
 static svalue_t *
-report_field(mapping_t *report, const char *name)
+report_field (mapping_t *report, const char *name)
+
+/* Return the writable value slot for key <name> in the fresh <report>.
+ * The caller must already have rooted the partial report on the interpreter
+ * stack. Keep the temporary key rooted there until insertion succeeds.
+ * Raise an LPC out-of-memory error if mapping insertion returns NULL, so
+ * the normal error unwinder releases both key and partial report. This
+ * function never returns a NULL slot to its callers.
+ */
+
 {
     svalue_t *result;
+
     push_c_string(inter_sp, name);
     result = get_map_lvalue(report, inter_sp);
+    if (!result)
+        outofmem(sizeof(*result), "blueprint update report field");
     pop_stack();
     return result;
-}
+} /* report_field() */
 
 svalue_t *
-f_update_blueprint_result(svalue_t *sp)
+f_update_blueprint_result (svalue_t *sp)
+
+/* LPC efun: mapping update_blueprint_result(int id)
+ *
+ * Return a fresh, non-consuming report for an existing request owned by
+ * the caller, or any existing request when called by the master. Unknown,
+ * expired, or unauthorized IDs raise an LPC error. Reports contain id,
+ * origin, selection, status, candidate_generation, matched, updated,
+ * already_current, destroyed, blueprint_updated, variable_changes, errors,
+ * and completed_at. Pending unknowns are zero and arrays are empty.
+ *
+ * Nested arrays and mappings are independently allocated. The stored
+ * terminal record contains no source or target references. Replace the ID
+ * at <sp> with the mapping and return <sp>. Keep the partial report rooted
+ * on the interpreter stack so allocation errors can unwind it safely.
+ */
+
 {
     static const char *numeric_fields[] =
     {
@@ -438,18 +568,47 @@ f_update_blueprint_result(svalue_t *sp)
                      : "Blueprint migration is not implemented.");
     }
     return sp;
-}
+} /* f_update_blueprint_result() */
 
 void
-program_update_detach(void)
+program_update_detach (void)
+
+/* Detach the pending work chain for one periodic backend tick. Call once
+ * at entry to the time_to_call_heart_beat block, before refreshing time or
+ * running callbacks. The previous detached batch must already be empty.
+ * No LPC code or allocating operation runs here.
+ *
+ * Moving queue links does not change ownership: every detached request
+ * remains on the global requests root. Submissions after this boundary
+ * stay on pending and cannot execute during the current tick.
+ */
+
 {
     assert(!batch);
     batch = pending;
     pending = NULL;
-}
+} /* program_update_detach() */
 
 void
-program_update_process(void)
+program_update_process (void)
+
+/* Process the previously detached batch with a per-request backend error
+ * boundary, then expire terminal reports. The backend must be idle, with
+ * no active LPC evaluation, current_object cleared, current_time refreshed,
+ * periodic flags reset, and next_call_out_cycle() already completed. Call
+ * before the heartbeat rate/enable gate and callout dispatch.
+ *
+ * The global requests chain roots the batch and active request throughout
+ * evaluation, including any later compiler callbacks. Reentrant submission
+ * only appends to pending. Owner destruction marks a busy request canceled
+ * instead of freeing it from under the active evaluation.
+ *
+ * Current finalization uses only non-reentrant native reference releases.
+ * TODO: Before adding reentrant compiler/native cleanup, retain the busy
+ * state and a GC-visible retirement root until release is fully complete.
+ * The present busy-to-terminal transition is not such a retirement protocol.
+ */
+
 {
     struct error_recovery_info recovery;
     expire_reports();
@@ -489,10 +648,18 @@ program_update_process(void)
     }
     rt_context = recovery.rt.last;
     expire_reports();
-}
+} /* program_update_process() */
 
 void
-program_update_owner_destructed(object_t *owner)
+program_update_owner_destructed (object_t *owner)
+
+/* Cancel every request owned by the destructing <owner>, including cached
+ * reports, and remove all non-owning owner links. A busy admission or active
+ * backend request stays globally rooted with canceled set; its own error
+ * handler or backend frame performs the eventual release. Other records
+ * are synchronously freed. Call before <owner>'s storage can disappear.
+ */
+
 {
     while (owner->program_updates)
     {
@@ -503,18 +670,31 @@ program_update_owner_destructed(object_t *owner)
         else
             free_request(request);
     }
-}
+} /* program_update_owner_destructed() */
 
 void
-program_update_shutdown(void)
+program_update_shutdown (void)
+
+/* Free every remaining request and report during idle backend shutdown.
+ * No admission handler or active request evaluation may still own a record.
+ * Uses the same non-reentrant native teardown contract as free_request().
+ */
+
 {
     while (requests)
         free_request(requests);
-}
+} /* program_update_shutdown() */
 
 #ifdef GC_SUPPORT
 void
-program_update_clear_refs(void)
+program_update_clear_refs (void)
+
+/* Clear GC references for every globally rooted request, its svalue roots,
+ * and its independently retained program. This includes unpublished
+ * admissions, pending work, detached/active work, and cached terminal data.
+ * Called only during the collector's clear-reference phase.
+ */
+
 {
     program_update_request_t *request;
     for (request = requests; request; request = request->next)
@@ -524,10 +704,16 @@ program_update_clear_refs(void)
         if (request->source_program)
             clear_program_ref(request->source_program, MY_TRUE);
     }
-}
+} /* program_update_clear_refs() */
 
 void
-program_update_count_refs(void)
+program_update_count_refs (void)
+
+/* Mark every request allocation and reconstruct its svalue and retained
+ * program references during the collector's count-reference phase. Owner
+ * reverse links are deliberately non-owning and must not be counted.
+ */
+
 {
     program_update_request_t *request;
     for (request = requests; request; request = request->next)
@@ -537,12 +723,18 @@ program_update_count_refs(void)
         if (request->source_program)
             mark_program_ref(request->source_program);
     }
-}
+} /* program_update_count_refs() */
 #endif /* GC_SUPPORT */
 
 #ifdef DEBUG
 void
-program_update_count_extra_refs(void)
+program_update_count_extra_refs (void)
+
+/* Count request-owned object, aggregate, and exact program references for
+ * DEBUG reference verification. Include admission and detached/active work
+ * through the global root list; do not count the non-owning owner links.
+ */
+
 {
     program_update_request_t *request;
     for (request = requests; request; request = request->next)
@@ -554,6 +746,6 @@ program_update_count_extra_refs(void)
             count_extra_ref_in_prog(request->source_program);
         }
     }
-}
+} /* program_update_count_extra_refs() */
 #endif /* DEBUG */
 #endif /* USE_BLUEPRINT_UPDATE */
