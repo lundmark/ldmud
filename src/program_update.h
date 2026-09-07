@@ -19,6 +19,7 @@ extern svalue_t *f_update_blueprint_result(svalue_t *sp);
 
 extern void program_update_detach(void);
 extern void program_update_process(void);
+extern Bool program_update_compilation_valid(void);
 
 /* Destruction removes non-owning owner links and marks active work canceled.
  * Shutdown requires an idle backend with no remaining admission/evaluation.

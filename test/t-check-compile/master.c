@@ -53,6 +53,27 @@ void run_test()
     rm("/compile_check_side_effect");
 
     run_array(({
+        ({ "recursive cache growth retains the correct entries", 0,
+           (:
+               string top = "";
+               mixed *result;
+               for (int i = 0; i < 6; i++)
+               {
+                   string name = sprintf("cache_growth_%d.c", i);
+                   rm(name);
+                   write_file(name, sprintf("int value%d;\n", i));
+                   top += sprintf("inherit \"cache_growth_%d\";\n", i);
+               }
+               rm("cache_growth_top.c");
+               write_file("cache_growth_top.c", top);
+               result = check_compile("cache_growth_top");
+               for (int i = 0; i < 6; i++)
+                   rm(sprintf("cache_growth_%d.c", i));
+               rm("cache_growth_top.c");
+               return pointerp(result) && result[0] && !has_error(result)
+                      && !find_object("cache_growth_5");
+           :)
+        }),
         ({ "simple file compiles", 0,
            (:
                mixed *result = check_compile("/ok");

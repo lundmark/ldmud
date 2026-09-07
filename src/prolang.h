@@ -128,9 +128,21 @@ extern void compile_check_record_diagnostic(
 extern void free_all_local_names(void);
 extern void store_line_number_info(void);
 extern void store_line_number_backward(int offset);
+#define INCLUDE_INFO_INVALID ((mp_uint)-1)
 extern mp_uint store_include_info(char *name, char *file, char delim, int inc_depth);
 extern void store_include_end(mp_uint inc_offset, int include_line);
 extern void compile_file(int fd, const char * fname, Bool isMasterObj);
+extern void compile_file_context(int fd, const char *fname, Bool isMasterObj,
+                                 lpctype_context_t *context);
+extern void abort_compile_file_context(void);
+extern bool compile_update_is_active(void);
+extern program_t *compile_update_find_program(string_t *name);
+extern void compile_update_callback_failed(void);
+extern bool compile_update_cancelled(void);
+extern void compile_push_c_string(const char *text);
+extern void compile_push_c_n_string(const char *text, size_t length);
+extern svalue_t *compile_apply_master(string_t *function, int num_arg);
+extern svalue_t *compile_apply_lambda(svalue_t *closure, int num_arg, svalue_t *bind_ob);
 extern lambda_t *compile_expr(string_t *expr, code_context_t *context);
 extern lambda_t *compile_block(string_t *block, code_context_t *context);
 extern bool is_undef_function (function_t *header, bytecode_p funstart);

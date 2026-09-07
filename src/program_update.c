@@ -1,5 +1,5 @@
 /* Deferred blueprint update request ownership and reporting.
- * This stage performs no compilation or migration. Terminal failure state is
+ * This stage privately compiles candidates but performs no migration. Terminal failure state is
  * reserved in the admission allocation. Schema diagnostics may allocate within
  * the backend recovery boundary, with partial summaries rooted in the request.
  */
@@ -8,6 +8,7 @@
 #include <assert.h>
 #include "program_update.h"
 #include "program_schema.h"
+#include "prolang.h"
 #include "efuns.h"
 #include "array.h"
 #include "backend.h"
@@ -15,6 +16,7 @@
 #include "gcollect.h"
 #include "interpret.h"
 #include "main.h"
+#include "lex.h"
 #include "mapping.h"
 #include "mstrings.h"
 #include "object.h"
@@ -23,6 +25,8 @@
 #include "stdstrings.h"
 #include "svalue.h"
 #include "swap.h"
+#include "structs.h"
+#include "i-eval_cost.h"
 #include "xalloc.h"
 #include "i-current_object.h"
 
@@ -41,6 +45,7 @@ typedef struct program_update_request_s
     struct program_update_request_s *work_next;
     object_t *owner;              /* Non-owning; destruction unlinks it. */
     program_t *source_program;    /* Exact generation, independently pinned. */
+    program_t *candidate;         /* Unpublished program, independently rooted. */
     svalue_t roots[UPDATE_NUM_ROOTS];
     p_int id;
     p_int candidate_generation;
@@ -58,6 +63,12 @@ static program_update_request_t *requests;
 static program_update_request_t *pending;
 static program_update_request_t *batch;
 static program_update_request_t *active;
+/* Static storage outlives compiler handlers and every guarded program
+ * release, including recovery after a suspended callback boundary.
+ */
+static stack_gap_guard_t preparation_guard;
+static stack_gap_guard_t *previous_preparation_guard;
+static Bool preparation_guard_active;
 static p_int last_id;
 
 static void
@@ -115,6 +126,12 @@ release_inputs (program_update_request_t *request)
     {
         free_svalue(&request->roots[i]);
         put_number(&request->roots[i], 0);
+    }
+    if (request->candidate)
+    {
+        program_t *candidate = request->candidate;
+        request->candidate = NULL;
+        free_prog(candidate, MY_TRUE);
     }
     if (request->source_program)
     {
@@ -284,6 +301,29 @@ validate_source (program_update_request_t *request)
         errorf("update_blueprint(): captured source program changed.\n");
 } /* validate_source() */
 
+Bool
+program_update_compilation_valid (void)
+
+/* Revalidate identities immediately after a compiler callback without
+ * allocating, unswapping, or raising an error through parser-owned values.
+ * The pinned program cannot be swapped while this request owns it. Full
+ * family/target validation still runs after normal compiler cleanup.
+ */
+
+{
+    object_t *source;
+
+    if (!active || active->canceled || !active->owner
+     || (active->owner->flags & O_DESTRUCTED)
+     || active->roots[UPDATE_SOURCE].type != T_OBJECT)
+        return MY_FALSE;
+    source = active->roots[UPDATE_SOURCE].u.ob;
+    return !(source->flags & (O_DESTRUCTED | O_REPLACED | O_SHADOW | O_CLONE))
+        && source->prog == active->source_program
+        && active->source_program->blueprint == source
+        && same_family(source, active->roots[UPDATE_ORIGIN].u.str);
+} /* program_update_compilation_valid() */
+
 static void
 validate_targets (program_update_request_t *request, Bool admission)
 
@@ -361,10 +401,10 @@ describe_schemas (program_update_request_t *request)
     size_t capacity = targets ? VEC_SIZE(targets) : 0;
     object_t *object;
     vector_t *trimmed;
+    program_t *candidate = request->source_from_path
+                           ? request->candidate : request->source_program;
 
-    if (request->source_from_path)
-        return;
-    request->candidate_generation = request->source_program->schema_generation;
+    request->candidate_generation = candidate->schema_generation;
     if (!targets)
     {
         for (object = obj_list; object; object = object->next_all)
@@ -373,7 +413,7 @@ describe_schemas (program_update_request_t *request)
                 errorf("update_blueprint(): schema scan limit exceeded.\n");
             if (!(object->flags & O_DESTRUCTED) && (object->flags & O_CLONE)
              && same_family(object, request->roots[UPDATE_ORIGIN].u.str)
-             && object->prog != request->source_program)
+             && object->prog != candidate)
                 capacity++;
         }
         scanned = 0;
@@ -401,7 +441,7 @@ describe_schemas (program_update_request_t *request)
         if (!targets && (!(object->flags & O_CLONE)
                      || !same_family(object, request->roots[UPDATE_ORIGIN].u.str)))
             continue;
-        if (object->prog == request->source_program)
+        if (object->prog == candidate)
             continue;
         for (previous = 0; previous < count; previous++)
         {
@@ -419,7 +459,7 @@ describe_schemas (program_update_request_t *request)
             continue;
         if (count == BLUEPRINT_UPDATE_MAX_TARGETS)
             errorf("update_blueprint(): schema generation limit exceeded.\n");
-        program_schema_compare(object->prog, request->source_program,
+        program_schema_compare(object->prog, candidate,
                                &root->u.vec->item[count++], &remaining);
         if (!remaining)
             break;
@@ -688,6 +728,61 @@ program_update_detach (void)
     pending = NULL;
 } /* program_update_detach() */
 
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+static void
+candidate_test_checkpoint (program_update_request_t *request, Bool collect)
+
+/* Internal fault/GC proof, absent from normal driver builds. No LPC entry
+ * point or scheduling change: run only after the parser and stack handlers
+ * have relinquished all compiler scratch, with candidate on requests.
+ */
+
+{
+    size_t i;
+    size_t saved_array = max_array_size, saved_mapping = max_mapping_size;
+    size_t saved_keys = max_mapping_keys;
+    int32 saved_eval = max_eval_cost, saved_file = max_file_xfer;
+    int32 saved_byte = max_byte_xfer, saved_callouts = max_callouts;
+    int32 saved_use = use_eval_cost;
+    p_int saved_memory = max_memory;
+    int32 saved_cost = eval_cost, saved_assigned = assigned_eval_cost;
+    int saved_privilege = malloc_privilege;
+
+    if (strcmp(get_txt(request->roots[UPDATE_ORIGIN].u.str), "/staging_target"))
+        return;
+    for (i = 0; i < request->source_program->num_structs; i++)
+    {
+        struct_def_t *def = &request->source_program->struct_defs[i];
+        if (def->inh == STRUCT_INH_LOCAL)
+            assert(def->type->name->current == def->type);
+    }
+    if (collect)
+    {
+        assert(request->candidate);
+        assert(!current_loc.file);
+        mark_end_evaluation();
+        clear_state();
+        garbage_collection();
+        max_array_size = saved_array;
+        max_mapping_size = saved_mapping;
+        max_mapping_keys = saved_keys;
+        max_eval_cost = saved_eval;
+        max_file_xfer = saved_file;
+        max_byte_xfer = saved_byte;
+        max_callouts = saved_callouts;
+        max_memory = saved_memory;
+        use_eval_cost = saved_use;
+        eval_cost = saved_cost;
+        assigned_eval_cost = saved_assigned;
+        malloc_privilege = saved_privilege;
+        mark_start_evaluation();
+        set_current_object(request->owner);
+        candidate_test_checkpoint(request, MY_FALSE);
+        debug_message("BLUEPRINT_STAGING_NATIVE_GC: retained candidate and published types verified.\n");
+    }
+} /* candidate_test_checkpoint() */
+#endif
+
 void
 program_update_process (void)
 
@@ -720,11 +815,22 @@ program_update_process (void)
         batch = active->work_next;
         active->work_next = NULL;
         active->busy = MY_TRUE;
+        preparation_guard.failed = MY_FALSE;
+        preparation_guard_active = MY_FALSE;
+        previous_preparation_guard = get_stack_gap_guard();
         if (setjmp(recovery.con.text))
         {
+            if (preparation_guard_active)
+                set_stack_gap_guard(&preparation_guard);
             active->validation_failed = MY_TRUE;
             mark_end_evaluation();
+            abort_compile_file_context();
             clear_state();
+            if (preparation_guard_active)
+            {
+                set_stack_gap_guard(previous_preparation_guard);
+                preparation_guard_active = MY_FALSE;
+            }
             /* Partial summaries are never exposed as completed evidence. */
             free_svalue(&active->roots[UPDATE_SCHEMAS]);
             put_number(&active->roots[UPDATE_SCHEMAS], 0);
@@ -739,17 +845,62 @@ program_update_process (void)
              * pass invokes no LPC and restores the idle backend context.
              */
             set_current_object(active->owner);
+            if (active->source_from_path)
+            {
+                set_stack_gap_guard(&preparation_guard);
+                preparation_guard_active = MY_TRUE;
+                compile_update_candidate(active->roots[UPDATE_ORIGIN].u.str,
+                                         active->source_program, &active->candidate);
+                set_stack_gap_guard(previous_preparation_guard);
+                preparation_guard_active = MY_FALSE;
+                /* This also covers pressure during the final context
+                 * release, after the parser's last cancellation check.
+                 */
+                if (preparation_guard.failed)
+                    errorf("update_blueprint(): memory pressure during compilation.\n");
+                if (active->canceled || !active->owner
+                 || (active->owner->flags & O_DESTRUCTED))
+                    errorf("update_blueprint(): requester was destructed during compilation.\n");
+                validate_source(active);
+                validate_targets(active, MY_FALSE);
+                if (!active->candidate)
+                    errorf("update_blueprint(): candidate compilation failed.\n");
+            }
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+            if (active->candidate)
+                candidate_test_checkpoint(active, MY_TRUE);
+#endif
             describe_schemas(active);
             clear_current_object();
             /* Future compiler and migration hooks belong in this boundary. */
             mark_end_evaluation();
         }
-        active->busy = MY_FALSE;
+        if (active->candidate)
+        {
+            program_t *candidate = active->candidate;
+            set_stack_gap_guard(&preparation_guard);
+            preparation_guard_active = MY_TRUE;
+            active->candidate = NULL;
+            free_prog(candidate, MY_TRUE);
+            if (preparation_guard.failed)
+            {
+                active->validation_failed = MY_TRUE;
+                free_svalue(&active->roots[UPDATE_SCHEMAS]);
+                put_number(&active->roots[UPDATE_SCHEMAS], 0);
+                active->candidate_generation = 0;
+            }
+            set_stack_gap_guard(previous_preparation_guard);
+            preparation_guard_active = MY_FALSE;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+            candidate_test_checkpoint(active, MY_FALSE);
+#endif
+        }
         if (active->canceled)
             free_request(active);
         else
         {
             release_inputs(active);
+            active->busy = MY_FALSE;
             active->terminal = MY_TRUE;
             active->completed_at = current_time;
         }
@@ -824,6 +975,8 @@ program_update_clear_refs (void)
         clear_ref_in_vector(request->roots, UPDATE_NUM_ROOTS);
         if (request->source_program)
             clear_program_ref(request->source_program, MY_TRUE);
+        if (request->candidate)
+            clear_program_ref(request->candidate, MY_TRUE);
     }
 } /* program_update_clear_refs() */
 
@@ -843,6 +996,8 @@ program_update_count_refs (void)
         count_ref_in_vector(request->roots, UPDATE_NUM_ROOTS);
         if (request->source_program)
             mark_program_ref(request->source_program);
+        if (request->candidate)
+            mark_program_ref(request->candidate);
     }
 } /* program_update_count_refs() */
 #endif /* GC_SUPPORT */
@@ -865,6 +1020,11 @@ program_update_count_extra_refs (void)
         {
             request->source_program->extra_ref++;
             count_extra_ref_in_prog(request->source_program);
+        }
+        if (request->candidate)
+        {
+            request->candidate->extra_ref++;
+            count_extra_ref_in_prog(request->candidate);
         }
     }
 } /* program_update_count_extra_refs() */

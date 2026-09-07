@@ -1437,6 +1437,47 @@ DIAGWARN_POP
 } /* get_stack_direction() */
 
 /*-------------------------------------------------------------------------*/
+static stack_gap_guard_t *active_stack_gap_guard;
+
+stack_gap_guard_t *
+set_stack_gap_guard (stack_gap_guard_t *guard)
+{
+    stack_gap_guard_t *previous = active_stack_gap_guard;
+    active_stack_gap_guard = guard;
+    return previous;
+}
+
+stack_gap_guard_t *
+get_stack_gap_guard (void)
+{
+    return active_stack_gap_guard;
+}
+
+Bool
+stack_gap_guard_failed (void)
+{
+    return active_stack_gap_guard && active_stack_gap_guard->failed;
+}
+
+static Bool
+latch_stack_gap_failure (void)
+{
+    if (!active_stack_gap_guard)
+        return MY_FALSE;
+    active_stack_gap_guard->failed = MY_TRUE;
+    return MY_TRUE;
+}
+
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+void
+test_stack_gap_failure (void)
+{
+    if (!active_stack_gap_guard)
+        fatal("Stack-gap failure test without a native owner.\n");
+    latch_stack_gap_failure();
+}
+#endif
+
 void
 assert_stack_gap (void)
 
@@ -1534,6 +1575,8 @@ assert_stack_gap (void)
     if (condition == Normal)
     {
         condition = Error;
+        if (latch_stack_gap_failure())
+            return;
         errorf("Out of memory: Gap between stack and heap: %ld.\n"
              , (long)gap);
         /* NOTREACHED */

@@ -20985,6 +20985,11 @@ apply_master_ob (string_t *fun, int num_arg, Bool external)
     struct control_stack *save_csp;
     svalue_t *result;
 
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (fun == STR_RUNTIME && get_stack_gap_guard())
+        fatal("Blueprint native guard entered runtime_error callback.\n");
+#endif
+
     /* Get the master object. */
     assert_master_ob_loaded();
 
@@ -21006,6 +21011,7 @@ apply_master_ob (string_t *fun, int num_arg, Bool external)
     save_csp = csp;
     if (setjmp(error_recovery_info.con.text))
     {
+        compile_update_callback_failed();
         secure_apply_error(save_sp - num_arg, save_csp, external);
         printf("%s Error in master_ob->%s()\n", time_stamp(), get_txt(fun));
         debug_message("%s Error in master_ob->%s()\n", time_stamp(), get_txt(fun));

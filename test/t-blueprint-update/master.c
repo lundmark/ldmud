@@ -10,6 +10,15 @@ object first, second, replacement;
 int pending_id;
 int stage;
 
+mixed include_file(string path, string from, int system)
+{
+#ifdef __BLUEPRINT_UPDATE__
+    if (path == "staging_hook.h" && find_object("staging"))
+        find_object("staging").compiler_hook();
+#endif
+    return 0;
+}
+
 string *get_simul_efun()
 {
     load_object("sefun");
@@ -79,7 +88,11 @@ void terminal_gc_done(int failed)
     else
     {
         msg("BLUEPRINT_UPDATE_ENABLED: %d checks passed.\n", checks);
-        load_object("schemas").run(#'finish);
+        load_object("staging").run(function void(int failed)
+        {
+            if (failed) finish(failed);
+            else load_object("schemas").run(#'finish);
+        });
     }
 }
 
@@ -218,7 +231,14 @@ void run_test()
     object blueprint;
 
     msg("\nRunning blueprint update lifecycle tests:\n");
-    call_out(#'finish, 90 * __ALARM_TIME__, 1);
+    call_out(#'finish, 180 * __ALARM_TIME__, 1);
+#ifdef __BLUEPRINT_UPDATE__
+    if (file_size("staging-only") >= 0)
+    {
+        load_object("staging").run(#'finish);
+        return;
+    }
+#endif
     rm("target.c");
     copy_file("v1.c", "target.c");
     blueprint = load_object("target");

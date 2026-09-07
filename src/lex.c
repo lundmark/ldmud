@@ -305,6 +305,8 @@ typedef struct source_s
 } source_t;
 
 static source_t yyin;
+static source_t pending_include_input;
+static Bool pending_include_active;
   /* Current input source.
    */
 
@@ -2046,18 +2048,7 @@ new_source_file (const char * name, source_loc_t * parent)
     rc = xalloc(sizeof(*rc));
     if (!rc)
         return NULL;
-    if (name)
-    {
-        rc->name = string_copy(name);
-        if (!rc->name)
-        {
-            xfree(rc);
-            return NULL;
-        }
-    }
-    else
-        rc->name = NULL;
-    
+    rc->name = NULL;
     if (parent)
         rc->parent = *parent;
     else
@@ -2065,9 +2056,21 @@ new_source_file (const char * name, source_loc_t * parent)
         rc->parent.file = NULL;
         rc->parent.line = 0;
     }
-
     rc->next = src_file_list;
     src_file_list = rc;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (compile_update_test_fail(COMPILE_TEST_SOURCE_NAME))
+        errorf("Injected source filename failure.\n");
+#endif
+    if (name)
+    {
+        rc->name = xalloc(strlen(name) + 1);
+        if (!rc->name)
+            return NULL;
+        strcpy(rc->name, name);
+    }
+    else
+        rc->name = NULL;
 
     return rc;
 } /* new_source_file() */
@@ -2212,7 +2215,12 @@ lookfor_shared_identifier (const char *s, size_t len, int n, int depth, bool bCr
 #if defined(LEXDEBUG)
                     printf("%s     shifting down inferior.\n", time_stamp());
 #endif
-                    curr = xalloc(sizeof *curr);
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+                    if (compile_update_test_fail(COMPILE_TEST_LOCAL_IDENTIFIER))
+                        curr = NULL;
+                    else
+#endif
+                        curr = xalloc(sizeof *curr);
                     if ( NULL != curr )
                     {
                         curr->name = ref_mstring(inferior->name);
@@ -2227,7 +2235,7 @@ lookfor_shared_identifier (const char *s, size_t len, int n, int depth, bool bCr
                     curr = NULL;
             }
 
-            if (bExactDepth
+            if (curr && bExactDepth
              && (curr->type > n
               || (curr->type == n && n == I_TYPE_LOCAL && curr->u.local.depth > depth)))
             {
@@ -2463,7 +2471,7 @@ free_shared_identifier (ident_t *p)
 } /* free_shared_identifier() */
 
 /*-------------------------------------------------------------------------*/
-static void
+static Bool
 realloc_defbuf (void)
 
 /* Increase the size of defbuf[] (unless it would exceed MAX_TOTAL_BUF).
@@ -2477,45 +2485,63 @@ realloc_defbuf (void)
     size_t old_defbuf_len = defbuf_len;
     char * old_outp = outp;
     ptrdiff_t outp_off;
+    size_t new_len;
+    char *new_buf;
 
     if (MAX_TOTAL_BUF <= defbuf_len)
-      return;
+      return MY_TRUE;
 
     outp_off = &defbuf[defbuf_len] - outp;
 
     /* Double the current size of defbuf, but top off at MAX_TOTAL_BUF. */
     if (defbuf_len > (MAX_TOTAL_BUF >> 1) )
     {
-        defbuf_len = MAX_TOTAL_BUF;
+        new_len = MAX_TOTAL_BUF;
     } else {
-        defbuf_len <<= 1;
+        new_len = defbuf_len << 1;
     }
     if (comp_flag)
-        fprintf(stderr, "%s (reallocating defbuf from %zu (%td left) to %lu) "
+        fprintf(stderr, "%s (reallocating defbuf from %zu (%td left) to %zu) "
                , time_stamp(), old_defbuf_len, (ptrdiff_t)(old_outp-defbuf)
-               , defbuf_len);
-    defbuf = xalloc(defbuf_len);
+               , new_len);
+    new_buf = xalloc(new_len);
+    if (!new_buf)
+    {
+        lexerror("Out of memory for lexer buffer");
+        return MY_FALSE;
+    }
+    defbuf = new_buf;
+    defbuf_len = new_len;
     memcpy(defbuf+defbuf_len-old_defbuf_len, old_defbuf, old_defbuf_len);
     xfree(old_defbuf);
     outp = &defbuf[defbuf_len] - outp_off;
     lastp = lastp - old_outp + outp;
     expandend = expandend - old_outp + outp;
+    return MY_TRUE;
 } /* realloc_defbuf() */
 
 /*-------------------------------------------------------------------------*/
 static void
-set_input_source (int fd, const char* fname, string_t * str)
+init_input_source (source_t *input, int fd, string_t *str)
+
+/* Establish exactly one owner before any diagnostic or encoding hook. */
+
+{
+    memset(input, 0, sizeof(*input));
+    input->fd = fd;
+    input->cd = iconv_init();
+    input->str = str ? ref_mstring(str) : NULL;
+}
+
+static void
+configure_input_source (const char* fname)
 
 /* Set the current input source to <fd>/<str>.
  * If <str> is given, it will be referenced.
  */
 
 {
-    yyin.convbuf = NULL;
-    yyin.convbytes[0] = 0;
-
-    yyin.fd = fd;
-    if (fd != -1)
+    if (yyin.fd != -1)
     {
         /* Initialize the converter. */
         string_t *encoding = NULL;
@@ -2530,8 +2556,8 @@ set_input_source (int fd, const char* fname, string_t * str)
             svalue_t master_sv = svalue_object(master_ob);
 
             /* Setup and call the closure */
-            push_c_string(inter_sp, fname);
-            svp = secure_apply_lambda_ob(driver_hook+H_FILE_ENCODING, 1, &master_sv);
+            compile_push_c_string(fname);
+            svp = compile_apply_lambda(driver_hook+H_FILE_ENCODING, 1, &master_sv);
 
             if (svp && svp->type == T_STRING)
                 encoding = svp->u.str;
@@ -2565,41 +2591,52 @@ set_input_source (int fd, const char* fname, string_t * str)
     else
         yyin.cd = iconv_init();
 
-    yyin.str = str ? ref_mstring(str) : NULL;
-    yyin.current = 0;
+} /* configure_input_source() */
+
+static void
+set_input_source (int fd, const char *fname, string_t *str)
+{
+    init_input_source(&yyin, fd, str);
+    configure_input_source(fname);
 } /* set_input_source() */
 
 /*-------------------------------------------------------------------------*/
 static void
-close_input_source (bool dontclosefd)
+close_source (source_t *input, bool dontclosefd)
 
 /* Close the current input source: a file is closed, a string is deallocated
  * If <dontclosefd> is true, the file descriptor shall stay open.
  */
 
 {
-    if (yyin.fd != -1)
+    if (input->fd != -1)
     {
         if (!dontclosefd)
-            close(yyin.fd);
-        yyin.fd = -1;
+            close(input->fd);
+        input->fd = -1;
     }
-    if (iconv_valid(yyin.cd))
+    if (iconv_valid(input->cd))
     {
-        iconv_close(yyin.cd);
-        yyin.cd = iconv_init();
+        iconv_close(input->cd);
+        input->cd = iconv_init();
     }
-    if (yyin.convbuf != NULL)
+    if (input->convbuf != NULL)
     {
-        xfree(yyin.convbuf);
-        yyin.convbuf = NULL;
+        xfree(input->convbuf);
+        input->convbuf = NULL;
     }
-    if (yyin.str != NULL)
+    if (input->str != NULL)
     {
-        free_mstring(yyin.str);
-        yyin.str = NULL;
+        free_mstring(input->str);
+        input->str = NULL;
     }
-    yyin.current = 0;
+    input->current = 0;
+} /* close_source() */
+
+static void
+close_input_source (bool dontclosefd)
+{
+    close_source(&yyin, dontclosefd);
 } /* close_input_source() */
 
 /*-------------------------------------------------------------------------*/
@@ -3131,6 +3168,11 @@ handle_cond (Bool c)
 
     if (c || skip_to("else", "endif")) {
         p = mempool_alloc(lexpool, sizeof(lpc_ifstate_t));
+        if (!p)
+        {
+            lexerror("Out of memory for preprocessor conditional");
+            return;
+        }
         p->next = iftop;
         iftop = p;
         p->state = c ? EXPECT_ELSE : EXPECT_ENDIF;
@@ -3158,16 +3200,21 @@ start_new_include (int fd, string_t * str
     int inc_depth;
     ptrdiff_t linebufoffset;
 
+    assert(!pending_include_active);
+    init_input_source(&pending_include_input, fd, str);
+    pending_include_active = MY_TRUE;
+
     /* Prepare defbuf for a (nested) include */
     linebufoffset = linebufstart - &defbuf[defbuf_len];
     if (outp - defbuf < 3*MAXLINE)
     {
-        realloc_defbuf();
+        if (!realloc_defbuf())
+            goto failed;
         /* linebufstart is invalid now */
         if (outp - defbuf < 2*MAXLINE)
         {
             lexerror("Maximum total buffer size exceeded");
-            return MY_FALSE;
+            goto failed;
         }
     }
 
@@ -3177,7 +3224,7 @@ start_new_include (int fd, string_t * str
     is = mempool_alloc(lexpool, sizeof(struct incstate));
     if (!is) {
         lexerror("Out of memory");
-        return MY_FALSE;
+        goto failed;
     }
 
     src_file = new_source_file(NULL, &current_loc);
@@ -3185,7 +3232,7 @@ start_new_include (int fd, string_t * str
     {
         mempool_free(lexpool, is);
         lexerror("Out of memory");
-        return MY_FALSE;
+        goto failed;
     }
 
     is->yyin = yyin;
@@ -3208,7 +3255,7 @@ start_new_include (int fd, string_t * str
     {
         mempool_free(lexpool, is);
         lexerror("Out of memory");
-        return MY_FALSE;
+        goto failed;
     }
     strcpy(src_file->name, name);
     if (name_ext)
@@ -3220,6 +3267,12 @@ start_new_include (int fd, string_t * str
 
     /* Now it is save to put the saved state onto the stack*/
     inctop = is;
+    yyin = pending_include_input;
+    pending_include_active = MY_FALSE;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (compile_update_test_fail(COMPILE_TEST_INCLUDE_INPUT))
+        errorf("Injected include input failure.\n");
+#endif
 
     /* Compute the include depth and store the include information */
     for (inc_depth = 0, ip = inctop; ip; ip = ip->next)
@@ -3229,6 +3282,8 @@ start_new_include (int fd, string_t * str
         inctop->inc_offset = store_include_info(name_ext, src_file->name, delim, inc_depth);
     else
         inctop->inc_offset = store_include_info(name, src_file->name, delim, inc_depth);
+    if (inctop->inc_offset == INCLUDE_INFO_INVALID)
+        return MY_FALSE;
 
     /* Initialise the rest of the lexer state */
     current_loc.file = src_file;
@@ -3237,10 +3292,17 @@ start_new_include (int fd, string_t * str
     linebufstart = linebufend - MAXLINE;
     *(outp = linebufend) = '\0';
     expandend  = linebufstart;
-    set_input_source(fd, name, str);
+    configure_input_source(name);
+    if (lex_fatal)
+        return MY_FALSE;
     _myfilbuf();
 
     return MY_TRUE;
+
+failed:
+    close_source(&pending_include_input, false);
+    pending_include_active = MY_FALSE;
+    return MY_FALSE;
 } /* start_new_include() */
 
 /*-------------------------------------------------------------------------*/
@@ -3273,12 +3335,12 @@ add_auto_include (const char * obj_file, const char *cur_file, Bool sys_include)
 
         /* Setup and call the closure */
         if (auto_include_hook == H_AUTO_INCLUDE)
-            push_c_string(inter_sp, obj_file);
+            compile_push_c_string(obj_file);
         else
             push_current_object(inter_sp, "auto_include");
         if (cur_file != NULL)
         {
-            push_c_string(inter_sp, (char *)cur_file);
+            compile_push_c_string((char *)cur_file);
             push_number(inter_sp, sys_include ? 1 : 0);
         }
         else
@@ -3286,7 +3348,7 @@ add_auto_include (const char * obj_file, const char *cur_file, Bool sys_include)
             push_number(inter_sp, 0);
             push_number(inter_sp, 0);
         }
-        svp = secure_apply_lambda_ob(driver_hook+auto_include_hook, 3, &master_sv);
+        svp = compile_apply_lambda(driver_hook+auto_include_hook, 3, &master_sv);
         if (svp && svp->type == T_STRING)
         {
             auto_include_string = svp->u.str;
@@ -3455,7 +3517,7 @@ open_include_file (char *buf, char *name, mp_int namelen, char delim)
     {
         svalue_t *res;
 
-        push_c_n_string(inter_sp, name, namelen);
+        compile_push_c_n_string(name, namelen);
 
         if (!compat_mode)
         {
@@ -3463,13 +3525,13 @@ open_include_file (char *buf, char *name, mp_int namelen, char delim)
             filename = alloca(strlen(current_loc.file->name)+2);
             *filename = '/';
             strcpy(filename+1, current_loc.file->name);
-            push_c_string(inter_sp, filename);
+            compile_push_c_string(filename);
         }
         else
-            push_c_string(inter_sp, current_loc.file->name);
+            compile_push_c_string(current_loc.file->name);
 
         push_number(inter_sp, (delim == '"') ? 0 : 1);
-        res = apply_master(STR_INCLUDE_FILE, 3);
+        res = compile_apply_master(STR_INCLUDE_FILE, 3);
 
         if (res && !(res->type == T_NUMBER && !res->u.number))
         {
@@ -3624,9 +3686,9 @@ open_include_file (char *buf, char *name, mp_int namelen, char delim)
         svalue_t master_sv = svalue_object(master_ob);
 
         /* Setup and call the closure */
-        push_c_string(inter_sp, name);
-        push_c_string(inter_sp, current_loc.file->name);
-        svp = secure_apply_lambda_ob(&driver_hook[H_INCLUDE_DIRS], 2, &master_sv);
+        compile_push_c_string(name);
+        compile_push_c_string(current_loc.file->name);
+        svp = compile_apply_lambda(&driver_hook[H_INCLUDE_DIRS], 2, &master_sv);
 
         /* The result must be legal relative pathname */
         if (!svp || svp->type != T_STRING)
@@ -4179,8 +4241,8 @@ handle_pragma (char *str)
                 svalue_t *res;
 
                 push_ref_string(inter_sp, STR_PRAGMA_NO_SIMUL_EFUNS);
-                push_c_string(inter_sp, current_loc.file->name);
-                res = apply_master(STR_PRIVILEGE, 2);
+                compile_push_c_string(current_loc.file->name);
+                res = compile_apply_master(STR_PRIVILEGE, 2);
 
                 if (!res || res->type != T_NUMBER || res->u.number < 0)
                     lexerror("Privilege violation: pragma no_simul_efuns");
@@ -4382,32 +4444,28 @@ handle_pragma (char *str)
         {
             if (pragma_no_bytes_type)
             {
-                /* Restore the bytes keyword. */
-                ident_t *p = make_shared_identifier("bytes", I_TYPE_RESWORD, 0);
+                /* Insert below a masking define without unlinking its
+                 * owner before the new identifier allocation succeeds.
+                 */
+                ident_t *p;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+                if (compile_update_test_fail(COMPILE_TEST_BYTES_KEYWORD))
+                    p = NULL;
+                else
+#endif
+                    p = insert_shared_identifier_n("bytes", 5, I_TYPE_RESWORD, 0);
                 if (!p)
-                    fatal("Out of memory\n");
+                {
+                    if (!compile_update_is_active())
+                        fatal("Out of memory\n");
+                    compile_update_memory_failed();
+                    lexerror("Out of memory for bytes keyword");
+                    return;
+                }
                 if (p->type == I_TYPE_UNKNOWN)
                 {
                     p->type = I_TYPE_RESWORD;
                     p->u.code = L_BYTES_DECL;
-                }
-                else if (p->type > I_TYPE_RESWORD)
-                {
-                    /* We found a define... We have to insert a new entry below that. */
-                    ident_t *r;
-
-                    /* Remove the define. */
-                    unlink_shared_identifier(p);
-
-                    r = make_shared_identifier("bytes", I_TYPE_RESWORD, 0);
-                    r->type = I_TYPE_RESWORD;
-                    r->u.code = L_BYTES_DECL;
-
-                    /* And reinsert the define. */
-                    assert(ident_table[p->hash] == r);
-                    p->next = r->next;
-                    p->inferior = r;
-                    ident_table[p->hash] = p;
                 }
 
                 pragma_no_bytes_type = false;
@@ -4918,6 +4976,7 @@ add_lex_string (char *str, size_t slen)
     {
         lexerrorf("Out of memory for string concatenation (%zu bytes)",
                   len1+slen);
+        return;
     }
     free_mstring(last_lex_string);
     if (new->info.unicode == STRING_ASCII && !is_ascii(str, slen))
@@ -4954,6 +5013,7 @@ string (char *str, size_t slen)
         {
             lexerrorf("Out of memory for string literal (%zu bytes)",
                       slen);
+            return -1;
         }
     }
     return L_STRING;
@@ -4988,6 +5048,7 @@ bytes (char *str, size_t slen)
         {
             lexerrorf("Out of memory for bytes literal (%zu bytes)",
                       slen);
+            return -1;
         }
     }
     return L_BYTES;
@@ -5230,9 +5291,9 @@ closure (char *in_yyp)
         svalue_t *res;
 
         push_ref_string(inter_sp, STR_NOMASK_SIMUL_EFUN);
-        push_c_string(inter_sp, current_loc.file->name);
+        compile_push_c_string(current_loc.file->name);
         push_ref_string(inter_sp, p->name);
-        res = apply_master(STR_PRIVILEGE, 3);
+        res = compile_apply_master(STR_PRIVILEGE, 3);
         if (!res || res->type != T_NUMBER || res->u.number < 0)
         {
             yyerrorf(
@@ -6274,6 +6335,11 @@ yylex1 (void)
                     /* Find the end of the symbol and make it a shared string. */
                     yyp = skip_alunum(yyp);
                     yylval.symbol.name = new_n_unicode_tabled(wordstart, yyp-wordstart);
+                    if (!yylval.symbol.name)
+                    {
+                        lexerror("Out of memory for symbol literal");
+                        RETURN(-1);
+                    }
                     yylval.symbol.quotes = quotes;
                     RETURN(L_SYMBOL);
                 }
@@ -6534,7 +6600,7 @@ badlex:
 
     /* We come here after an unexpected character */
 
-    if (lex_fatal)
+    if (lex_fatal || compile_update_cancelled())
         return -1;
 
     {
@@ -6631,6 +6697,9 @@ yylex (void)
 {
     int r;
 
+    if (lex_fatal || compile_update_cancelled())
+        return -1;
+
     if (start_token != -1)
     {
         r = start_token;
@@ -6655,7 +6724,7 @@ yylex (void)
 }
 
 /*-------------------------------------------------------------------------*/
-static void
+static Bool
 start_lex ()
 
 /* Prepare the lexer for a new compilation, reset all data structures.
@@ -6664,19 +6733,30 @@ start_lex ()
 {
     ident_t *p;
 
+    lex_fatal = MY_FALSE;
+    lex_error_pos = -1;
+
     cleanup_source_files();
     free_defines();
 
     /* Restore the bytes keyword. */
     p = make_shared_identifier("bytes", I_TYPE_RESWORD, 0);
     if (!p)
-        fatal("Out of memory\n");
+    {
+        lexerror("Out of memory for lexer keyword");
+        return MY_FALSE;
+    }
     p->type = I_TYPE_RESWORD;
     p->u.code = L_BYTES_DECL;
 
     if (!defbuf_len)
     {
         defbuf = xalloc(DEFBUF_1STLEN);
+        if (!defbuf)
+        {
+            lexerror("Out of memory for lexer buffer");
+            return MY_FALSE;
+        }
         defbuf_len = DEFBUF_1STLEN;
     }
 
@@ -6716,6 +6796,7 @@ start_lex ()
     with_end_detection = false;
 
     nexpands = 0;
+    return MY_TRUE;
 
 } /* start_lex() */
 
@@ -6727,6 +6808,11 @@ end_lex ()
  */
 
 {
+    if (pending_include_active)
+    {
+        close_source(&pending_include_input, false);
+        pending_include_active = MY_FALSE;
+    }
     while (inctop)
     {
         struct incstate *p;
@@ -6769,14 +6855,23 @@ start_new_file (int fd, const char * fname)
  */
 
 {
-    start_lex();
+    init_input_source(&yyin, -1, NULL);
+    if (!start_lex())
+        return;
 
     object_file = fname;
 
     current_loc.file = new_source_file(fname, NULL);
+    if (!current_loc.file)
+    {
+        lexerror("Out of memory for lexer source filename");
+        return;
+    }
     current_loc.line = 1; /* already used in first _myfilbuf() */
 
     set_input_source(fd, object_file, NULL);
+    if (lex_fatal)
+        return;
     _myfilbuf();
 
     auto_include_hook = H_AUTO_INCLUDE;
@@ -6806,11 +6901,18 @@ start_new_string (string_t* str, int token, int auto_include_hook_expr)
 {
     program_t *prog = get_current_object_program();
 
-    start_lex();
+    init_input_source(&yyin, -1, NULL);
+    if (!start_lex())
+        return;
 
     object_file = "";
 
     current_loc.file = new_source_file(NULL, NULL);
+    if (!current_loc.file)
+    {
+        lexerror("Out of memory for lexer source filename");
+        return;
+    }
     current_loc.file->name = xalloc(mstrsize(prog->name) + 10);
     if (!current_loc.file->name)
         lexerror("Out of memory");
@@ -6905,6 +7007,16 @@ lex_close (char *msg)
         /* skip back terminating \0 and 8 digits */
         sprintf(buf + sizeof buf - 9, "%d", i);
         msg = buf;
+    }
+
+    if (compile_update_is_active())
+    {
+        /* The suspended parser and hook callers may still borrow the
+         * input. Preserve it until the parser returns and aborts normally.
+         */
+        compile_update_memory_failed();
+        lexerror(msg);
+        return;
     }
 
     end_lex();
@@ -8281,8 +8393,12 @@ cond_get_exp (int priority, svalue_t *svp)
     p_int value = 0;
     char *opstart;      /* Will point to the first character of the last op. */
 
-    svp->type = T_INVALID;
+    put_number(svp, 0);
+    if (lex_fatal || compile_update_cancelled())
+        return 0;
     do c = exgetc(NULL); while ( unicode_iswhite(c) );
+    if (lex_fatal || compile_update_cancelled())
+        goto failed;
 
     /* Evaluate the first value */
 
@@ -8291,6 +8407,8 @@ cond_get_exp (int priority, svalue_t *svp)
         /* It's a parenthesized subexpression */
 
         value = cond_get_exp(0, svp);
+        if (lex_fatal || compile_update_cancelled())
+            goto failed;
 
         do c = exgetc(NULL); while ( lexwhite(c) );
         if ( c != ')' )
@@ -8337,7 +8455,19 @@ cond_get_exp (int priority, svalue_t *svp)
                 *q++ = (char)c;
             }
             *q = '\0';
-            put_c_string(svp, outp);
+            string_t *text;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+            if (compile_update_test_fail(COMPILE_TEST_PREPROCESSOR_STRING))
+                text = NULL;
+            else
+#endif
+                text = new_unicode_mstring(outp);
+            if (!text)
+            {
+                lexerror("Out of memory for preprocessor string");
+                goto failed;
+            }
+            put_string(svp, text);
             outp = p;
         }
         else
@@ -8352,6 +8482,8 @@ cond_get_exp (int priority, svalue_t *svp)
 
             /* Get the value for this unary operator */
             value = cond_get_exp(12, svp);
+            if (lex_fatal || compile_update_cancelled())
+                goto failed;
 
             /* Evaluate the operator */
             switch ( optab2[x-1] )
@@ -8437,6 +8569,9 @@ cond_get_exp (int priority, svalue_t *svp)
         int x;
         char c2;
 
+        if (lex_fatal || compile_update_cancelled())
+            goto failed;
+
         do c=exgetc(&opstart); while ( lexwhite(c) );
 
         /* An operator or string must come next */
@@ -8482,6 +8617,11 @@ cond_get_exp (int priority, svalue_t *svp)
 
         /* Get the second operand */
         value2 = cond_get_exp(optab2[x+2], &sv2);
+        if (lex_fatal || compile_update_cancelled())
+        {
+            free_svalue(&sv2);
+            goto failed;
+        }
 
         /* Evaluate the operands:
          *   Full set of operations for numbers.
@@ -8539,8 +8679,25 @@ cond_get_exp (int priority, svalue_t *svp)
             x = optab2[x+1];
             if (x == BPLUS)
             {
-                svp->u.str = mstr_append(svp->u.str, sv2.u.str);
+                string_t *text;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+                if (compile_update_test_fail(COMPILE_TEST_PREPROCESSOR_APPEND))
+                {
+                    free_mstring(svp->u.str);
+                    text = NULL;
+                }
+                else
+#endif
+                    text = mstr_append(svp->u.str, sv2.u.str);
+                /* mstr_append consumes the left string even on failure. */
+                put_number(svp, 0);
                 free_string_svalue(&sv2);
+                if (!text)
+                {
+                    lexerror("Out of memory for preprocessor concatenation");
+                    goto failed;
+                }
+                put_string(svp, text);
             }
             else
             {
@@ -8575,6 +8732,11 @@ cond_get_exp (int priority, svalue_t *svp)
 
     outp = opstart;
     return value;
+
+failed:
+    free_svalue(svp);
+    put_number(svp, 0);
+    return 0;
 } /* cond_get_expr() */
 
 /*-------------------------------------------------------------------------*/
@@ -8684,7 +8846,10 @@ get_current_function (char ** args UNUSED)
 
     if (!name) {
         lexerror("__FUNCTION__ outside of function definition");
-        return string_copy("");
+        char *empty = xalloc(1);
+        if (empty)
+            *empty = '\0';
+        return empty;
     }
 
     char *buf = xalloc(strlen(name) + 4);
@@ -9183,4 +9348,3 @@ f_expand_define (svalue_t *sp)
 } /* f_expand_define() */
 
 /***************************************************************************/
-
