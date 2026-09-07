@@ -79,7 +79,7 @@ void terminal_gc_done(int failed)
     else
     {
         msg("BLUEPRINT_UPDATE_ENABLED: %d checks passed.\n", checks);
-        finish(0);
+        load_object("schemas").run(#'finish);
     }
 }
 
@@ -218,7 +218,7 @@ void run_test()
     object blueprint;
 
     msg("\nRunning blueprint update lifecycle tests:\n");
-    call_out(#'finish, 20 * __ALARM_TIME__, 1);
+    call_out(#'finish, 90 * __ALARM_TIME__, 1);
     rm("target.c");
     copy_file("v1.c", "target.c");
     blueprint = load_object("target");

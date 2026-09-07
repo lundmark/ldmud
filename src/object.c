@@ -148,6 +148,7 @@
  */
 
 #include "driver.h"
+#include "program_schema.h"
 #include "typedefs.h"
 
 #include "my-alloca.h"
@@ -616,6 +617,11 @@ _free_prog (program_t *progp, Bool free_all, const char * file, int line
  */
 
 {
+#if defined(DEBUG) && defined(USE_BLUEPRINT_UPDATE)
+    if (free_all)
+        program_schema_check(progp);
+#endif
+    /* Schema tables are embedded; progp->types owns their type references. */
     /* Decrement the refcount */
 
     progp->ref--;

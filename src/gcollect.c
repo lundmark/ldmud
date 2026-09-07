@@ -77,6 +77,7 @@
  */
 
 #include "driver.h"
+#include "program_schema.h"
 #include "typedefs.h"
 
 #include <sys/types.h>
@@ -663,6 +664,10 @@ cleanup_structures (cleanup_t * context)
         }
     }
 
+#ifdef USE_BLUEPRINT_UPDATE
+    program_update_cleanup(context);
+#endif
+
 #ifdef USE_PYTHON
     cleanup_python_data(context);
 #endif
@@ -1123,6 +1128,10 @@ clear_program_ref (program_t *p, Bool clear_ref)
 {
     int i;
 
+#if defined(DEBUG) && defined(USE_BLUEPRINT_UPDATE)
+    program_schema_check(p);
+#endif
+    /* Internal schema argument types share the existing types root table. */
     if (clear_ref)
     {
         p->ref = 0;

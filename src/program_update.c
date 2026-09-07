@@ -1,11 +1,14 @@
 /* Deferred blueprint update request ownership and reporting.
  * This stage performs no compilation or migration. Terminal failure state is
- * reserved in the admission allocation, so backend completion never allocates.
+ * reserved in the admission allocation. Schema diagnostics may allocate within
+ * the backend recovery boundary, with partial summaries rooted in the request.
  */
 #include "driver.h"
 #ifdef USE_BLUEPRINT_UPDATE
 #include <assert.h>
 #include "program_update.h"
+#include "program_schema.h"
+#include "efuns.h"
 #include "array.h"
 #include "backend.h"
 #include "exec.h"
@@ -28,7 +31,7 @@
 
 enum update_root
 {
-    UPDATE_ORIGIN, UPDATE_SOURCE, UPDATE_TARGETS, UPDATE_NUM_ROOTS
+    UPDATE_ORIGIN, UPDATE_SCHEMAS, UPDATE_SOURCE, UPDATE_TARGETS, UPDATE_NUM_ROOTS
 };
 typedef struct program_update_request_s
 {
@@ -40,6 +43,7 @@ typedef struct program_update_request_s
     program_t *source_program;    /* Exact generation, independently pinned. */
     svalue_t roots[UPDATE_NUM_ROOTS];
     p_int id;
+    p_int candidate_generation;
     time_t completed_at;
     Bool source_from_path;
     Bool explicit_selection;
@@ -141,6 +145,7 @@ free_request (program_update_request_t *request)
     *link = request->next;
     release_inputs(request);
     free_svalue(&request->roots[UPDATE_ORIGIN]);
+    free_svalue(&request->roots[UPDATE_SCHEMAS]);
     xfree(request);
 } /* free_request() */
 
@@ -338,6 +343,91 @@ validate_targets (program_update_request_t *request, Bool admission)
             errorf("update_blueprint(): variable storage limit exceeded.\n");
     }
 } /* validate_targets() */
+
+static void
+describe_schemas (program_update_request_t *request)
+
+/* Build immutable summaries for every represented old program. The source
+ * and all live programs remain pinned through the object roots/list while
+ * this native pass executes. No LPC callbacks run. Store partial results in
+ * the global request root before any fallible work, including comparison.
+ */
+{
+    vector_t *targets = request->explicit_selection
+                        ? request->roots[UPDATE_TARGETS].u.vec : NULL;
+    svalue_t *root = &request->roots[UPDATE_SCHEMAS];
+    size_t scanned = 0, count = 0, work = 0;
+    size_t remaining = BLUEPRINT_UPDATE_MAX_BYTES;
+    size_t capacity = targets ? VEC_SIZE(targets) : 0;
+    object_t *object;
+    vector_t *trimmed;
+
+    if (request->source_from_path)
+        return;
+    request->candidate_generation = request->source_program->schema_generation;
+    if (!targets)
+    {
+        for (object = obj_list; object; object = object->next_all)
+        {
+            if (++scanned > BLUEPRINT_UPDATE_MAX_SCAN_OBJECTS)
+                errorf("update_blueprint(): schema scan limit exceeded.\n");
+            if (!(object->flags & O_DESTRUCTED) && (object->flags & O_CLONE)
+             && same_family(object, request->roots[UPDATE_ORIGIN].u.str)
+             && object->prog != request->source_program)
+                capacity++;
+        }
+        scanned = 0;
+    }
+    put_array(root, allocate_array(capacity));
+    for (object = targets ? NULL : obj_list; targets || object;
+         object = targets ? NULL : object->next_all)
+    {
+        size_t previous;
+        if (targets)
+        {
+            if (scanned == VEC_SIZE(targets))
+                break;
+            if (targets->item[scanned].type != T_OBJECT)
+            {
+                scanned++;
+                continue;
+            }
+            object = targets->item[scanned].u.ob;
+        }
+        if (++scanned > BLUEPRINT_UPDATE_MAX_SCAN_OBJECTS)
+            errorf("update_blueprint(): schema scan limit exceeded.\n");
+        if (object->flags & O_DESTRUCTED)
+            continue;
+        if (!targets && (!(object->flags & O_CLONE)
+                     || !same_family(object, request->roots[UPDATE_ORIGIN].u.str)))
+            continue;
+        if (object->prog == request->source_program)
+            continue;
+        for (previous = 0; previous < count; previous++)
+        {
+            svalue_t *generation;
+            if (++work > BLUEPRINT_UPDATE_MAX_SCAN_OBJECTS)
+                errorf("update_blueprint(): schema generation scan limit exceeded.\n");
+            /* The temporary key is stack-rooted during lookup. */
+            push_c_string(inter_sp, "old_generation");
+            generation = get_map_value(root->u.vec->item[previous].u.map, inter_sp);
+            pop_stack();
+            if (generation->u.number == object->prog->schema_generation)
+                break;
+        }
+        if (previous != count)
+            continue;
+        if (count == BLUEPRINT_UPDATE_MAX_TARGETS)
+            errorf("update_blueprint(): schema generation limit exceeded.\n");
+        program_schema_compare(object->prog, request->source_program,
+                               &root->u.vec->item[count++], &remaining);
+        if (!remaining)
+            break;
+    }
+    trimmed = slice_array(root->u.vec, 0, count - 1);
+    free_svalue(root);
+    put_array(root, trimmed);
+} /* describe_schemas() */
 
 static void
 validate_capacity (program_update_request_t *self)
@@ -550,9 +640,18 @@ f_update_blueprint_result (svalue_t *sp)
     put_c_string(report_field(report, "status"), request->terminal ? "failed" : "pending");
     for (i = 0; i < sizeof(numeric_fields) / sizeof(numeric_fields[0]); i++)
         put_number(report_field(report, numeric_fields[i]), 0);
+    put_number(report_field(report, "candidate_generation"), request->candidate_generation);
     put_number(report_field(report, "completed_at"), request->completed_at);
     field = report_field(report, "variable_changes");
-    put_array(field, allocate_array(0));
+    if (request->roots[UPDATE_SCHEMAS].type == T_POINTER)
+    {
+        push_svalue(&request->roots[UPDATE_SCHEMAS]);
+        inter_sp = f_deep_copy(inter_sp);
+        transfer_svalue_no_free(field, inter_sp);
+        inter_sp--;
+    }
+    else
+        put_array(field, allocate_array(0));
     field = report_field(report, "errors");
     put_array(field, allocate_array(request->terminal ? 1 : 0));
     if (request->terminal)
@@ -626,12 +725,22 @@ program_update_process (void)
             active->validation_failed = MY_TRUE;
             mark_end_evaluation();
             clear_state();
+            /* Partial summaries are never exposed as completed evidence. */
+            free_svalue(&active->roots[UPDATE_SCHEMAS]);
+            put_number(&active->roots[UPDATE_SCHEMAS], 0);
+            active->candidate_generation = 0;
         }
         else if (!active->canceled)
         {
             mark_start_evaluation();
             validate_source(active);
             validate_targets(active, MY_FALSE);
+            /* Mapping allocations charge the submitting owner. This native
+             * pass invokes no LPC and restores the idle backend context.
+             */
+            set_current_object(active->owner);
+            describe_schemas(active);
+            clear_current_object();
             /* Future compiler and migration hooks belong in this boundary. */
             mark_end_evaluation();
         }
@@ -684,6 +793,18 @@ program_update_shutdown (void)
     while (requests)
         free_request(requests);
 } /* program_update_shutdown() */
+
+void
+program_update_cleanup (cleanup_t *context)
+
+/* Include request-owned aggregate roots in the ordinary data-clean pass,
+ * which compacts mapping hashes before the collector clears references.
+ */
+{
+    program_update_request_t *request;
+    for (request = requests; request; request = request->next)
+        cleanup_vector(request->roots, UPDATE_NUM_ROOTS, context);
+} /* program_update_cleanup() */
 
 #ifdef GC_SUPPORT
 void

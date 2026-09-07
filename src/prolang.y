@@ -444,6 +444,14 @@ enum e_saved_areas {
     /* (struct_def_t) Tabled descriptors of all struct definitions.
      */
 
+#ifdef USE_BLUEPRINT_UPDATE
+ , A_SCHEMA_FUNCTION_FLAGS
+    /* (funflag_t) Effective flags before addresses overwrite low flag bits. */
+ , A_SCHEMA_ARGUMENTS
+    /* (schema_argument_s) Internal declared argument evidence, even without
+     * exact_types or save_types. Type references are owned by A_TYPES.
+     */
+#endif
  , NUMPAREAS  /* Number of saved areas */
 };
 
@@ -460,6 +468,10 @@ typedef unsigned short       A_ARGUMENT_TYPE_INDEX_t;
 typedef unsigned short       A_ARGUMENT_INDEX_t;
 typedef include_t            A_INCLUDES_t;
 typedef struct_def_t         A_STRUCT_DEFS_t;
+#ifdef USE_BLUEPRINT_UPDATE
+typedef struct schema_argument_s A_SCHEMA_ARGUMENTS_t;
+typedef funflag_t A_SCHEMA_FUNCTION_FLAGS_t;
+#endif
 
 enum e_internal_areas {
    A_FUNCTIONS = NUMPAREAS
@@ -1103,6 +1115,9 @@ static char *last_yalloced = NULL;
    */
 
 static program_t NULL_program;
+#ifdef USE_BLUEPRINT_UPDATE
+static p_int schema_generation;
+#endif
   /* Empty program_t structure for initialisations.
    */
 
@@ -5701,6 +5716,10 @@ define_new_function ( Bool complete, ident_t *p, int num_arg, int num_local
         heart_beat = FUNCTION_COUNT;
 
     /* Fill in the function_t */
+#ifdef USE_BLUEPRINT_UPDATE
+    fun.schema_argument_start = UINT_MAX;
+    fun.schema_kind = SCHEMA_FUNCTION_GENERATED;
+#endif
     fun.name      = p->name;
     fun.offset.pc = offset;
     fun.flags     = flags;
@@ -5838,6 +5857,12 @@ define_variable (ident_t *name, fulltype_t type)
 
     type.t_flags = flags;
 
+#ifdef USE_BLUEPRINT_UPDATE
+    /* Programs are swapped as raw blocks: initialize the padding introduced
+     * by the declaration marker as well as the marker itself.
+     */
+    memset(&dummy, 0, sizeof(dummy));
+#endif
     dummy.name = ref_mstring(name->name);
     dummy.type = ref_fulltype(type);
 
@@ -6003,6 +6028,13 @@ define_global_variable (ident_t* name, fulltype_t actual_type, Bool with_init)
 
     name = define_variable(name, actual_type);
     i = name->u.global.variable;
+#ifdef USE_BLUEPRINT_UPDATE
+    /* Hidden insertions need not update the visible identifier index. */
+    if (actual_type.t_flags & TYPE_MOD_VIRTUAL)
+        V_VARIABLE(V_VARIABLE_COUNT - 1)->schema_declared = true;
+    else
+        NV_VARIABLE(NV_VARIABLE_COUNT - 1)->schema_declared = true;
+#endif
 
 #ifdef DEBUG
     if (name->type != I_TYPE_GLOBAL || i == I_GLOBAL_VARIABLE_OTHER)
@@ -6173,6 +6205,14 @@ get_function_information (function_t * fun_p, program_t * prog, int ix)
     int inhfx;
     function_t * header = get_function_header_extended(prog, ix, &inhprogp, &inhfx);
 
+#ifdef USE_BLUEPRINT_UPDATE
+    /* Inherited headers use their defining program's argument table. If a
+     * later compiler pass turns this entry into an own undefined stub, the
+     * missing local evidence must remain explicit.
+     */
+    fun_p->schema_argument_start = UINT_MAX;
+    fun_p->schema_kind = header->schema_kind;
+#endif
     fun_p->name = header->name;
     fun_p->type = ref_lpctype(header->type);
 
@@ -6319,6 +6359,31 @@ def_function_prototype (int num_args, Bool is_inline)
     fun = define_new_function( MY_FALSE, ident, num_args, 0, 0
                              , NAME_UNDEFINED|NAME_PROTOTYPE|(coroutine?TYPE_MOD_COROUTINE:0)
                              , returntype);
+
+#ifdef USE_BLUEPRINT_UPDATE
+    /* Capture the actual declaration independently of compiler type checking.
+     * Inherited headers resolve their own table through their defining program.
+     * Repeated prototypes may leave unused scalar entries, never extra roots.
+     */
+    FUNCTION(fun)->schema_argument_start = GET_BLOCK_COUNT(A_SCHEMA_ARGUMENTS);
+    FUNCTION(fun)->schema_kind = is_inline ? SCHEMA_FUNCTION_INLINE
+                                          : SCHEMA_FUNCTION_NAMED;
+    for (int arg = 0; arg < num_args; arg++)
+    {
+        struct schema_argument_s entry;
+        lpctype_t *type = local_variables[arg].type.t_type;
+        int index = get_type_index(type ? type : lpctype_mixed);
+        if (index < 0)
+        {
+            yyerror("Too many schema argument types");
+            break;
+        }
+        memset(&entry, 0, sizeof(entry));
+        entry.type_index = index;
+        entry.flags = local_variables[arg].type.t_flags;
+        add_to_mem_block(A_SCHEMA_ARGUMENTS, &entry, sizeof(entry));
+    }
+#endif
 
     /* Store the data */
     if (is_inline)
@@ -22719,6 +22784,9 @@ epilog (void)
              * the function's flags.
              */
             flags = f->flags;
+#ifdef USE_BLUEPRINT_UPDATE
+            add_to_mem_block(A_SCHEMA_FUNCTION_FLAGS, &flags, sizeof(flags));
+#endif
             f->flags = flags & NAME_INHERITED ?
               (flags & ~INHERIT_MASK)  | (f->offset.inherit & INHERIT_MASK) :
               (flags & ~FUNSTART_MASK) | (f->offset.pc & FUNSTART_MASK);
@@ -22949,6 +23017,10 @@ epilog (void)
 }
 #endif /* 0 */
 
+#ifdef USE_BLUEPRINT_UPDATE
+        if (schema_generation == PINT_MAX)
+            yyerror("Blueprint schema generation identifiers exhausted");
+#endif
         /* On error, don't create anything */
         if (num_parse_error > 0 || inherit_file)
             break;
@@ -23004,6 +23076,9 @@ epilog (void)
                     | (uses_non_lightweight_efuns ? P_USE_NONLW_EFUNS : 0)
                     ;
 
+#ifdef USE_BLUEPRINT_UPDATE
+        prog->schema_generation = ++schema_generation;
+#endif
         prog->load_time = current_time;
 
         total_prog_block_size += prog->total_size + mstrsize(prog->name);
@@ -23191,6 +23266,24 @@ epilog (void)
             prog->argument_types = NULL;
             prog->type_start = NULL;
         }
+
+#ifdef USE_BLUEPRINT_UPDATE
+        prog->schema_function_flags = (A_SCHEMA_FUNCTION_FLAGS_t *)p;
+        /* The last scalar entry may leave pointer-alignment padding. */
+        memset(p, 0, align(mem_block[A_SCHEMA_FUNCTION_FLAGS].current_size));
+        if (mem_block[A_SCHEMA_FUNCTION_FLAGS].current_size)
+            memcpy(p, mem_block[A_SCHEMA_FUNCTION_FLAGS].block,
+                      mem_block[A_SCHEMA_FUNCTION_FLAGS].current_size);
+        p += align(mem_block[A_SCHEMA_FUNCTION_FLAGS].current_size);
+        prog->num_schema_arguments = GET_BLOCK_COUNT(A_SCHEMA_ARGUMENTS);
+        if (prog->num_schema_arguments)
+        {
+            prog->schema_arguments = (A_SCHEMA_ARGUMENTS_t *)p;
+            memcpy(p, mem_block[A_SCHEMA_ARGUMENTS].block,
+                      mem_block[A_SCHEMA_ARGUMENTS].current_size);
+            p += align(mem_block[A_SCHEMA_ARGUMENTS].current_size);
+        }
+#endif
 
         /* Add the lightweight object call cache.
          */

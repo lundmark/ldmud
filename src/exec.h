@@ -375,6 +375,9 @@ enum function_header_sizes {
 struct variable_s
 {
     string_t   *name;   /* Name of the variable (shared string) */
+#ifdef USE_BLUEPRINT_UPDATE
+    bool schema_declared; /* True only for a declaration in this program. */
+#endif
     fulltype_t  type;
       /* Type and visibility of the variable (type object counted).
        * If a variable is inherited virtually, the function flag
@@ -437,6 +440,9 @@ struct inherit_s
       /* Offset of the inherited program's variables block within the
        * inheriting program's variable block. This offset points
        * to the first non-virtual variable of <prog>.
+       *
+       * For normal inherits this is relative to this program's nonvirtual
+       * block; virtual/extra inherits are relative to its complete block.
        *
        * The NON_VIRTUAL_OFFSET_TAG marks the variables of non-virtual
        * inherits temporarily during compiles.
@@ -585,6 +591,24 @@ struct call_cache_s
  * TODO:: the program even for clones.
  */
 
+#ifdef USE_BLUEPRINT_UPDATE
+/* Scalar internal signature entries; type references belong to prog->types.
+ * This table is independent of the public save_types tables.
+ */
+struct schema_argument_s
+{
+    unsigned short type_index;
+    typeflags_t flags;
+};
+
+enum schema_function_kind
+{
+    SCHEMA_FUNCTION_GENERATED,
+    SCHEMA_FUNCTION_NAMED,
+    SCHEMA_FUNCTION_INLINE
+};
+#endif
+
 struct program_s
 {
     p_int           ref;           /* Reference count */
@@ -610,6 +634,12 @@ struct program_s
        * information for this program without actually pointing to
        * the structure.
        */
+#ifdef USE_BLUEPRINT_UPDATE
+    p_int schema_generation; /* Monotonic for this driver lifetime, never reused. */
+    struct schema_argument_s *schema_arguments; /* Embedded, relocatable table. */
+    unsigned int num_schema_arguments;
+    funflag_t *schema_function_flags; /* Effective flags before address encoding. */
+#endif
     mp_int          load_time;     /* When has it been compiled ? */
     linenumbers_t  *line_numbers;
       /* Line number information, NULL when not swapped in.
@@ -853,6 +883,10 @@ struct function_s
 
     funflag_t     flags;      /* Function flags */
     lpctype_t    *type;       /* Return type of function (counted). */
+#ifdef USE_BLUEPRINT_UPDATE
+    unsigned int schema_argument_start;
+    unsigned char schema_kind; /* enum schema_function_kind */
+#endif
     unsigned char num_locals; /* Number of local variables */
     unsigned char num_arg;    /* Number of arguments needed. */
     unsigned char num_opt_arg;/* Number of optional arguments (with default values). */

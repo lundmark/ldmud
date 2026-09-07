@@ -224,6 +224,7 @@
 #include "mstrings.h"
 #include "object.h"
 #include "program_update.h"
+#include "program_schema.h"
 #include "otable.h"
 #include "parse.h"
 #include "prolang.h"
@@ -23754,6 +23755,10 @@ count_extra_ref_in_prog (program_t *prog)
 /* Count extra refs for <prog>.
  */
 {
+#ifdef USE_BLUEPRINT_UPDATE
+    program_schema_check(prog);
+#endif
+
     if (NULL != register_pointer(ptable, prog))
     {
         prog->extra_ref = 1;

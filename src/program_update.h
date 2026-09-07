@@ -28,6 +28,7 @@ extern void program_update_process(void);
 
 extern void program_update_owner_destructed(object_t *owner);
 extern void program_update_shutdown(void);
+extern void program_update_cleanup(cleanup_t *context);
 
 /* --- GC and DEBUG root accounting --- */
 
