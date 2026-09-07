@@ -378,6 +378,7 @@ extern int last_instructions(int length, Bool verbose, svalue_t **svpp);
 #ifdef DEBUG
 extern int check_state(void);
 extern void count_inherits(program_t *progp);
+extern void count_extra_ref_in_prog(program_t *prog);
 extern void count_extra_ref_in_object(object_t *ob);
 extern void count_extra_ref_in_vector(svalue_t *svp, size_t num);
 extern void check_a_lot_ref_counts(program_t *search_prog);

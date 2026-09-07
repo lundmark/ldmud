@@ -63,6 +63,7 @@
 #include "mregex.h"
 #include "mstrings.h"
 #include "object.h"
+#include "program_update.h"
 #include "otable.h"
 #include "pkg-python.h"
 #include "random.h"
@@ -807,6 +808,9 @@ backend (void)
 
             if (game_is_being_shut_down)
             {
+#ifdef USE_BLUEPRINT_UPDATE
+                program_update_shutdown();
+#endif
                 command_giver = NULL;
                 clear_current_object();
                 return;
@@ -1013,6 +1017,9 @@ backend (void)
         if (time_to_call_heart_beat)
         {
             struct timeval cur_time;
+#ifdef USE_BLUEPRINT_UPDATE
+            program_update_detach();
+#endif
             gettimeofday(&cur_time, NULL);
             // Round the time. This prevents problems with tv_sec fluctuating between
             // values very near of whole seconds (e.g. .99999s and .000001s) which
@@ -1034,6 +1041,9 @@ backend (void)
              * correctly timed.
              */
             next_call_out_cycle();
+#ifdef USE_BLUEPRINT_UPDATE
+            program_update_process();
+#endif
 
             /* Do the timed events */
             if (!synch_heart_beats

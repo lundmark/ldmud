@@ -28,6 +28,10 @@ struct object_s
 #ifdef DEBUG
     p_int extra_ref;      /* Used to check ref count. */
 #endif
+#ifdef USE_BLUEPRINT_UPDATE
+    struct program_update_request_s *program_updates;
+      /* Non-owning reverse links for requests owned by this object. */
+#endif
     program_t *prog;      /* Program code for this object */
     string_t *name;
       /* name of the object (untabled), always w/o leading '/' */

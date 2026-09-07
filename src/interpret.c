@@ -223,6 +223,7 @@
 #include "mapping.h"
 #include "mstrings.h"
 #include "object.h"
+#include "program_update.h"
 #include "otable.h"
 #include "parse.h"
 #include "prolang.h"
@@ -23748,7 +23749,7 @@ check_extra_ref_in_mapping_filter (svalue_t *key, svalue_t *data
     check_extra_ref_in_vector(data, (size_t)extra);
 }
 
-static void
+void
 count_extra_ref_in_prog (program_t *prog)
 /* Count extra refs for <prog>.
  */
@@ -24250,6 +24251,9 @@ check_a_lot_ref_counts (program_t *search_prog)
     count_extra_ref_from_wiz_list();
     count_simul_efun_extra_refs(ptable);
     count_comm_extra_refs();
+#ifdef USE_BLUEPRINT_UPDATE
+    program_update_count_extra_refs();
+#endif
 #ifdef USE_PYTHON
     count_python_extra_refs();
 #endif

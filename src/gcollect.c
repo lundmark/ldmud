@@ -109,6 +109,7 @@
 #include "mregex.h"
 #include "mstrings.h"
 #include "object.h"
+#include "program_update.h"
 #include "otable.h"
 #include "parse.h"
 #include "pkg-pgsql.h"
@@ -2384,6 +2385,9 @@ garbage_collection(void)
     clear_compiler_refs();
     clear_simul_efun_refs();
     clear_interpreter_refs();
+#ifdef USE_BLUEPRINT_UPDATE
+    program_update_clear_refs();
+#endif
     clear_comm_refs();
     clear_rxcache_refs();
     clear_tabled_struct_refs();
@@ -2607,6 +2611,9 @@ garbage_collection(void)
     note_otable_ref();
     count_comm_refs();
     count_interpreter_refs();
+#ifdef USE_BLUEPRINT_UPDATE
+    program_update_count_refs();
+#endif
     count_heart_beat_refs();
     count_std_struct_refs();
     count_rxcache_refs();

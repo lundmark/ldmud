@@ -58,6 +58,7 @@
 #include "mregex.h"
 #include "mstrings.h"
 #include "object.h"
+#include "program_update.h"
 #include "otable.h"
 #ifdef USE_TLS
 #include "pkg-tls.h"
@@ -3406,6 +3407,9 @@ destruct (object_t *ob)
 #ifdef USE_PYTHON
     python_call_hook_object(PYTHON_HOOK_ON_OBJECT_DESTRUCTED, false, ob);
 #endif /* USE_PYTHON */
+#ifdef USE_BLUEPRINT_UPDATE
+    program_update_owner_destructed(ob);
+#endif
     ob->time_reset = 0;
 
     /* We need the object in memory */

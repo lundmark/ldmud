@@ -917,6 +917,9 @@ init_lexer(void)
 #ifdef USE_XML
     add_permanent_define_str("__XML_DOM__", -1, "1");
 #endif
+#ifdef USE_BLUEPRINT_UPDATE
+    add_permanent_define_str("__BLUEPRINT_UPDATE__", -1, "1");
+#endif
 #ifdef USE_JSON
     add_permanent_define_str("__JSON__", -1, "1");
 #endif
