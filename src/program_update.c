@@ -198,6 +198,22 @@ validate_object(object_t *object, string_t *origin, Bool source)
             errorf("update_blueprint(): pending replace_program conflict.\n");
 }
 
+/* Admission and execution share the same captured source contract. A new
+ * blueprint at the same pathname cannot replace the admitted identity.
+ */
+static void
+validate_source(program_update_request_t *request)
+{
+    object_t *source;
+
+    if (request->roots[UPDATE_SOURCE].type != T_OBJECT)
+        errorf("update_blueprint(): captured source was destructed.\n");
+    source = request->roots[UPDATE_SOURCE].u.ob;
+    validate_object(source, request->roots[UPDATE_ORIGIN].u.str, MY_TRUE);
+    if (source->prog != request->source_program)
+        errorf("update_blueprint(): captured source program changed.\n");
+}
+
 static void
 validate_targets(program_update_request_t *request, Bool admission)
 {
@@ -345,9 +361,7 @@ v_update_blueprint(svalue_t *sp, int num_arg)
     if (request->canceled || !request->owner
      || request->roots[UPDATE_SOURCE].type != T_OBJECT)
         errorf("update_blueprint(): owner or source was destructed.\n");
-    validate_object(source, request->roots[UPDATE_ORIGIN].u.str, MY_TRUE);
-    if (source->prog != request->source_program)
-        errorf("update_blueprint(): source program changed during authorization.\n");
+    validate_source(request);
     validate_capacity(request);
     validate_targets(request, MY_TRUE);
     if (last_id == PINT_MAX)
@@ -457,6 +471,7 @@ program_update_process(void)
         else if (!active->canceled)
         {
             mark_start_evaluation();
+            validate_source(active);
             validate_targets(active, MY_FALSE);
             /* Future compiler and migration hooks belong in this boundary. */
             mark_end_evaluation();

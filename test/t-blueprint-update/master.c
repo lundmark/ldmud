@@ -61,6 +61,7 @@ void require(int condition, string description)
 
 #ifdef __BLUEPRINT_UPDATE__
 void advance();
+void source_invalidated(int from_path);
 
 void pending_gc_done(int failed)
 {
@@ -80,6 +81,41 @@ void terminal_gc_done(int failed)
         msg("BLUEPRINT_UPDATE_ENABLED: %d checks passed.\n", checks);
         finish(0);
     }
+}
+
+void check_invalidated_source(int from_path)
+{
+    mixed err = catch(funcall(
+        function void()
+        {
+            mapping report = update_blueprint_result(pending_id);
+            require(report["status"] == "failed" && report["updated"] == 0
+                    && sizeof(report["errors"])
+                    && report["errors"][0]["code"] == "VALIDATION_FAILED",
+                    from_path ? "deferred string source invalidation"
+                              : "deferred object source invalidation");
+            require(replacement.behavior_version() == 2
+                    && first.behavior_version() == 1 && first.hp_value() == 41
+                    && second.behavior_version() == 1 && second.hp_value() == 73,
+                    "source revalidation preserves reloaded blueprint and old clones");
+            if (!from_path)
+                source_invalidated(1);
+            else
+                start_gc(#'terminal_gc_done);
+        }); publish);
+    if (err)
+        finish(1);
+}
+
+void source_invalidated(int from_path)
+{
+    pending_id = from_path ? update_blueprint("/target.c", ({}))
+                           : update_blueprint(replacement, ({}));
+    require(update_blueprint_result(pending_id)["status"] == "pending",
+            "empty-selection request is initially pending");
+    destruct(replacement);
+    replacement = load_object("target");
+    call_out(#'check_invalidated_source, __ALARM_TIME__ + 1, from_path);
 }
 
 void lifecycle()
@@ -164,7 +200,7 @@ void advance()
                 require(!!catch(first.request_update(load_object("v2"))), "source destruction during privilege check");
                 deny_update = 0;
                 require(checks >= 25, "enabled tests executed");
-                start_gc(#'terminal_gc_done);
+                source_invalidated(0);
                 return;
             }
             require(pending_id == previous_id + 1, "request identifiers increase monotonically");
