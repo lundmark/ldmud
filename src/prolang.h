@@ -76,6 +76,27 @@ struct code_location_s
 {
     int start;  /* Position of the first byte of the token. */
     int end;    /* Position of the byte after the token.    */
+#ifdef USE_BLUEPRINT_UPDATE
+    const struct source_file_s *source_file; /* Borrowed until end_new_file(). */
+    int source_line;
+#endif
+};
+
+#ifdef USE_BLUEPRINT_UPDATE
+struct default_descriptor_s
+{
+    uint32_t epoch, node;
+    uint32_t status, reason;
+};
+#endif
+
+struct default_list_s
+{
+    p_int count, width;
+#ifdef USE_BLUEPRINT_UPDATE
+    struct default_descriptor_s description;
+    uint32_t head, tail;
+#endif
 };
 
 /* --- Variables --- */

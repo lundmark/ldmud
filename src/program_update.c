@@ -35,7 +35,8 @@
 
 enum update_root
 {
-    UPDATE_ORIGIN, UPDATE_SCHEMAS, UPDATE_SOURCE, UPDATE_TARGETS, UPDATE_NUM_ROOTS
+    UPDATE_ORIGIN, UPDATE_SCHEMAS, UPDATE_SOURCE, UPDATE_TARGETS,
+    UPDATE_BLUEPRINT_SCHEMA, UPDATE_BLUEPRINT_DEFAULTS, UPDATE_NUM_ROOTS
 };
 typedef struct program_update_request_s
 {
@@ -70,6 +71,65 @@ static stack_gap_guard_t preparation_guard;
 static stack_gap_guard_t *previous_preparation_guard;
 static Bool preparation_guard_active;
 static p_int last_id;
+
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+static int default_test_point, default_test_countdown;
+static Bool default_test_literal, default_test_active;
+
+static void
+default_test_begin(void)
+{
+    FILE *input;
+    default_test_point = default_test_countdown = 0;
+    default_test_literal = default_test_active = MY_FALSE;
+    if (strcmp(get_txt(active->roots[UPDATE_ORIGIN].u.str), "/defaults_target"))
+        return;
+    input = fopen("defaults-fault", "r");
+    if (!input)
+        return;
+    if (fscanf(input, "%d %d", &default_test_point, &default_test_countdown) == 2
+     && default_test_countdown >= 0)
+        default_test_active = MY_TRUE;
+    fclose(input);
+}
+
+Bool
+program_update_default_test_fail(int point)
+{
+    /* Allocator sites are selected separately for literal construction and
+     * schema/report ownership. Ordinary LPC callbacks have another guard.
+     */
+    if (point <= DEFAULT_TEST_CHAIN && !default_test_literal)
+        point = point == DEFAULT_TEST_MAPPING ? DEFAULT_TEST_REPORT_MAPPING
+              : point == DEFAULT_TEST_STRING ? DEFAULT_TEST_REPORT_STRING
+              : point == DEFAULT_TEST_HASH ? DEFAULT_TEST_REPORT_HASH
+              : point == DEFAULT_TEST_CHAIN ? DEFAULT_TEST_REPORT_CHAIN
+              : DEFAULT_TEST_REPORT_ARRAY;
+    if (!default_test_active || !active || !preparation_guard_active
+     || get_stack_gap_guard() != &preparation_guard || default_test_point != point)
+        return MY_FALSE;
+    if (default_test_countdown)
+    {
+        default_test_countdown--;
+        return MY_FALSE;
+    }
+    default_test_point = 0;
+    return MY_TRUE;
+}
+
+void
+program_update_default_test_scope(Bool literal)
+{
+    default_test_literal = literal;
+}
+
+void
+program_update_default_test_pressure(int point)
+{
+    if (program_update_default_test_fail(point))
+        test_stack_gap_failure();
+}
+#endif
 
 static void
 unlink_work (program_update_request_t **list, program_update_request_t *request)
@@ -397,7 +457,8 @@ describe_schemas (program_update_request_t *request)
                         ? request->roots[UPDATE_TARGETS].u.vec : NULL;
     svalue_t *root = &request->roots[UPDATE_SCHEMAS];
     size_t scanned = 0, count = 0, work = 0;
-    size_t remaining = BLUEPRINT_UPDATE_MAX_BYTES;
+    schema_budget_t budget = { BLUEPRINT_UPDATE_MAX_BYTES, SCHEMA_MAX_WORK,
+                               BLUEPRINT_UPDATE_MAX_VARIABLE_SLOTS };
     size_t capacity = targets ? VEC_SIZE(targets) : 0;
     object_t *object;
     vector_t *trimmed;
@@ -405,6 +466,31 @@ describe_schemas (program_update_request_t *request)
                            ? request->candidate : request->source_program;
 
     request->candidate_generation = candidate->schema_generation;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    program_schema_test_rtt(candidate);
+    if (program_update_default_test_fail(99))
+        program_schema_test_defaults(request->source_program,
+                                     &request->roots[UPDATE_BLUEPRINT_SCHEMA]);
+#endif
+    if (request->source_from_path)
+    {
+        svalue_t *defaults = &request->roots[UPDATE_BLUEPRINT_DEFAULTS];
+        size_t slots = candidate->num_variables;
+        size_t bytes;
+        if (slots > (SIZE_MAX - sizeof(vector_t)) / sizeof(svalue_t))
+            errorf("update_blueprint(): source defaults allocation overflow.\n");
+        bytes = sizeof(vector_t) + slots * sizeof(svalue_t);
+        if (bytes >= budget.bytes)
+            errorf("update_blueprint(): source defaults memory limit exceeded.\n");
+        budget.bytes -= bytes;
+        put_array(defaults, allocate_array(candidate->num_variables));
+        if (stack_gap_guard_failed())
+            errorf("update_blueprint(): memory pressure preparing source defaults.\n");
+        if (!program_schema_compare(request->source_program, candidate,
+                                    &request->roots[UPDATE_BLUEPRINT_SCHEMA],
+                                    &budget, defaults->u.vec, MY_TRUE))
+            errorf("update_blueprint(): unsupported source blueprint defaults.\n");
+    }
     if (!targets)
     {
         for (object = obj_list; object; object = object->next_all)
@@ -460,8 +546,11 @@ describe_schemas (program_update_request_t *request)
         if (count == BLUEPRINT_UPDATE_MAX_TARGETS)
             errorf("update_blueprint(): schema generation limit exceeded.\n");
         program_schema_compare(object->prog, candidate,
-                               &root->u.vec->item[count++], &remaining);
-        if (!remaining)
+                               &root->u.vec->item[count++], &budget,
+                               request->source_from_path
+                                   ? request->roots[UPDATE_BLUEPRINT_DEFAULTS].u.vec : NULL,
+                               MY_FALSE);
+        if (!budget.bytes)
             break;
     }
     trimmed = slice_array(root->u.vec, 0, count - 1);
@@ -820,21 +909,24 @@ program_update_process (void)
         previous_preparation_guard = get_stack_gap_guard();
         if (setjmp(recovery.con.text))
         {
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+            default_test_active = default_test_literal = MY_FALSE;
+#endif
             if (preparation_guard_active)
                 set_stack_gap_guard(&preparation_guard);
             active->validation_failed = MY_TRUE;
             mark_end_evaluation();
             abort_compile_file_context();
             clear_state();
+            /* Partial summaries are never exposed as completed evidence. */
+            free_svalue(&active->roots[UPDATE_SCHEMAS]);
+            put_number(&active->roots[UPDATE_SCHEMAS], 0);
+            active->candidate_generation = 0;
             if (preparation_guard_active)
             {
                 set_stack_gap_guard(previous_preparation_guard);
                 preparation_guard_active = MY_FALSE;
             }
-            /* Partial summaries are never exposed as completed evidence. */
-            free_svalue(&active->roots[UPDATE_SCHEMAS]);
-            put_number(&active->roots[UPDATE_SCHEMAS], 0);
-            active->candidate_generation = 0;
         }
         else if (!active->canceled)
         {
@@ -870,7 +962,19 @@ program_update_process (void)
             if (active->candidate)
                 candidate_test_checkpoint(active, MY_TRUE);
 #endif
+            set_stack_gap_guard(&preparation_guard);
+            preparation_guard_active = MY_TRUE;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+            default_test_begin();
+#endif
             describe_schemas(active);
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+            default_test_active = default_test_literal = MY_FALSE;
+#endif
+            set_stack_gap_guard(previous_preparation_guard);
+            preparation_guard_active = MY_FALSE;
+            if (preparation_guard.failed)
+                errorf("update_blueprint(): memory pressure preparing defaults.\n");
             clear_current_object();
             /* Future compiler and migration hooks belong in this boundary. */
             mark_end_evaluation();

@@ -342,6 +342,8 @@ locate_out (program_t *prog)
     if (prog->schema_arguments)
         prog->schema_arguments = MAKEOFFSET(struct schema_argument_s *, schema_arguments);
     prog->schema_function_flags = MAKEOFFSET(funflag_t *, schema_function_flags);
+    if (prog->schema_defaults)
+        prog->schema_defaults = MAKEOFFSET(bytecode_p, schema_defaults);
 #endif
     if (prog->type_start)
     {
@@ -398,6 +400,8 @@ locate_in (program_t *prog)
     if (prog->schema_arguments)
         prog->schema_arguments = MAKEPTR(struct schema_argument_s *, schema_arguments);
     prog->schema_function_flags = MAKEPTR(funflag_t *, schema_function_flags);
+    if (prog->schema_defaults)
+        prog->schema_defaults = MAKEPTR(bytecode_p, schema_defaults);
 #endif
     if (prog->type_start)
     {
@@ -2625,4 +2629,3 @@ swap_driver_info (svalue_t *svp, int value)
 } /* swap_driver_info() */
 
 /***************************************************************************/
-

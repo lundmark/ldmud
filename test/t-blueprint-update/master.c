@@ -91,7 +91,11 @@ void terminal_gc_done(int failed)
         load_object("staging").run(function void(int failed)
         {
             if (failed) finish(failed);
-            else load_object("schemas").run(#'finish);
+            else load_object("schemas").run(function void(int failed)
+            {
+                if (failed) finish(failed);
+                else load_object("defaults").run(#'finish);
+            });
         });
     }
 }
@@ -233,6 +237,23 @@ void run_test()
     msg("\nRunning blueprint update lifecycle tests:\n");
     call_out(#'finish, 180 * __ALARM_TIME__, 1);
 #ifdef __BLUEPRINT_UPDATE__
+    if (file_size("defaults-faults-only") >= 0)
+    {
+        remove_call_out(#'finish);
+        call_out(#'finish, 900 * __ALARM_TIME__, 1);
+        load_object("default_faults").run(#'finish);
+        return;
+    }
+    if (file_size("defaults-validation-only") >= 0)
+    {
+        load_object("default_validation").run(#'finish);
+        return;
+    }
+    if (file_size("defaults-only") >= 0)
+    {
+        load_object("defaults").run(#'finish);
+        return;
+    }
     if (file_size("staging-only") >= 0)
     {
         load_object("staging").run(#'finish);

@@ -128,6 +128,16 @@
 static bool compiler_reduction_cancelled(const void *result,
     const void *normal_result, const void *rhs, const void *error_rhs);
 
+#ifdef USE_BLUEPRINT_UPDATE
+#define DEFAULT_LOCATION_COPY(dst, src) \
+    do { (dst).source_file = (src).source_file; \
+         (dst).source_line = (src).source_line; } while (0)
+static void compiler_default_reset(void);
+#else
+#define DEFAULT_LOCATION_COPY(dst, src) ((void)0)
+#define compiler_default_reset() ((void)0)
+#endif
+
 #define YYLLOC_DEFAULT(cur, rhs, n)                         \
     do                                                      \
     {                                                       \
@@ -141,10 +151,12 @@ static bool compiler_reduction_cancelled(const void *result,
         {                                                   \
             (cur).start = YYRHSLOC(rhs, 1).start;           \
             (cur).end   = YYRHSLOC(rhs, n).end;             \
+            DEFAULT_LOCATION_COPY(cur, YYRHSLOC(rhs, 1));   \
         }                                                   \
         else                                                \
         {                                                   \
             (cur).start = (cur).end = YYRHSLOC(rhs, 0).end; \
+            DEFAULT_LOCATION_COPY(cur, YYRHSLOC(rhs, 0));   \
         }                                                   \
     } while (0)
 
@@ -473,6 +485,8 @@ enum e_saved_areas {
     /* (schema_argument_s) Internal declared argument evidence, even without
      * exact_types or save_types. Type references are owned by A_TYPES.
      */
+ , A_SCHEMA_DEFAULTS
+    /* (bytecode_t) Packed immutable default records, nodes, edges and bytes. */
 #endif
  , NUMPAREAS  /* Number of saved areas */
 };
@@ -610,6 +624,17 @@ enum e_internal_areas {
      * string compilation when looking up u.global.struct_id from
      * identifiers.
      */
+
+#ifdef USE_BLUEPRINT_UPDATE
+ , A_SCHEMA_DEFAULT_RECORDS
+ , A_SCHEMA_DEFAULT_NODES
+ , A_SCHEMA_DEFAULT_EDGES
+ , A_SCHEMA_DEFAULT_BYTES
+ , A_DEFAULT_CAPTURE_NODES
+ , A_DEFAULT_CAPTURE_EDGES
+ , A_DEFAULT_CAPTURE_BYTES
+ , A_DEFAULT_CAPTURE_LINKS
+#endif
 
  , NUMAREAS  /* Total number of areas */
 };
@@ -1621,6 +1646,7 @@ yyerror (const char *str)
 {
     char *context;
 
+    compiler_default_reset();
     if (num_parse_error > 5)
         return;
     context = current_loc.file ? lex_error_context() : "";
@@ -1893,7 +1919,15 @@ reserve_mem_block (int n, size_t size)
               : n == A_ARGUMENT_TYPE_INDEX ? COMPILE_TEST_ARGUMENT_INDEX
               : n == A_LOCAL_VARIABLES_DBG ? COMPILE_TEST_LOCAL_DEBUG
               : n == A_STRUCT_MEMBERS ? COMPILE_TEST_STRUCT_MEMBER
-              : n == A_INLINE_CLOSURE ? COMPILE_TEST_INLINE_STORAGE : 0;
+              : n == A_INLINE_CLOSURE ? COMPILE_TEST_INLINE_STORAGE
+#ifdef USE_BLUEPRINT_UPDATE
+              : n >= A_DEFAULT_CAPTURE_NODES && n <= A_DEFAULT_CAPTURE_LINKS
+                  ? COMPILE_TEST_DEFAULT_CAPTURE
+              : n == A_SCHEMA_DEFAULT_NODES || n == A_SCHEMA_DEFAULT_EDGES
+                  ? COMPILE_TEST_DEFAULT_FREEZE
+              : n == A_SCHEMA_DEFAULTS ? COMPILE_TEST_DEFAULT_PACK
+#endif
+              : 0;
     if (point && size && compile_update_test_fail(point))
     {
         lex_close("Out of memory");
@@ -2009,6 +2043,476 @@ DEFINE_RESERVE_MEM_BLOCK(RESERVE_DEFAULT_LAMBDA_VALUES, A_DEFAULT_LAMBDA_VALUES)
 DEFINE_RESERVE_MEM_BLOCK(RESERVE_LAMBDA_VALUES, A_LAMBDA_VALUES)
 DEFINE_RESERVE_MEM_BLOCK(RESERVE_LAMBDA_VALUES_TABLE, A_LAMBDA_VALUES_TABLE)
 DEFINE_RESERVE_MEM_BLOCK(RESERVE_LAMBDA_VALUES_NEXT, A_LAMBDA_VALUES_NEXT)
+
+#ifdef USE_BLUEPRINT_UPDATE
+static uint32_t default_epoch;
+static uint32_t active_default;
+
+static void
+compiler_default_reset (void)
+
+/* Invalidate IDs without touching storage an interrupted helper may use. */
+
+{
+    active_default = 0;
+}
+
+static struct default_descriptor_s
+compiler_default_reject (uint32_t status, uint32_t reason)
+
+{
+    return (struct default_descriptor_s)
+        { active_default ? default_epoch : 0, 0, status, reason };
+}
+
+static bool
+compiler_default_append (int area, const void *data, size_t size)
+
+/* Optional evidence limits do not change ordinary LPC acceptance. Actual
+ * allocator failure uses the compiler's existing fallible append path.
+ */
+
+{
+    size_t used = 0;
+    int first = area >= A_DEFAULT_CAPTURE_NODES
+                ? A_DEFAULT_CAPTURE_NODES : A_SCHEMA_DEFAULT_RECORDS;
+    int last = area >= A_DEFAULT_CAPTURE_NODES
+               ? A_DEFAULT_CAPTURE_LINKS : A_SCHEMA_DEFAULT_BYTES;
+
+    for (int i = first; i <= last; i++)
+    {
+        if (mem_block[i].current_size > BLUEPRINT_UPDATE_MAX_BYTES - used)
+            return false;
+        used += mem_block[i].current_size;
+    }
+    if (size > BLUEPRINT_UPDATE_MAX_BYTES - used
+     || size > UINT32_MAX - mem_block[area].current_size)
+        return false;
+    return add_to_mem_block(area, (void *)data, size);
+}
+
+static struct default_descriptor_s
+compiler_default_node (struct schema_default_node_s node)
+
+{
+    uint32_t index;
+    if (!active_default)
+        return compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+    index = mem_block[A_DEFAULT_CAPTURE_NODES].current_size / sizeof(node);
+    if (!compiler_default_append(A_DEFAULT_CAPTURE_NODES, &node, sizeof(node)))
+        return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                       SCHEMA_DEFAULT_REASON_LIMIT);
+    return (struct default_descriptor_s)
+        { default_epoch, index, SCHEMA_DEFAULT_SUPPORTED, 0 };
+}
+
+static struct default_descriptor_s
+compiler_default_integer (p_int number)
+
+{
+    struct schema_default_node_s node = {0};
+    node.kind = SCHEMA_DEFAULT_INTEGER;
+    node.depth = 1;
+    node.value.integer = number;
+    return compiler_default_node(node);
+}
+
+static struct default_descriptor_s
+compiler_default_float (double number)
+
+{
+    struct schema_default_node_s node = {0};
+    svalue_t scalar;
+    if (!active_default)
+        return compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+    if (!isfinite(number))
+        return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                       SCHEMA_DEFAULT_REASON_NUMBER);
+    scalar = svalue_float(number);
+    node.kind = SCHEMA_DEFAULT_FLOAT;
+    node.depth = 1;
+    node.value.floating = READ_DOUBLE(&scalar);
+    return compiler_default_node(node);
+}
+
+static struct default_descriptor_s
+compiler_default_string (string_t *str)
+
+/* Copy while the existing lexer owner still holds the string reference. */
+
+{
+    struct schema_default_node_s node = {0};
+    if (!active_default)
+        return compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+    node.kind = str->info.unicode == STRING_BYTES
+                ? SCHEMA_DEFAULT_BYTES : SCHEMA_DEFAULT_STRING;
+    node.unicode = str->info.unicode;
+    node.depth = 1;
+    node.text_start = mem_block[A_DEFAULT_CAPTURE_BYTES].current_size;
+    if (mstrsize(str) > UINT32_MAX
+     || !compiler_default_append(A_DEFAULT_CAPTURE_BYTES, get_txt(str), mstrsize(str)))
+        return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                       SCHEMA_DEFAULT_REASON_LIMIT);
+    node.text_size = mstrsize(str);
+    return compiler_default_node(node);
+}
+
+static struct default_descriptor_s
+compiler_default_negate (struct default_descriptor_s value)
+
+{
+    struct schema_default_node_s node;
+    if (!active_default || value.epoch != default_epoch)
+        return compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+    if (value.status != SCHEMA_DEFAULT_SUPPORTED)
+        return value;
+    node = ((struct schema_default_node_s *)mem_block[A_DEFAULT_CAPTURE_NODES].block)[value.node];
+    if (node.kind == SCHEMA_DEFAULT_INTEGER)
+    {
+        /* Ordinary literal folding preserves this wrapped boundary. */
+        if (node.value.integer != PINT_MIN)
+            node.value.integer = -node.value.integer;
+    }
+    else if (node.kind == SCHEMA_DEFAULT_FLOAT)
+    {
+        svalue_t scalar = svalue_float(node.value.floating);
+        STORE_DOUBLE(&scalar, -READ_DOUBLE(&scalar));
+        node.value.floating = READ_DOUBLE(&scalar);
+    }
+    else
+        return compiler_default_reject(SCHEMA_DEFAULT_UNSUPPORTED,
+                                       SCHEMA_DEFAULT_REASON_SYNTAX);
+    return compiler_default_node(node);
+}
+
+struct default_link_s
+{
+    uint32_t node, next;
+};
+
+static struct default_list_s
+compiler_default_list (p_int width)
+
+{
+    struct default_list_s list = {0};
+    list.width = width;
+    list.head = list.tail = UINT32_MAX;
+    list.description = compiler_default_reject(active_default
+                            ? SCHEMA_DEFAULT_SUPPORTED : SCHEMA_DEFAULT_MISSING, 0);
+    return list;
+}
+
+static struct default_list_s
+compiler_default_list_add (struct default_list_s list,
+                           struct default_descriptor_s value)
+
+{
+    struct default_link_s link = { value.node, UINT32_MAX };
+    uint32_t index;
+    list.count++;
+    if (!active_default || list.description.epoch != default_epoch
+     || value.epoch != default_epoch)
+    {
+        list.description = compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+        return list;
+    }
+    if (list.description.status != SCHEMA_DEFAULT_SUPPORTED)
+        return list;
+    if (value.status != SCHEMA_DEFAULT_SUPPORTED)
+    {
+        list.description = value;
+        return list;
+    }
+    index = mem_block[A_DEFAULT_CAPTURE_LINKS].current_size / sizeof(link);
+    if (!compiler_default_append(A_DEFAULT_CAPTURE_LINKS, &link, sizeof(link)))
+    {
+        list.description = compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                                   SCHEMA_DEFAULT_REASON_LIMIT);
+        return list;
+    }
+    if (list.tail == UINT32_MAX)
+        list.head = index;
+    else
+        ((struct default_link_s *)mem_block[A_DEFAULT_CAPTURE_LINKS].block)[list.tail].next = index;
+    list.tail = index;
+    return list;
+}
+
+static struct default_list_s
+compiler_default_list_join (struct default_list_s left, struct default_list_s right)
+
+{
+    left.count += right.count;
+    if (!active_default || left.description.epoch != default_epoch
+     || right.description.epoch != default_epoch)
+    {
+        left.description = compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+        return left;
+    }
+    if (left.description.status != SCHEMA_DEFAULT_SUPPORTED)
+        return left;
+    if (right.description.status != SCHEMA_DEFAULT_SUPPORTED)
+    {
+        left.description = right.description;
+        return left;
+    }
+    if (right.head == UINT32_MAX)
+        return left;
+    if (left.tail == UINT32_MAX)
+        left.head = right.head;
+    else
+        ((struct default_link_s *)mem_block[A_DEFAULT_CAPTURE_LINKS].block)[left.tail].next = right.head;
+    left.tail = right.tail;
+    return left;
+}
+
+static struct default_descriptor_s
+compiler_default_container (struct default_list_s list, uint32_t kind)
+
+{
+    struct schema_default_node_s node = {0};
+    uint32_t link = list.head;
+    if (!active_default || list.description.epoch != default_epoch)
+        return compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+    if (list.description.status != SCHEMA_DEFAULT_SUPPORTED)
+        return list.description;
+    if (list.count < 0 || (p_uint)list.count > UINT32_MAX
+     || (kind == SCHEMA_DEFAULT_ARRAY && list.count > USHRT_MAX))
+        return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                       SCHEMA_DEFAULT_REASON_LIMIT);
+    node.kind = kind;
+    node.width = list.width;
+    node.depth = 1;
+    node.edge_count = list.count;
+    node.edge_start = mem_block[A_DEFAULT_CAPTURE_EDGES].current_size / sizeof(uint32_t);
+    for (p_int i = 0; i < list.count; i++)
+    {
+        struct default_link_s entry =
+            ((struct default_link_s *)mem_block[A_DEFAULT_CAPTURE_LINKS].block)[link];
+        const struct schema_default_node_s *child =
+            (const struct schema_default_node_s *)mem_block[A_DEFAULT_CAPTURE_NODES].block + entry.node;
+        if (child->depth >= BLUEPRINT_UPDATE_MAX_LITERAL_DEPTH)
+            return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                           SCHEMA_DEFAULT_REASON_LIMIT);
+        if (node.depth <= child->depth)
+            node.depth = child->depth + 1;
+        if (!compiler_default_append(A_DEFAULT_CAPTURE_EDGES, &entry.node, sizeof(entry.node)))
+            return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                           SCHEMA_DEFAULT_REASON_LIMIT);
+        link = entry.next;
+    }
+    return compiler_default_node(node);
+}
+
+static struct default_descriptor_s
+compiler_default_mapping_width (struct default_descriptor_s width)
+
+{
+    const struct schema_default_node_s *node;
+    if (!active_default || width.epoch != default_epoch)
+        return compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+    if (width.status != SCHEMA_DEFAULT_SUPPORTED)
+        return width;
+    node = (const struct schema_default_node_s *)mem_block[A_DEFAULT_CAPTURE_NODES].block + width.node;
+    if (node->kind != SCHEMA_DEFAULT_INTEGER || node->value.integer < 0
+     || (p_uint)node->value.integer > (SSIZE_MAX - sizeof(void *)
+                                      - 2 * sizeof(svalue_t)) / sizeof(svalue_t))
+        return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                       SCHEMA_DEFAULT_REASON_WIDTH);
+    return compiler_default_container(compiler_default_list(node->value.integer),
+                                      SCHEMA_DEFAULT_MAPPING);
+}
+
+static uint32_t
+compiler_default_declaration (fulltype_t type, Bool with_init,
+                              const code_location_t *location)
+
+{
+    struct schema_default_s record = {0};
+    uint32_t index;
+    const char *filename = location->source_file
+                           ? location->source_file->name : compiled_file;
+    size_t length = filename ? strlen(filename) : 0;
+
+    compiler_default_reset();
+    record.status = with_init ? SCHEMA_DEFAULT_UNSUPPORTED
+                    : type.t_type == lpctype_float ? SCHEMA_DEFAULT_FLOAT_ZERO
+                                                   : SCHEMA_DEFAULT_INT_ZERO;
+    record.reason = with_init ? SCHEMA_DEFAULT_REASON_SYNTAX : 0;
+    record.line = location->source_line > 0 ? location->source_line : 0;
+    record.source_start = mem_block[A_SCHEMA_DEFAULT_BYTES].current_size;
+    if (length <= UINT32_MAX
+     && compiler_default_append(A_SCHEMA_DEFAULT_BYTES, filename, length))
+        record.source_size = length;
+    index = mem_block[A_SCHEMA_DEFAULT_RECORDS].current_size / sizeof(record) + 1;
+    if (!compiler_default_append(A_SCHEMA_DEFAULT_RECORDS, &record, sizeof(record)))
+        return 0;
+    if (with_init)
+    {
+        for (int i = A_DEFAULT_CAPTURE_NODES; i <= A_DEFAULT_CAPTURE_LINKS; i++)
+            mem_block[i].current_size = 0;
+        default_epoch++;
+        if (!default_epoch)
+            default_epoch++;
+        active_default = index;
+    }
+    return index;
+}
+
+static void
+compiler_default_end (struct default_descriptor_s value);
+
+static bool
+compiler_default_freeze (uint32_t index, uint32_t *result, unsigned int depth)
+
+/* Reserve the parent's edge range before visiting children. Child tables
+ * can grow independently, so reacquire its destination after recursion.
+ */
+
+{
+    struct schema_default_node_s node =
+        ((struct schema_default_node_s *)mem_block[A_DEFAULT_CAPTURE_NODES].block)[index];
+    uint32_t source_edges = node.edge_start;
+    if (depth >= BLUEPRINT_UPDATE_MAX_LITERAL_DEPTH)
+        return false;
+    node.edge_start = mem_block[A_SCHEMA_DEFAULT_EDGES].current_size / sizeof(uint32_t);
+    for (uint32_t i = 0; i < node.edge_count; i++)
+    {
+        uint32_t zero = 0;
+        if (!compiler_default_append(A_SCHEMA_DEFAULT_EDGES, &zero, sizeof(zero)))
+            return false;
+    }
+    for (uint32_t i = 0; i < node.edge_count; i++)
+    {
+        uint32_t child = ((uint32_t *)mem_block[A_DEFAULT_CAPTURE_EDGES].block)[source_edges + i];
+        uint32_t frozen;
+        if (child >= index || !compiler_default_freeze(child, &frozen, depth + 1))
+            return false;
+        ((uint32_t *)mem_block[A_SCHEMA_DEFAULT_EDGES].block)[node.edge_start + i] = frozen;
+    }
+    if (node.kind == SCHEMA_DEFAULT_STRING || node.kind == SCHEMA_DEFAULT_BYTES)
+    {
+        uint32_t offset = mem_block[A_SCHEMA_DEFAULT_BYTES].current_size;
+        if (!compiler_default_append(A_SCHEMA_DEFAULT_BYTES,
+                mem_block[A_DEFAULT_CAPTURE_BYTES].block + node.text_start, node.text_size))
+            return false;
+        node.text_start = offset;
+    }
+    *result = mem_block[A_SCHEMA_DEFAULT_NODES].current_size / sizeof(node);
+    return compiler_default_append(A_SCHEMA_DEFAULT_NODES, &node, sizeof(node));
+}
+
+static void
+compiler_default_end (struct default_descriptor_s value)
+
+{
+    struct schema_default_s *record;
+    uint32_t index = active_default;
+    size_t saved_bytes = mem_block[A_SCHEMA_DEFAULT_BYTES].current_size;
+    size_t saved_nodes = mem_block[A_SCHEMA_DEFAULT_NODES].current_size;
+    size_t saved_edges = mem_block[A_SCHEMA_DEFAULT_EDGES].current_size;
+
+    if (!index)
+        return;
+    if (value.epoch != default_epoch)
+        value = compiler_default_reject(SCHEMA_DEFAULT_UNSUPPORTED,
+                                        SCHEMA_DEFAULT_REASON_SYNTAX);
+    if (value.status == SCHEMA_DEFAULT_SUPPORTED)
+    {
+        if (!compiler_default_freeze(value.node, &value.node, 0))
+        {
+            mem_block[A_SCHEMA_DEFAULT_BYTES].current_size = saved_bytes;
+            mem_block[A_SCHEMA_DEFAULT_NODES].current_size = saved_nodes;
+            mem_block[A_SCHEMA_DEFAULT_EDGES].current_size = saved_edges;
+            value.status = SCHEMA_DEFAULT_UNAVAILABLE;
+            value.reason = SCHEMA_DEFAULT_REASON_LIMIT;
+        }
+    }
+    record = (struct schema_default_s *)mem_block[A_SCHEMA_DEFAULT_RECORDS].block + index - 1;
+    record->status = value.status;
+    record->reason = value.reason;
+    record->root = value.node;
+    compiler_default_reset();
+}
+
+static bool
+compiler_default_pack (void)
+
+{
+    struct schema_defaults_s header = {0};
+    size_t size = align(sizeof(header));
+    bytecode_p block;
+    header.version = SCHEMA_DEFAULT_VERSION;
+#define DEFAULT_PART(count, field, area, type) \
+    header.count = mem_block[area].current_size / sizeof(type); \
+    header.field##_offset = size; \
+    size += align(mem_block[area].current_size)
+    DEFAULT_PART(records, record, A_SCHEMA_DEFAULT_RECORDS, struct schema_default_s);
+    DEFAULT_PART(nodes, node, A_SCHEMA_DEFAULT_NODES, struct schema_default_node_s);
+    DEFAULT_PART(edges, edge, A_SCHEMA_DEFAULT_EDGES, uint32_t);
+    DEFAULT_PART(bytes, byte, A_SCHEMA_DEFAULT_BYTES, bytecode_t);
+#undef DEFAULT_PART
+    if (size > UINT32_MAX || !extend_mem_block(A_SCHEMA_DEFAULTS, size))
+        return false;
+    block = (bytecode_p)mem_block[A_SCHEMA_DEFAULTS].block;
+    memset(block, 0, size);
+    memcpy(block, &header, sizeof(header));
+    for (int i = A_SCHEMA_DEFAULT_RECORDS; i <= A_SCHEMA_DEFAULT_BYTES; i++)
+    {
+        size_t offset = i == A_SCHEMA_DEFAULT_RECORDS ? header.record_offset
+                        : i == A_SCHEMA_DEFAULT_NODES ? header.node_offset
+                        : i == A_SCHEMA_DEFAULT_EDGES ? header.edge_offset
+                                                     : header.byte_offset;
+        if (mem_block[i].current_size)
+            memcpy(block + offset, mem_block[i].block, mem_block[i].current_size);
+    }
+    return true;
+}
+
+#define DEFAULT_REJECT(result) \
+    ((result).default_desc = compiler_default_reject(SCHEMA_DEFAULT_UNSUPPORTED, SCHEMA_DEFAULT_REASON_SYNTAX))
+#define DEFAULT_FORWARD(result, source) ((result).default_desc = (source).default_desc)
+#define DEFAULT_INTEGER(result, number) ((result).default_desc = compiler_default_integer(number))
+#define DEFAULT_FLOAT(result, number) ((result).default_desc = compiler_default_float(number))
+#define DEFAULT_STRING(result, str) ((result).default_desc = compiler_default_string(str))
+#define DEFAULT_NEGATE(result, source) ((result).default_desc = compiler_default_negate((source).default_desc))
+#define DEFAULT_END(source) compiler_default_end((source).default_desc)
+#define DEFAULT_LIST_ADD(list, value) compiler_default_list_add(list, (value).default_desc)
+#define DEFAULT_CONTAINER(result, list, kind) ((result).default_desc = compiler_default_container(list, kind))
+#define DEFAULT_WIDTH(result, width) ((result).default_desc = compiler_default_mapping_width((width).default_desc))
+#else
+#define DEFAULT_REJECT(result) ((void)0)
+#define DEFAULT_FORWARD(result, source) ((void)0)
+#define DEFAULT_INTEGER(result, number) ((void)0)
+#define DEFAULT_FLOAT(result, number) ((void)0)
+#define DEFAULT_STRING(result, str) ((void)0)
+#define DEFAULT_NEGATE(result, source) ((void)0)
+#define DEFAULT_END(source) ((void)0)
+#define compiler_default_pack() true
+#define DEFAULT_CONTAINER(result, list, kind) ((void)0)
+#define DEFAULT_WIDTH(result, width) ((void)0)
+#define DEFAULT_LIST_ADD(list, value) compiler_default_list_add(list)
+
+static struct default_list_s
+compiler_default_list (p_int width)
+{
+    return (struct default_list_s){ .count = 0, .width = width };
+}
+
+static struct default_list_s
+compiler_default_list_add (struct default_list_s list)
+{
+    list.count++;
+    return list;
+}
+
+static struct default_list_s
+compiler_default_list_join (struct default_list_s left, struct default_list_s right)
+{
+    left.count += right.count;
+    return left;
+}
+#endif
 
 #define byte_to_mem_block(n, b) \
     ((void)((mem_block[n].current_size == mem_block[n].max_size \
@@ -6311,7 +6815,8 @@ get_initialized_variable (ident_t *p)
 
 /*-------------------------------------------------------------------------*/
 static int
-define_global_variable (ident_t* name, fulltype_t actual_type, Bool with_init)
+define_global_variable (ident_t* name, fulltype_t actual_type, Bool with_init,
+                        const code_location_t *location UNUSED)
 
 /* This is called directly from a parser rule: <type> <name>
  * if with_init is true, then an initialization of this variable will follow.
@@ -6340,10 +6845,17 @@ define_global_variable (ident_t* name, fulltype_t actual_type, Bool with_init)
     i = name->u.global.variable;
 #ifdef USE_BLUEPRINT_UPDATE
     /* Hidden insertions need not update the visible identifier index. */
+    uint32_t default_record = compiler_default_declaration(actual_type, with_init, location);
     if (actual_type.t_flags & TYPE_MOD_VIRTUAL)
+    {
         V_VARIABLE(V_VARIABLE_COUNT - 1)->schema_declared = true;
+        V_VARIABLE(V_VARIABLE_COUNT - 1)->schema_default = default_record;
+    }
     else
+    {
         NV_VARIABLE(NV_VARIABLE_COUNT - 1)->schema_declared = true;
+        NV_VARIABLE(NV_VARIABLE_COUNT - 1)->schema_default = default_record;
+    }
 #endif
 
 #ifdef DEBUG
@@ -6437,6 +6949,12 @@ init_global_variable (int i, ident_t* name, fulltype_t actual_type
  */
 
 {
+#ifdef USE_BLUEPRINT_UPDATE
+    if (active_default && pragma_rtt_checks && pragma_save_types
+     && actual_type.t_type != lpctype_mixed && actual_type.t_type != lpctype_unknown)
+        ((struct schema_default_s *)mem_block[A_SCHEMA_DEFAULT_RECORDS].block)
+            [active_default - 1].flags = SCHEMA_DEFAULT_RTT_CHECK;
+#endif
     add_type_check(actual_type.t_type, TYPECHECK_VAR_INIT);
 
     PREPARE_INSERT(4)
@@ -9694,6 +10212,9 @@ get_global_variable_lvalue (ident_t *ident)
       /* Often used to save the current break/continue address.
        */
 
+    struct default_list_s default_list;
+      /* Literal counts and non-owning default-description list IDs. */
+
     p_uint address;
       /* Address of an instruction. */
 
@@ -9741,6 +10262,9 @@ get_global_variable_lvalue (ident_t *ident)
         fulltype_t type;   /* Type of the expression */
         uint32     start;  /* Startaddress of the expression */
         bool       needs_use; /* Warn, when not used. */
+#ifdef USE_BLUEPRINT_UPDATE
+        struct default_descriptor_s default_desc; /* Non-owning arena ID. */
+#endif
     } rvalue;
       /* Just a simple expression. */
 
@@ -9751,6 +10275,9 @@ get_global_variable_lvalue (ident_t *ident)
         uint32         start;    /* Startaddress of the instruction */
         bool           needs_use;/* Warn, when not used. */
         lvalue_block_t lvalue;   /* Code of the expression as an lvalue */
+#ifdef USE_BLUEPRINT_UPDATE
+        struct default_descriptor_s default_desc; /* Non-owning arena ID. */
+#endif
     }
     lrvalue;
       /* Used for expressions which may return a rvalue or lvalues.
@@ -10026,10 +10553,10 @@ get_global_variable_lvalue (ident_t *ident)
 %type <number> switch_label
   /* 1 for default, 0 otherwise. */
 
-%type <number> expr_list arg_expr arg_expr_list arg_expr_list2 expr_list2
+%type <number> arg_expr arg_expr_list arg_expr_list2
   /* Number of expressions in an expression list */
 
-%type <number> m_expr_values
+%type <default_list> expr_list expr_list2 m_expr_values
   /* Number of values for a mapping entry (ie the 'width') */
 
 %type <number> L_ASSIGN
@@ -10046,7 +10573,7 @@ get_global_variable_lvalue (ident_t *ident)
    * [1]: address of the branch-offset of the if
    */
 
-%type <numbers> m_expr_list m_expr_list2
+%type <default_list> m_expr_list m_expr_list2
   /* [0]: number of entries in a mapping literal
    * [1]: width of the mapping literal
    */
@@ -10740,6 +11267,7 @@ printf("DEBUG: After inline block: program size %"PRIuMPINT"\n", CURRENT_PROGRAM
              ins_f_code(F_FUNCALL);
              ins_f_code(F_RESTORE_ARG_FRAME);
          }
+          DEFAULT_REJECT($$);
       }
 
 
@@ -10815,6 +11343,7 @@ printf("DEBUG: After L_END_INLINE: program size %"PRIuMPINT"\n", CURRENT_PROGRAM
                                     .is_empty =         $3.is_empty         && $4.is_empty,
                                     .warned_dead_code = $3.warned_dead_code || $4.warned_dead_code,
                                   });
+          DEFAULT_REJECT($$);
       }
 
 ; /* inline_func */
@@ -11785,6 +12314,7 @@ opt_default_value:
         $$.name = NULL;
         $$.type = get_fulltype(NULL);
         $$.needs_use = false;
+          DEFAULT_REJECT($$);
       }
     | L_ASSIGN expr0
       {
@@ -11797,6 +12327,7 @@ opt_default_value:
         $$.type = $2.type;
         $$.needs_use = false;
         free_lvalue_block($2.lvalue);
+          DEFAULT_REJECT($$);
       }
 ; /* opt_default_value */
 
@@ -11814,7 +12345,7 @@ name_list:
               $1.t_type = lpctype_mixed;
           }
 
-          define_global_variable($2, $1, MY_FALSE);
+          define_global_variable($2, $1, MY_FALSE, &@2);
           $$ = $1;
       }
 
@@ -11830,13 +12361,14 @@ name_list:
               $1.t_type = lpctype_mixed;
           }
 
-          $<number>$ = define_global_variable($2, $1, MY_TRUE);
+          $<number>$ = define_global_variable($2, $1, MY_TRUE, &@2);
       }
 
       L_ASSIGN expr0
       {
           use_variable($5.name, VAR_USAGE_READ);
           init_global_variable($<number>3, $2, $1, $4, $5.type);
+          DEFAULT_END($5);
           free_fulltype($5.type);
           free_lvalue_block($5.lvalue);
           $$ = $1;
@@ -11849,7 +12381,7 @@ name_list:
           type.t_flags = $1.t_flags;
 
           check_identifier($4);
-          define_global_variable($4, type, MY_FALSE);
+          define_global_variable($4, type, MY_FALSE, &@4);
           free_fulltype(type);
           $$ = $1;
       }
@@ -11863,7 +12395,7 @@ name_list:
           type.t_flags = $1.t_flags;
 
           check_identifier($4);
-          $<number>$ = define_global_variable($4, type, MY_TRUE); 
+          $<number>$ = define_global_variable($4, type, MY_TRUE, &@4);
           free_fulltype(type);
       }
 
@@ -11875,6 +12407,7 @@ name_list:
 
           use_variable($7.name, VAR_USAGE_READ);
           init_global_variable($<number>5, $4, type, $6, $7.type);
+          DEFAULT_END($7);
 
           free_fulltype(type);
           free_fulltype($7.type);
@@ -13819,6 +14352,7 @@ comma_expr:
         $$.name = $1.name;
         $$.needs_use = $1.needs_use;
         free_lvalue_block($1.lvalue);
+          DEFAULT_FORWARD($$, $1);
       }
     | comma_expr
       {
@@ -13837,6 +14371,7 @@ comma_expr:
 
           free_fulltype($1.type);
           free_lvalue_block($4.lvalue);
+          DEFAULT_REJECT($$);
       }
 ; /* comma_expr */
 
@@ -13849,6 +14384,7 @@ opt_expr:
           $$.name = NULL;
           $$.needs_use = false;
           ins_f_code(F_CONST0);
+          DEFAULT_REJECT($$);
       }
     | ',' expr0
       {
@@ -13857,6 +14393,7 @@ opt_expr:
           $$.name = $2.name;
           $$.needs_use = $2.needs_use;
           free_lvalue_block($2.lvalue);
+          DEFAULT_REJECT($$);
       }
 ; /* opt_expr */
 
@@ -14173,6 +14710,7 @@ expr0:
 
           free_lpctype($1.type);
           free_fulltype($4.type);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14187,6 +14725,7 @@ expr0:
           $$.needs_use = false;
           free_fulltype($3.type);
           free_lvalue_block($3.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14307,6 +14846,7 @@ expr0:
           free_lvalue_block($7.lvalue);
           free_lvalue_block($4.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14343,6 +14883,7 @@ expr0:
           free_fulltype($4.type);
           free_lvalue_block($4.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       } /* LOR */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14377,7 +14918,8 @@ expr0:
           free_fulltype($1.type);
           free_lvalue_block($4.lvalue);
           free_lvalue_block($1.lvalue);
-       } /* LAND */
+          DEFAULT_REJECT($$);
+      } /* LAND */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
     | expr0 '|' expr0
@@ -14403,6 +14945,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_OR);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14429,6 +14972,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_XOR);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14455,6 +14999,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_AND);
+          DEFAULT_REJECT($$);
       } /* end of '&' code */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14488,6 +15033,7 @@ expr0:
           $$.name = NULL;
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14521,6 +15067,7 @@ expr0:
           $$.name = NULL;
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14546,6 +15093,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_IN);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14572,6 +15120,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_GT);
+          DEFAULT_REJECT($$);
       }
     | expr0 L_GE  expr0
       {
@@ -14596,6 +15145,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_GE);
+          DEFAULT_REJECT($$);
       }
     | expr0 '<'  expr0
       {
@@ -14620,6 +15170,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_LT);
+          DEFAULT_REJECT($$);
       }
     | expr0 L_LE  expr0
       {
@@ -14644,6 +15195,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_LE);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14671,6 +15223,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_LSH);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14697,6 +15250,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_RSH);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14723,6 +15277,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_byte(F_RSHL);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14836,6 +15391,7 @@ expr0:
           free_fulltype($4.type);
           free_lvalue_block($4.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       } /* '+' */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14861,6 +15417,7 @@ expr0:
           free_fulltype($3.type);
           free_lvalue_block($3.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       } /* '-' */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14885,6 +15442,7 @@ expr0:
           free_fulltype($3.type);
           free_lvalue_block($3.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       } /* '*' */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14909,6 +15467,7 @@ expr0:
           free_fulltype($3.type);
           free_lvalue_block($3.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       }
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
     | expr0 '/' expr0
@@ -14932,6 +15491,7 @@ expr0:
           free_fulltype($3.type);
           free_lvalue_block($3.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       } /* '/' */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14981,6 +15541,7 @@ expr0:
 
           free_fulltype($2.type);
           free_lvalue_block($2.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15060,6 +15621,7 @@ expr0:
 
           free_fulltype($2.type);
           free_lvalue_block($2.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15087,6 +15649,7 @@ expr0:
           $$.needs_use = false;
 
           free_lpctype($2.type);
+          DEFAULT_REJECT($$);
       }
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
     | L_NOT expr0
@@ -15103,6 +15666,7 @@ expr0:
 
           free_fulltype($2.type);
           free_lvalue_block($2.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15122,6 +15686,7 @@ expr0:
 
           free_fulltype($2.type);
           free_lvalue_block($2.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15167,6 +15732,7 @@ expr0:
 
           free_fulltype($2.type);
           free_lvalue_block($2.lvalue);
+          DEFAULT_NEGATE($$, $2);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15192,6 +15758,7 @@ expr0:
           $$.needs_use = false;
 
           free_lpctype($1.type);
+          DEFAULT_REJECT($$);
       } /* post-inc */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15218,6 +15785,7 @@ expr0:
           $$.needs_use = false;
 
           free_lpctype($1.type);
+          DEFAULT_REJECT($$);
       } /* post-dec */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15242,6 +15810,7 @@ expr0:
           $$.name = $1.name;
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15309,6 +15878,7 @@ expr0:
           free_lpctype($1.type);
           free_fulltype($3.type);
           free_lvalue_block($3.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15316,6 +15886,7 @@ expr0:
       {
 %line
           $$ = $1;
+          DEFAULT_FORWARD($$, $1);
       }
 
 ; /* expr0 */
@@ -15374,6 +15945,7 @@ expr4:
           $$.type =   $1.type;
           $$.name =   NULL;
           $$.needs_use = $1.needs_use;
+          DEFAULT_REJECT($$);
       }
     | inline_func    %prec '~'
       {
@@ -15382,6 +15954,7 @@ expr4:
           $$.type =   $1.type;
           $$.name =   NULL;
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
     | catch          %prec '~'
       {
@@ -15390,6 +15963,7 @@ expr4:
           $$.type =   $1.type;
           $$.name =   NULL;
           $$.needs_use = false;
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15399,6 +15973,7 @@ expr4:
 
           string_t *p;
 %line
+          DEFAULT_STRING($$, last_lex_string);
           p = last_lex_string;
           last_lex_string = NULL;
           $$.start = last_expression = CURRENT_PROGRAM_SIZE;
@@ -15424,6 +15999,7 @@ expr4:
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name =   NULL;
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
 
     | L_BYTES
@@ -15432,6 +16008,7 @@ expr4:
 
           string_t *p;
 %line
+          DEFAULT_STRING($$, last_lex_string);
           p = last_lex_string;
           last_lex_string = NULL;
           $$.start = last_expression = CURRENT_PROGRAM_SIZE;
@@ -15492,6 +16069,7 @@ expr4:
               $$.type = get_fulltype_flags(lpctype_int, TYPE_MOD_LITERAL);
           }
           CURRENT_PROGRAM_SIZE = current;
+          DEFAULT_INTEGER($$, $1);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15574,6 +16152,7 @@ expr4:
           ins_short(ix);
           ins_short(inhIndex);
           $$.type = get_fulltype_flags(lpctype_closure, TYPE_MOD_LITERAL);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15608,6 +16187,7 @@ expr4:
               ins_short(sefun + CLOSURE_SIMUL_EFUN_OFFS);
               ins_short(0);
           }
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15637,6 +16217,7 @@ expr4:
               ins_byte(quotes);
           }
           $$.type = get_fulltype_flags(lpctype_symbol, TYPE_MOD_LITERAL);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15657,6 +16238,7 @@ expr4:
           ins_uint16 ( exponent );
 #endif  /* FLOAT_FORMAT_2 */
           $$.type = get_fulltype_flags(lpctype_float, TYPE_MOD_LITERAL);
+          DEFAULT_FLOAT($$, $1);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15679,6 +16261,7 @@ expr4:
               ins_f_code(F_LAMBDA_CONSTANT);
               ins_short($1);
           }
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15691,6 +16274,7 @@ expr4:
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name = $2.name;
           $$.needs_use = $2.needs_use;
+          DEFAULT_FORWARD($$, $2);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15699,14 +16283,15 @@ expr4:
           /* Generate an array */
 
           ins_f_code(F_AGGREGATE);
-          ins_short($4);
-          if (max_array_size && $4 > (p_int)max_array_size)
+          ins_short($4.count);
+          if (max_array_size && $4.count > (p_int)max_array_size)
               yyerror("Illegal array size");
-          $$.type = get_aggregate_type($4);
+          $$.type = get_aggregate_type($4.count);
           $$.start = $3;
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name =   NULL;
           $$.needs_use = true;
+          DEFAULT_CONTAINER($$, $4, SCHEMA_DEFAULT_ARRAY);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15719,11 +16304,11 @@ expr4:
 
           int quotes;
 
-          pop_arg_stack($3);
+          pop_arg_stack($3.count);
 
           ins_f_code(F_AGGREGATE);
-          ins_short($3);
-          if (max_array_size && $3 > (p_int)max_array_size)
+          ins_short($3.count);
+          if (max_array_size && $3.count > (p_int)max_array_size)
               yyerror("Illegal array size");
           $$.type = get_fulltype_flags(lpctype_quoted_array, TYPE_MOD_LITERAL);
           $$.start = $2;
@@ -15734,6 +16319,7 @@ expr4:
           do {
                 ins_f_code(F_QUOTE);
           } while (--quotes);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15761,6 +16347,7 @@ expr4:
 
           free_fulltype($6.type);
           free_lvalue_block($6.lvalue);
+          DEFAULT_WIDTH($$, $6);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15770,24 +16357,24 @@ expr4:
 
           mp_int num_keys;
 
-          pop_arg_stack($4[0]);
-          num_keys = $4[0] / ($4[1]+1);
+          pop_arg_stack($4.count);
+          num_keys = $4.count / ($4.width+1);
 
-          if ((num_keys|$4[1]) & ~0xffff)
+          if ((num_keys|$4.width) & ~0xffff)
               yyerror("cannot handle more than 65535 keys/values "
                       "in mapping aggregate");
 
-          if ( (num_keys | $4[1]) &~0xff)
+          if ( (num_keys | $4.width) &~0xff)
           {
               ins_f_code(F_M_AGGREGATE);
               ins_short(num_keys);
-              ins_short($4[1]);
+              ins_short($4.width);
           }
           else
           {
               ins_f_code(F_M_CAGGREGATE);
               ins_byte(num_keys);
-              ins_byte($4[1]);
+              ins_byte($4.width);
           }
 
           $$.type = get_fulltype_flags(lpctype_mapping, TYPE_MOD_LITERAL);
@@ -15795,6 +16382,7 @@ expr4:
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name =   NULL;
           $$.needs_use = true;
+          DEFAULT_CONTAINER($$, $4, SCHEMA_DEFAULT_MAPPING);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15806,6 +16394,7 @@ expr4:
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name =   NULL;
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
     | '(' '<' note_start error ')'
       {
@@ -15814,6 +16403,7 @@ expr4:
           $$.start = $3;
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name =   NULL;
+          DEFAULT_REJECT($$);
       }
     | '(' '<' struct_name '>'
       {
@@ -15902,6 +16492,7 @@ expr4:
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name =   NULL;
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15915,6 +16506,7 @@ expr4:
 
           ins_prog_type($2);
           free_lpctype($2);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15935,6 +16527,7 @@ expr4:
 
           ins_prog_type($4.type.t_type);
           free_fulltype($4.type);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -16129,6 +16722,7 @@ expr4:
 
           $$.name = varident;
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -16171,6 +16765,7 @@ expr4:
           ins_f_code($2.strict_member ? F_S_INDEX : F_SX_INDEX);
 
           free_fulltype($1.type);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -16209,6 +16804,7 @@ expr4:
           free_fulltype($1.type);
           free_fulltype($2.type1);
           free_fulltype($2.type2);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -16255,6 +16851,7 @@ expr4:
           free_fulltype($1.type);
           free_fulltype($2.type1);
           free_fulltype($2.type2);
+          DEFAULT_REJECT($$);
       } /* expr4 index_range */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -16290,6 +16887,7 @@ expr4:
 
           free_fulltype($1.type);
           free_fulltype($2.type1);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -16320,6 +16918,7 @@ expr4:
           free_fulltype($1.type);
           free_fulltype($2.type1);
           free_fulltype($2.type2);
+          DEFAULT_REJECT($$);
       } /* expr4 index_map_range */
 ; /* expr4 */
 
@@ -17633,14 +18232,14 @@ index_map_expr:
  */
 
 expr_list:
-      /* empty */     { $$ = 0; }
+      /* empty */     { $$ = compiler_default_list(0); }
     | expr_list2      { $$ = $1; }
     | expr_list2 ','  { $$ = $1; }  /* Allow a terminating comma */
 ; /* expr_list */
 
 expr_list2:
-      expr0                 { $$ = 1;      add_arg_type($1.type); check_unknown_type($1.type.t_type); use_variable($1.name, VAR_USAGE_READ); free_lvalue_block($1.lvalue); }
-    | expr_list2 ',' expr0  { $$ = $1 + 1; add_arg_type($3.type); check_unknown_type($3.type.t_type); use_variable($3.name, VAR_USAGE_READ); free_lvalue_block($3.lvalue); }
+      expr0                 { $$ = DEFAULT_LIST_ADD(compiler_default_list(0), $1); add_arg_type($1.type); check_unknown_type($1.type.t_type); use_variable($1.name, VAR_USAGE_READ); free_lvalue_block($1.lvalue); }
+    | expr_list2 ',' expr0  { $$ = DEFAULT_LIST_ADD($1, $3); add_arg_type($3.type); check_unknown_type($3.type.t_type); use_variable($3.name, VAR_USAGE_READ); free_lvalue_block($3.lvalue); }
 ; /* expr_list2 */
 
 
@@ -17767,18 +18366,18 @@ arg_expr:
 ; /* arg_expr */
 
 m_expr_list:
-      /* empty */          { $$[0] = 0; $$[1]= 1; }
+      /* empty */          { $$ = compiler_default_list(1); }
     | m_expr_list2      /* { $$ = $1; } */
     | m_expr_list2 ','  /* { $$ = $1; } Allow a terminating comma */
-    | expr_list2           { $$[0] = $1; $$[1] = 0; }
-    | expr_list2 ','       { $$[0] = $1; $$[1] = 0; }
+    | expr_list2           { $$ = $1; $$.width = 0; }
+    | expr_list2 ','       { $$ = $1; $$.width = 0; }
 ; /* m_expr_list */
 
 m_expr_list2:
       expr0  m_expr_values
       {
-          $$[0] = 1 + $2;
-          $$[1] = $2;
+          $$ = compiler_default_list_join(DEFAULT_LIST_ADD(compiler_default_list(0), $1), $2);
+          $$.width = $2.count;
           add_arg_type($1.type); /* order doesn't matter */
           check_unknown_type($1.type.t_type);
           use_variable($1.name, VAR_USAGE_READ);
@@ -17787,11 +18386,11 @@ m_expr_list2:
 
     | m_expr_list2 ',' expr0 m_expr_values
       {
-          if ($1[1] != $4) {
+          if ($1.width != $4.count) {
               yyerror("Inconsistent number of values in mapping literal");
           }
-          $$[0] = $1[0] + 1 + $4;
-          $$[1] = $1[1];
+          $$ = compiler_default_list_join($1,
+                compiler_default_list_join(DEFAULT_LIST_ADD(compiler_default_list(0), $3), $4));
           add_arg_type($3.type);
           check_unknown_type($3.type.t_type);
           use_variable($3.name, VAR_USAGE_READ);
@@ -17800,8 +18399,8 @@ m_expr_list2:
 ; /* m_expr_list2 */
 
 m_expr_values:
-      ':' expr0                { $$ = 1;      add_arg_type($2.type); check_unknown_type($2.type.t_type); use_variable($2.name, VAR_USAGE_READ); free_lvalue_block($2.lvalue); }
-    | m_expr_values ';' expr0  { $$ = $1 + 1; add_arg_type($3.type); check_unknown_type($3.type.t_type); use_variable($3.name, VAR_USAGE_READ); free_lvalue_block($3.lvalue); }
+      ':' expr0                { $$ = DEFAULT_LIST_ADD(compiler_default_list(0), $2); add_arg_type($2.type); check_unknown_type($2.type.t_type); use_variable($2.name, VAR_USAGE_READ); free_lvalue_block($2.lvalue); }
+    | m_expr_values ';' expr0  { $$ = DEFAULT_LIST_ADD($1, $3); add_arg_type($3.type); check_unknown_type($3.type.t_type); use_variable($3.name, VAR_USAGE_READ); free_lvalue_block($3.lvalue); }
 ; /* m_expr_values */
 
 
@@ -19340,6 +19939,7 @@ catch:
           $$.type  = get_fulltype(lpctype_mixed);
           $$.name  = NULL;
           $$.needs_use = false;
+          DEFAULT_REJECT($$);
       }
 ; /* catch */
 
@@ -22853,6 +23453,7 @@ prolog (const char * fname, Bool isMasterObj)
 {
     int i;
 
+    compiler_default_reset();
     compiled_file = fname;
 
     /* Initialize the memory for the argument types */
@@ -23003,6 +23604,7 @@ epilog_cleanup (void)
  */
 
 {
+    compiler_default_reset();
 #ifdef DEBUG
     if (num_parse_error == 0 && type_of_arguments.current_size != 0)
         fatal("Failed to deallocate argument type stack\n");
@@ -23707,6 +24309,8 @@ epilog (void)
          * Right now, we allocate everything in one block.
          */
 
+        if (!compiler_default_pack())
+            goto canceled;
         size = align(sizeof (program_t));
 
         for (i = 0; i< NUMPAREAS; i++)
@@ -23969,6 +24573,10 @@ epilog (void)
                       mem_block[A_SCHEMA_ARGUMENTS].current_size);
             p += align(mem_block[A_SCHEMA_ARGUMENTS].current_size);
         }
+        prog->schema_defaults = p;
+        prog->schema_defaults_size = mem_block[A_SCHEMA_DEFAULTS].current_size;
+        memcpy(p, mem_block[A_SCHEMA_DEFAULTS].block, prog->schema_defaults_size);
+        p += align(prog->schema_defaults_size);
 #endif
 
         /* Add the lightweight object call cache.

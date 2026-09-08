@@ -50,6 +50,9 @@ extern void compile_update_candidate(string_t *origin, program_t *expected,
 #define COMPILE_TEST_ARGUMENT_INDEX 32
 #define COMPILE_TEST_STRUCT_LITERAL 33
 #define COMPILE_TEST_STRUCT_FILL 34
+#define COMPILE_TEST_DEFAULT_CAPTURE 35
+#define COMPILE_TEST_DEFAULT_FREEZE 36
+#define COMPILE_TEST_DEFAULT_PACK 37
 extern bool compile_update_test_fail(int point);
 #endif
 extern void compile_update_memory_failed(void);

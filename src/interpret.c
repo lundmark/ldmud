@@ -8050,7 +8050,8 @@ test_efun_args (int instr, int args, svalue_t *argp)
 
 /*-------------------------------------------------------------------------*/
 static INLINE Bool
-check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **svptype)
+check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **svptype,
+                            size_t *remaining, Bool *exhausted)
 // This function checks if <formal_type> and the svalue pointed to by <svp>
 // are compatible (that means, it is allowed to assign *svp to an LPC variable
 // having the type described by <formal_type>. The function handles lvalues,
@@ -8059,6 +8060,15 @@ check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **sv
 // If <svptype> is not NULL, the function stores the type of the value there,
 // which is useful for error messages. (The caller must free it afterwards.)
 {
+    if (remaining)
+    {
+        if (!*remaining)
+        {
+            *exhausted = MY_TRUE;
+            return MY_FALSE;
+        }
+        --*remaining;
+    }
     lpctype_t *valuetype = NULL;
     svalue_t *bsvp = get_rvalue_no_collapse(svp, NULL);
 
@@ -8134,6 +8144,15 @@ check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **sv
 
             while (true)
             {
+                if (remaining)
+                {
+                    if (!*remaining)
+                    {
+                        *exhausted = MY_TRUE;
+                        return MY_FALSE;
+                    }
+                    --*remaining;
+                }
                 // Walk through all possibilities of <formaltype>.
                 lpctype_t *member = head->t_class == TCLASS_UNION ? head->t_union.member : head;
                 if (member->t_class == TCLASS_ARRAY)
@@ -8149,7 +8168,8 @@ check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **sv
                         if (!item)
                             break;
 
-                        if(!check_rtt_compatibility_inl(element, item, svptype ? &svpresult : NULL))
+                        if(!check_rtt_compatibility_inl(element, item, svptype ? &svpresult : NULL,
+                                                        remaining, exhausted))
                             correct = MY_FALSE;
 
                         // mixed is returned when the element is '0'.
@@ -8291,6 +8311,24 @@ check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **sv
         }
         else
         {
+            /* The bounded caller supplies only native literal values and
+             * never requests diagnostic types. Scalar union checks must also
+             * account for alternatives visited by lpctype_contains().
+             */
+            if (remaining)
+            {
+                lpctype_t *head = formaltype;
+                do
+                {
+                    if (!*remaining)
+                    {
+                        *exhausted = MY_TRUE;
+                        return MY_FALSE;
+                    }
+                    --*remaining;
+                    head = head->t_class == TCLASS_UNION ? head->t_union.head : NULL;
+                } while (head);
+            }
             result = lpctype_contains(valuetype, formaltype);
             if (svptype)
                 *svptype = ref_lpctype(valuetype);
@@ -8312,15 +8350,29 @@ check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **sv
 Bool
 check_rtt_compatibility(lpctype_t *formaltype, svalue_t *svp) 
 {
-    return check_rtt_compatibility_inl(formaltype, svp, NULL);
+    return check_rtt_compatibility_inl(formaltype, svp, NULL, NULL, NULL);
 }
-#define check_rtt_compatibility(ft, svp) check_rtt_compatibility_inl(ft, svp, NULL)
+#ifdef USE_BLUEPRINT_UPDATE
+Bool
+check_rtt_compatibility_bounded(lpctype_t *formaltype, svalue_t *svp,
+                                size_t *remaining, Bool *exhausted)
+
+/* Only native default trees, recursively limited to scalar literals, arrays
+ * and mappings. Arbitrary runtime objects/lvalues need separate accounting;
+ * this path never owns an allocated diagnostic struct or Python type.
+ */
+{
+    *exhausted = MY_FALSE;
+    return check_rtt_compatibility_inl(formaltype, svp, NULL, remaining, exhausted);
+}
+#endif
+#define check_rtt_compatibility(ft, svp) check_rtt_compatibility_inl(ft, svp, NULL, NULL, NULL)
 
 lpctype_t*
 get_rtt_type(lpctype_t *formaltype, svalue_t *svp)
 {
     lpctype_t *result;
-    check_rtt_compatibility_inl(formaltype, svp, &result);
+    check_rtt_compatibility_inl(formaltype, svp, &result, NULL, NULL);
     return result;
 }
 

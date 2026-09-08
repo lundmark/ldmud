@@ -2815,6 +2815,22 @@ compile_update_candidate (string_t *origin, program_t *expected, program_t **res
     if (!cleanup->ctx.emergency.message)
         outofmemory("reserved update compiler diagnostic");
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (!strcmp(get_txt(origin), "/defaults_target"))
+    {
+        FILE *input = fopen("defaults-compiler-fault", "r");
+        if (input)
+        {
+            int point, countdown;
+            if (fscanf(input, "%d %d", &point, &countdown) == 2
+             && point >= COMPILE_TEST_DEFAULT_CAPTURE && point <= COMPILE_TEST_DEFAULT_PACK
+             && countdown >= 0)
+            {
+                cleanup->ctx.test_failure = point;
+                cleanup->ctx.test_countdown = countdown;
+            }
+            fclose(input);
+        }
+    }
     if (access("staging_fault_diagnostic", F_OK) == 0)
         cleanup->ctx.test_failure = COMPILE_TEST_DIAGNOSTIC;
     if (access("staging_fault_type_context", F_OK) == 0)

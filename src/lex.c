@@ -5818,6 +5818,10 @@ yylex1 (void)
         p_int c;
         size_t clen;
 
+#ifdef USE_BLUEPRINT_UPDATE
+        yylloc.source_file = current_loc.file;
+        yylloc.source_line = current_loc.line;
+#endif
         READ_CHAR;
 
         switch(c)
@@ -6705,6 +6709,10 @@ yylex (void)
         r = start_token;
         start_token = -1;
         yylloc.start = yylloc.end = 0;
+#ifdef USE_BLUEPRINT_UPDATE
+        yylloc.source_file = NULL;
+        yylloc.source_line = 0;
+#endif
         return r;
     }
 

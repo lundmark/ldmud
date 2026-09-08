@@ -377,6 +377,7 @@ struct variable_s
     string_t   *name;   /* Name of the variable (shared string) */
 #ifdef USE_BLUEPRINT_UPDATE
     bool schema_declared; /* True only for a declaration in this program. */
+    uint32_t schema_default; /* One-based own default record; zero if inherited. */
 #endif
     fulltype_t  type;
       /* Type and visibility of the variable (type object counted).
@@ -607,6 +608,71 @@ enum schema_function_kind
     SCHEMA_FUNCTION_NAMED,
     SCHEMA_FUNCTION_INLINE
 };
+
+/* Default evidence is a packed, immutable scalar payload. All offsets are
+ * relative to its start; values contain no separately owned references.
+ */
+enum schema_default_status
+{
+    SCHEMA_DEFAULT_MISSING,
+    SCHEMA_DEFAULT_INT_ZERO,
+    SCHEMA_DEFAULT_FLOAT_ZERO,
+    SCHEMA_DEFAULT_SUPPORTED,
+    SCHEMA_DEFAULT_UNSUPPORTED,
+    SCHEMA_DEFAULT_UNAVAILABLE
+};
+
+enum schema_default_reason
+{
+    SCHEMA_DEFAULT_REASON_NONE,
+    SCHEMA_DEFAULT_REASON_SYNTAX,
+    SCHEMA_DEFAULT_REASON_LIMIT,
+    SCHEMA_DEFAULT_REASON_NUMBER,
+    SCHEMA_DEFAULT_REASON_WIDTH,
+    SCHEMA_DEFAULT_REASON_METADATA
+};
+
+enum schema_default_kind
+{
+    SCHEMA_DEFAULT_INTEGER,
+    SCHEMA_DEFAULT_FLOAT,
+    SCHEMA_DEFAULT_STRING,
+    SCHEMA_DEFAULT_BYTES,
+    SCHEMA_DEFAULT_ARRAY,
+    SCHEMA_DEFAULT_MAPPING
+};
+
+#define SCHEMA_DEFAULT_VERSION 1
+#define SCHEMA_DEFAULT_RTT_CHECK 1
+
+struct schema_default_s
+{
+    uint32_t status, reason, root;
+    uint32_t source_start, source_size, line;
+    uint32_t flags;
+};
+
+struct schema_default_node_s
+{
+    uint32_t kind, edge_start, edge_count;
+    uint32_t text_start, text_size, unicode, depth;
+    p_int width;
+    union
+    {
+        p_int integer;
+        /* Already quantized through the driver's scalar float format. */
+        double floating;
+    } value;
+};
+
+struct schema_defaults_s
+{
+    uint32_t version;
+    uint32_t records, record_offset;
+    uint32_t nodes, node_offset;
+    uint32_t edges, edge_offset;
+    uint32_t bytes, byte_offset;
+};
 #endif
 
 struct program_s
@@ -639,6 +705,8 @@ struct program_s
     struct schema_argument_s *schema_arguments; /* Embedded, relocatable table. */
     unsigned int num_schema_arguments;
     funflag_t *schema_function_flags; /* Effective flags before address encoding. */
+    bytecode_p schema_defaults;   /* Embedded scalar/byte default descriptions. */
+    uint32_t schema_defaults_size;
 #endif
     mp_int          load_time;     /* When has it been compiled ? */
     linenumbers_t  *line_numbers;

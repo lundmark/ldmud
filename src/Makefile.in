@@ -726,7 +726,12 @@ xalloc.o : stdstrings.h
 # --- DO NOT MODIFY THIS LINE -- SELECTED AUTO-DEPENDS PRECEDE ---
 
 program_schema.o : program_schema.h config.h driver.h array.h exec.h interpret.h \
-                   mapping.h mstrings.h structs.h svalue.h xalloc.h
+                   mapping.h mstrings.h structs.h svalue.h xalloc.h program_update.h object.h
 program_update.o : program_schema.h efuns.h
 
 object.o gcollect.o interpret.o : program_schema.h
+
+# The test-only include is optional in source-only release distributions.
+program_schema.o : $(wildcard ../test/t-blueprint-update/defaults_native.inc)
+
+array.o mapping.o mstrings.o : program_update.h

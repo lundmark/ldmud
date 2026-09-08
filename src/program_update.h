@@ -4,6 +4,28 @@
 #include "driver.h"
 #include "typedefs.h"
 
+#if defined(USE_BLUEPRINT_UPDATE) && defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+enum default_test_point
+{
+    DEFAULT_TEST_ARRAY = 1, DEFAULT_TEST_STRING, DEFAULT_TEST_MAPPING,
+    DEFAULT_TEST_HASH, DEFAULT_TEST_CHAIN, DEFAULT_TEST_ARRAY_PRESSURE,
+    DEFAULT_TEST_STRING_PRESSURE, DEFAULT_TEST_MAPPING_PRESSURE,
+    DEFAULT_TEST_INSERT_PRESSURE, DEFAULT_TEST_DUPLICATE_RELEASE,
+    DEFAULT_TEST_DUPLICATE_CHILD, DEFAULT_TEST_ROW_CHILD,
+    DEFAULT_TEST_REPORT_MAPPING, DEFAULT_TEST_REPORT_STRING,
+    DEFAULT_TEST_REPORT_HASH, DEFAULT_TEST_REPORT_CHAIN, DEFAULT_TEST_REPORT_ARRAY
+};
+extern Bool program_update_default_test_fail(int point);
+extern void program_update_default_test_scope(Bool literal);
+extern void program_update_default_test_pressure(int point);
+#define DEFAULT_TEST_NULL(point, allocation) \
+    (program_update_default_test_fail(point) ? NULL : (allocation))
+#define DEFAULT_TEST_PRESSURE(point) program_update_default_test_pressure(point)
+#else
+#define DEFAULT_TEST_NULL(point, allocation) (allocation)
+#define DEFAULT_TEST_PRESSURE(point) ((void)0)
+#endif
+
 #ifdef USE_BLUEPRINT_UPDATE
 
 /* --- LPC request and report interface --- */

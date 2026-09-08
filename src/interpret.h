@@ -302,6 +302,13 @@ extern Bool privilege_violation2(string_t *what, svalue_t *arg, svalue_t *arg2, 
 extern Bool privilege_violation4(string_t *what, svalue_t whom, string_t *how_str, int how_num, svalue_t *sp);
 extern Bool privilege_violation_n(string_t *what, svalue_t whom, svalue_t *sp, int num_arg);
 
+#ifdef USE_BLUEPRINT_UPDATE
+/* Only fresh native default trees: numbers, strings/bytes, arrays, mappings.
+ * No lvalues, objects, structs, closures, or Python values, including children.
+ */
+extern Bool check_rtt_compatibility_bounded(lpctype_t *formaltype, svalue_t *svp,
+                                           size_t *remaining, Bool *exhausted);
+#endif
 extern Bool check_rtt_compatibility(lpctype_t *formaltype, svalue_t *svp) __attribute__((nonnull(2)));
 extern lpctype_t* get_rtt_type(lpctype_t *formaltype, svalue_t *svp) __attribute__((nonnull(2)));
 extern int translate_virtual_variable_index(int num);
