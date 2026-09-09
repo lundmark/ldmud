@@ -31,6 +31,8 @@ struct object_s
 #ifdef USE_BLUEPRINT_UPDATE
     struct program_update_request_s *program_updates;
       /* Non-owning reverse links for requests owned by this object. */
+    struct program_dependency_s *program_dependencies;
+      /* Non-owning live closure and unfinished coroutine dependencies. */
 #endif
     program_t *prog;      /* Program code for this object */
     string_t *name;

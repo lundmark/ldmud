@@ -9411,6 +9411,7 @@ printf("DEBUG:     -> F_CONTEXT_CLOSURE %d %d %d\n", current_inline->function
 
             /* Initialize the slots for the context variables. */
             memset(values - context->num_locals, 0, context->num_locals * sizeof(svalue_t));
+            closure_register_dependencies(&l->base, CLOSURE_LAMBDA);
 
             /* References have been adopted. */
             GET_BLOCK_SIZE(A_LAMBDA_VALUES) = lambda_values_offset * sizeof(A_LAMBDA_VALUES_t);
@@ -24761,6 +24762,8 @@ epilog_closure (int num_args)
         /* References have been adopted. */
         GET_BLOCK_SIZE(A_LAMBDA_VALUES) = 0;
         GET_BLOCK_SIZE(A_LAMBDA_VALUES_NEXT) = 0;
+
+        closure_register_dependencies(&l->base, CLOSURE_LAMBDA);
 
         break;
     }

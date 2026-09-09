@@ -610,8 +610,7 @@ cleanup_stuff (void)
             l = driver_hook[i].u.lambda;
             if (l->base.ob.type != T_OBJECT || l->base.ob.u.ob != master_ob)
             {
-                free_svalue(&(l->base.ob));
-                put_ref_object(&(l->base.ob), master_ob, "backend");
+                closure_set_bound_object(&l->base, CLOSURE_LAMBDA, svalue_object(master_ob));
             }
         }
     }

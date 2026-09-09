@@ -30,6 +30,74 @@
 #include "i-eval_cost.h"
 #include "xalloc.h"
 #include "i-current_object.h"
+#ifdef USE_PYTHON
+#include "pkg-python.h"
+#endif
+
+void
+program_dependency_init (program_dependency_t *link, void *handle,
+                         enum program_dependency_kind kind)
+
+/* Initialize an unpublished allocation, including GC sample handles. */
+
+{
+    link->object = NULL;
+    link->next = NULL;
+    link->prev = NULL;
+    link->peer = NULL;
+    link->handle = handle;
+    link->kind = kind;
+}
+
+void
+program_dependency_detach (program_dependency_t *link)
+
+/* Unlink without allocation, callbacks, or counted-reference releases. */
+
+{
+    if (!link->object)
+        return;
+    *link->prev = link->next;
+    if (link->next)
+        link->next->prev = link->prev;
+    link->object = NULL;
+    link->next = NULL;
+    link->prev = NULL;
+}
+
+void
+program_dependency_attach (program_dependency_t *link, object_t *ob)
+
+/* The handle already owns its endpoint. Inventory adds no reference. */
+
+{
+    assert(!link->object);
+    if (!ob || ob->flags & O_DESTRUCTED)
+        return;
+    link->object = ob;
+    link->next = ob->program_dependencies;
+    link->prev = &ob->program_dependencies;
+    if (link->next)
+        link->next->prev = &link->next;
+    ob->program_dependencies = link;
+}
+
+void
+program_dependencies_clear (object_t *ob)
+
+/* Drain while all allocations are still valid: at irreversible destruction,
+ * and before GC clears marks. No release can reenter or invalidate a peer.
+ */
+
+{
+    while (ob->program_dependencies)
+    {
+        program_dependency_t *link = ob->program_dependencies;
+        if (link->peer)
+            program_dependency_detach(link->peer);
+        program_dependency_detach(link);
+    }
+}
 
 #define BLUEPRINT_UPDATE_REPORT_TTL 300
 #define BLUEPRINT_UPDATE_MAX_REPORTS 256
@@ -650,6 +718,86 @@ validate_targets (program_update_request_t *request, Bool admission)
             request_error(request, "VARIABLE_STORAGE_LIMIT", "variable storage limit exceeded.");
     }
 } /* validate_targets() */
+
+static Bool
+validate_runtime_object (program_update_request_t *request, object_t *ob)
+
+/* Called at the final compatibility boundary, after schema diagnostics.
+ * No callbacks or allocation occur while consulting the weak inventories.
+ */
+
+{
+    program_dependency_t *link;
+    const char *code = NULL, *reason = NULL;
+    char message[2 * MAXPATHLEN + 256];
+
+    link = ob->program_dependencies;
+    if (link)
+    {
+        if (link->kind == PROGRAM_DEPENDENCY_COROUTINE)
+        {
+            code = "LIVE_COROUTINE";
+            reason = "unfinished coroutine depends on the current program.";
+        }
+        else
+        {
+            code = "LIVE_CLOSURE";
+            reason = "live closure depends on the current program.";
+        }
+    }
+#ifdef USE_PYTHON
+    if (!code && python_program_has_handles(ob))
+    {
+        code = "PYTHON_HANDLE";
+        reason = "live Python handle depends on the current program.";
+    }
+#endif
+    if (!code)
+        return MY_TRUE;
+    snprintf(message, sizeof(message), "%s: %s", get_txt(ob->name), reason);
+    /* The schema pass completed. Do not unwind through the preparation
+     * error handler, which correctly discards incomplete schema evidence.
+     */
+    request_failure(request, code, message);
+    return MY_FALSE;
+}
+
+static void
+validate_runtime_dependencies (program_update_request_t *request)
+
+/* Only programs that would change need compatibility checks. Object-source
+ * mode leaves its blueprint and already-current clones unchanged. Selection
+ * validity and complete counts have already been established after hooks.
+ */
+
+{
+    object_t *ob;
+    program_t *candidate = request->source_from_path ? request->candidate
+                                                    : request->source_program;
+    vector_t *targets = request->explicit_selection
+                       ? request->roots[UPDATE_TARGETS].u.vec : NULL;
+    size_t index = 0;
+
+    if (request->source_from_path)
+        if (!validate_runtime_object(request, request->roots[UPDATE_SOURCE].u.ob))
+            return;
+    for (ob = targets ? NULL : obj_list; targets || ob;
+         ob = targets ? NULL : ob->next_all)
+    {
+        if (targets)
+        {
+            if (index == VEC_SIZE(targets)) break;
+            svalue_t *value = &targets->item[index++];
+            ob = value->type == T_OBJECT ? value->u.ob : NULL;
+        }
+        if (!ob || ob->flags & O_DESTRUCTED || !(ob->flags & O_CLONE)
+         || ob->prog == candidate
+         || (!targets && !same_family(ob, request->roots[UPDATE_ORIGIN].u.str)))
+            continue;
+        if (!validate_runtime_object(request, ob))
+            return;
+    }
+}
 
 static void
 describe_schemas (program_update_request_t *request)
@@ -1479,6 +1627,8 @@ program_update_process (void)
             preparation_guard_active = MY_FALSE;
             if (preparation_guard.failed)
                 errorf("update_blueprint(): memory pressure preparing defaults.\n");
+            if (!strcmp(active->failure_code, "IMPLEMENTATION_INCOMPLETE"))
+                validate_runtime_dependencies(active);
             clear_current_object();
             /* Future compiler and migration hooks belong in this boundary. */
             mark_end_evaluation();

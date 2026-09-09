@@ -3964,6 +3964,9 @@ destruct (object_t *ob)
     ob->contains = NULL;
     ob->flags &= ~O_ENABLE_COMMANDS;
     ob->flags |= O_DESTRUCTED;  /* must come last! */
+#ifdef USE_BLUEPRINT_UPDATE
+    program_dependencies_clear(ob);
+#endif
     if (command_giver == ob)
         command_giver = NULL;
 
@@ -6345,6 +6348,7 @@ f_set_driver_hook (svalue_t *sp)
             driver_hook[n] = *sp;
             driver_hook[n].x.closure_type = CLOSURE_LAMBDA;
             put_ref_object(&(driver_hook[n].u.lambda->base.ob), master_ob, "hook closure");
+            closure_register_dependencies(&driver_hook[n].u.lambda->base, CLOSURE_LAMBDA);
             break;
         }
         /* FALLTHROUGH */

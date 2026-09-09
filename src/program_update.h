@@ -28,6 +28,33 @@ extern void program_update_default_test_pressure(int point);
 
 #ifdef USE_BLUEPRINT_UPDATE
 
+enum program_dependency_kind
+{
+    PROGRAM_DEPENDENCY_BINDING,
+    PROGRAM_DEPENDENCY_LFUN,
+    PROGRAM_DEPENDENCY_COROUTINE
+};
+
+/* Weak intrusive membership, embedded in its native handle. Neither the
+ * object head nor these links own/mark a reference. A closure's two records
+ * are peers so destruction of either endpoint invalidates both records.
+ */
+typedef struct program_dependency_s
+{
+    object_t *object;
+    struct program_dependency_s *next;
+    struct program_dependency_s **prev;
+    struct program_dependency_s *peer;
+    void *handle;
+    enum program_dependency_kind kind;
+} program_dependency_t;
+
+extern void program_dependency_init(program_dependency_t *link, void *handle,
+                                    enum program_dependency_kind kind);
+extern void program_dependency_attach(program_dependency_t *link, object_t *ob);
+extern void program_dependency_detach(program_dependency_t *link);
+extern void program_dependencies_clear(object_t *ob);
+
 #define BLUEPRINT_UPDATE_MAX_DIAGNOSTICS 128
 #define BLUEPRINT_UPDATE_MAX_DIAGNOSTIC_BYTES 65536
 

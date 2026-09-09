@@ -655,8 +655,8 @@ cleanup_structures (cleanup_t * context)
                 {
                     lambda_t * l = driver_hook[i].u.lambda;
 
-                    free_svalue(&(l->base.ob));
-                    put_ref_object(&(l->base.ob), master_ob, "cleanup_structures");
+                    closure_set_bound_object(&l->base, driver_hook[i].x.closure_type,
+                                             svalue_object(master_ob));
                 }
             }
             else
@@ -2060,6 +2060,7 @@ gc_count_ref_in_malloced_closure (svalue_t *csvp)
                 if(csvp->u.lfun_closure->inhProg)
                     mark_program_ref(csvp->u.lfun_closure->inhProg);
             }
+            closure_register_dependencies(cl, type);
         }
     }
 
@@ -2319,6 +2320,14 @@ garbage_collection(void)
 
     /* --- Pass 1: clear the 'referenced' flag in all malloced blocks ---
      */
+#ifdef USE_BLUEPRINT_UPDATE
+    /* Allocator sweeping bypasses destructors. Detach every old weak node
+     * while it and its neighbors still exist; only actual roots rebuild
+     * membership in the count pass. Inventory is never a GC root.
+     */
+    for (ob = obj_list; ob; ob = ob->next_all)
+        program_dependencies_clear(ob);
+#endif
     mem_clear_ref_flags();
 
     /* --- Pass 2: clear the ref counts ---

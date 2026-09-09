@@ -148,6 +148,7 @@
  */
 
 #include "driver.h"
+#include "program_update.h"
 #include "program_schema.h"
 #include "typedefs.h"
 
@@ -274,6 +275,9 @@ dealloc_object ( object_t *ob, const char * file, int line)
               "still has sentences.\n"
              , get_txt(ob->name), ob->ref, ob->flags);
 
+#ifdef USE_BLUEPRINT_UPDATE
+    program_dependencies_clear(ob);
+#endif
 #ifdef USE_PYTHON
     if (ob->python_dict != NULL)
         python_free_object(ob);
@@ -923,6 +927,43 @@ logon_object (object_t *ob, p_int flag)
 } /* logon_object() */
 
 /*-------------------------------------------------------------------------*/
+#if defined(USE_BLUEPRINT_UPDATE) && defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+static Bool
+replacement_test_resource_failure (object_t *ob)
+
+/* Private regression checkpoint: retain an actual pending replacement at
+ * its variable-allocation failure boundary. No LPC-visible testing API.
+ */
+
+{
+    FILE *input = fopen("blockers-replacement-fault", "r");
+    char name[MAXPATHLEN + 1];
+    Bool fail = MY_FALSE;
+
+    if (input)
+    {
+        if (fgets(name, sizeof(name), input))
+        {
+            char *start = name;
+            name[strcspn(name, "\r\n")] = '\0';
+            if (*start == '/') start++;
+            fail = !strcmp(start, get_txt(ob->name));
+        }
+        fclose(input);
+    }
+    if (fail)
+    {
+        FILE *output = fopen("blockers-replacement-hit", "a");
+        if (output)
+        {
+            fputs("variable allocation deferred\n", output);
+            fclose(output);
+        }
+    }
+    return fail;
+}
+#endif
+
 void
 replace_programs (void)
 
@@ -984,7 +1025,12 @@ replace_programs (void)
             program_t *oldprog = r_ob->ob->prog;
 
             /* Get the memory */
-            new_vars = xalloc(r_ob->new_prog->num_variables * sizeof *new_vars);
+#if defined(USE_BLUEPRINT_UPDATE) && defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+            if (replacement_test_resource_failure(r_ob->ob))
+                new_vars = NULL;
+            else
+#endif
+                new_vars = xalloc(r_ob->new_prog->num_variables * sizeof *new_vars);
             if (!new_vars)
             {
                 obj_list_replace = r_ob;
@@ -3939,13 +3985,12 @@ move_object (void)
 
     if (NULL != ( l = driver_hook[H_MOVE_OBJECT1].u.lambda) )
     {
-        free_svalue(&(l->base.ob));
-        put_ref_object(&(l->base.ob), inter_sp[-1].u.ob, "move_object");
+        closure_set_bound_object(&l->base, CLOSURE_LAMBDA, inter_sp[-1]);
         call_lambda(&driver_hook[H_MOVE_OBJECT1], 2);
     }
     else if (NULL != ( l = driver_hook[H_MOVE_OBJECT0].u.lambda) )
     {
-        assign_current_object(&(l->base.ob), "move_object");
+        closure_set_bound_object(&l->base, CLOSURE_LAMBDA, current_object);
         call_lambda(&driver_hook[H_MOVE_OBJECT0], 2);
     }
     else
@@ -10828,4 +10873,3 @@ f_restore_value (svalue_t *sp)
 } /* f_restore_value() */
 
 /***************************************************************************/
-

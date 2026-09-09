@@ -3922,8 +3922,8 @@ ldmud_program_dealloc (ldmud_program_t* self)
  */
 
 {
-    free_svalue(&(self->lpc_object));
     remove_gc_object(&gc_program_list, (ldmud_gc_var_t*)self);
+    free_svalue(&(self->lpc_object));
 
     Py_TYPE(self)->tp_free((PyObject*)self);
 } /* ldmud_program_dealloc() */
@@ -5583,6 +5583,44 @@ static PyTypeObject ldmud_program_variables_type =
     0,                                  /* tp_members */
     ldmud_program_variables_getset,     /* tp_getset */
 };
+
+#ifdef USE_BLUEPRINT_UPDATE
+Bool
+python_program_has_handles (object_t *ob)
+
+/* These native wrappers include handles retained solely by Python. Inspect
+ * exact ordinary targets without allocation, Python calls, or decrefs.
+ * Namespace containers also cache programs: their refresh ordering must be
+ * audited before enabling them. Retained iterators, including
+ * exhausted ones, remain conservative blockers as well.
+ */
+
+{
+    ldmud_gc_var_t *var;
+    Bool found = MY_FALSE;
+    bool started = python_start_thread();
+
+    for (var = gc_program_list; var; var = var->gcnext)
+    {
+        ldmud_program_t *self = (ldmud_program_t *)var;
+        PyTypeObject *type = Py_TYPE(self);
+
+        if (self->lpc_object.type == T_OBJECT && self->lpc_object.u.ob == ob
+         && (type == &ldmud_program_lfun_type
+          || type == &ldmud_program_variable_type
+          || type == &ldmud_program_functions_type
+          || type == &ldmud_program_variables_type
+          || type == &ldmud_program_functions_iter_type
+          || type == &ldmud_program_variables_iter_type))
+        {
+            found = MY_TRUE;
+            break;
+        }
+    }
+    python_finish_thread(started);
+    return found;
+}
+#endif /* USE_BLUEPRINT_UPDATE */
 
 /*-------------------------------------------------------------------------*/
 /* Objects */
@@ -9389,7 +9427,7 @@ ldmud_closure_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
         }
 
         /* The closure was bound to the wrong object */
-        assign_object_svalue(&(cl.u.lfun_closure->base.ob), sv_bound_ob, "ldmud_closure_init");
+        closure_set_bound_object(&cl.u.lfun_closure->base, CLOSURE_LFUN, sv_bound_ob);
     }
 
     result = ldmud_closure_create(&cl);
@@ -9725,7 +9763,7 @@ ldmud_lfun_closure_init (ldmud_closure_t *self, PyObject *args, PyObject *kwds)
     }
 
     /* The closure was bound to the wrong object */
-    assign_object_svalue(&(self->lpc_closure.u.lfun_closure->base.ob), sv_bound_ob, "ldmud_closure_init");
+    closure_set_bound_object(&self->lpc_closure.u.lfun_closure->base, CLOSURE_LFUN, sv_bound_ob);
 
     return 0;
 } /* ldmud_lfun_closure_init() */
@@ -10308,6 +10346,7 @@ ldmud_bound_lambda_closure_init (ldmud_closure_t *self, PyObject *args, PyObject
     closure_init_base(&(l->base), sv_ob);
     l->lambda = lambda->lpc_closure.u.lambda;
     lambda->lpc_closure.u.lambda->base.ref++;
+    closure_register_dependencies(&l->base, CLOSURE_BOUND_LAMBDA);
 
     free_svalue(&self->lpc_closure);
     self->lpc_closure.type = T_CLOSURE;

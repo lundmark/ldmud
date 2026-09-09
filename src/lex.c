@@ -1937,7 +1937,7 @@ undefined_function:
                 fatal("Can't find simul_efun %s", get_txt(p->name));
 
             closure_lfun(sp, svalue_object(simul_efun_object), simul_efun_object->prog, fx, 0, true);
-            assign_current_object(&(sp->u.lfun_closure->base.ob), "symbol_efun");
+            closure_set_bound_object(&sp->u.lfun_closure->base, CLOSURE_LFUN, current_object);
             return;
         }
         else if (current_object.type == T_OBJECT)

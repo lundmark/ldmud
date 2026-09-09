@@ -913,16 +913,22 @@ replace_program_lfun_closure_adjust (replace_ob_t *r_ob)
                 int newidx = replace_program_function_adjust(r_ob, l->fun_index);
                 if (newidx < 0)
                 {
+                    svalue_t old_ob;
+                    program_t *old_prog;
+
                     /* If the function vanished, replace it with a default */
                     assert_master_ob_loaded();
-                    free_svalue(&(l->fun_ob));
-                    if(l->inhProg)
-                        free_prog(l->inhProg, MY_TRUE);
-
+                    old_ob = l->fun_ob;
+                    old_prog = l->inhProg;
+                    closure_detach_dependencies(&l->base);
                     put_ref_object(&(l->fun_ob), master_ob, "replace_program_lambda_adjust");
                     newidx = find_function( STR_DANGLING_LFUN, master_ob->prog);
                     l->fun_index = (unsigned short)(newidx < 0 ? 0 : newidx);
                     l->inhProg = NULL;
+                    closure_register_dependencies(&l->base, CLOSURE_LFUN);
+                    free_svalue(&old_ob);
+                    if (old_prog)
+                        free_prog(old_prog, MY_TRUE);
                 }
                 else
                 {
@@ -1118,6 +1124,7 @@ replace_program_lambda_adjust (replace_ob_t *r_ob)
             memcpy(&l->program, &l2->program, (size_t)code_size2);
 
             /* Free the (now empty) memory */
+            closure_detach_dependencies(&l2->base);
             free_svalue(&(l2->base.ob));
             if  (l2->base.prog_ob)
                 free_object(l2->base.prog_ob, "replace_program_lambda_adjust");
@@ -1139,6 +1146,67 @@ replace_program_lambda_adjust (replace_ob_t *r_ob)
 } /* replace_lambda_program_adjust() */
 
 /*-------------------------------------------------------------------------*/
+#ifdef USE_BLUEPRINT_UPDATE
+void
+closure_init_dependencies (closure_base_t *cl)
+
+/* Also used after copying a context lambda: copied links are never owned. */
+
+{
+    program_dependency_init(&cl->binding_dependency, cl, PROGRAM_DEPENDENCY_BINDING);
+    program_dependency_init(&cl->target_dependency, cl, PROGRAM_DEPENDENCY_LFUN);
+    cl->binding_dependency.peer = &cl->target_dependency;
+    cl->target_dependency.peer = &cl->binding_dependency;
+}
+
+void
+closure_detach_dependencies (closure_base_t *cl)
+{
+    program_dependency_detach(&cl->binding_dependency);
+    program_dependency_detach(&cl->target_dependency);
+}
+
+void
+closure_register_dependencies (closure_base_t *cl, int type)
+
+/* Called only on initialized, owned fields and on surviving GC visits.
+ * An unbound lambda's ob is borrowed execution scratch, never an endpoint.
+ * Creator metadata is diagnostic only. Both lfun endpoints must be live.
+ */
+
+{
+    svalue_t target = const0;
+
+    if (type == CLOSURE_UNBOUND_LAMBDA)
+        return;
+    if (type == CLOSURE_LFUN)
+        target = ((lfun_closure_t *)cl)->fun_ob;
+    if ((cl->ob.type == T_OBJECT && cl->ob.u.ob->flags & O_DESTRUCTED)
+     || (target.type == T_OBJECT && target.u.ob->flags & O_DESTRUCTED))
+        return;
+    if (cl->ob.type == T_OBJECT)
+        program_dependency_attach(&cl->binding_dependency, cl->ob.u.ob);
+    if (target.type == T_OBJECT)
+        program_dependency_attach(&cl->target_dependency, target.u.ob);
+}
+
+void
+closure_set_bound_object (closure_base_t *cl, int type, svalue_t ob)
+
+/* Copy the new binding and publish coherent membership before releasing
+ * the old one: object release can run Python finalizers and reenter LPC.
+ */
+
+{
+    svalue_t old = cl->ob;
+
+    closure_detach_dependencies(cl);
+    assign_object_svalue_no_free(&cl->ob, ob, "closure binding");
+    closure_register_dependencies(cl, type);
+    free_svalue(&old);
+}
+#endif /* USE_BLUEPRINT_UPDATE */
+
 void
 closure_init_base (closure_base_t * cl, svalue_t obj)
 
@@ -1147,6 +1215,7 @@ closure_init_base (closure_base_t * cl, svalue_t obj)
  */
 
 {
+    closure_init_dependencies(cl);
     cl->ref = 1;
     if (current_prog)
     {
@@ -1192,6 +1261,7 @@ closure_identifier (svalue_t *dest, svalue_t obj, int ix, Bool raise_error)
 
     closure_init_base(&(cl->base), obj);
     cl->var_index = (unsigned short)ix;
+    closure_register_dependencies(&cl->base, CLOSURE_IDENTIFIER);
 
     /* Fill in the result svalue */
     dest->type = T_CLOSURE;
@@ -1265,6 +1335,7 @@ closure_lfun ( svalue_t *dest, svalue_t obj, program_t *prog, int ix
     dest->type = T_CLOSURE;
     dest->x.closure_type = CLOSURE_LFUN;
     dest->u.lfun_closure = l;
+    closure_register_dependencies(&l->base, CLOSURE_LFUN);
 
     /* If the object's program will be replaced, store the closure
      * in lambda protector, otherwise mark the object as referenced by
@@ -5634,6 +5705,9 @@ lambda (vector_t *args, svalue_t *block, svalue_t origin)
     l->num_opt_arg = 0;
     l->xvarargs = false;
 
+    closure_register_dependencies(&l->base, origin.type == T_NUMBER
+                                           ? CLOSURE_UNBOUND_LAMBDA : CLOSURE_LAMBDA);
+
     /* Clean up */
     free_symbols();
     xfree(current.code);
@@ -5686,6 +5760,8 @@ free_closure (svalue_t *svp)
         closure_base_t *cl = svp->u.closure;
         if (--cl->ref)
             return;
+
+        closure_detach_dependencies(cl);
 
         if (type != CLOSURE_UNBOUND_LAMBDA)
             free_svalue(&(cl->ob));
@@ -6423,8 +6499,8 @@ v_bind_lambda (svalue_t *sp, int num_arg)
 
         case CLOSURE_LFUN:
             /* Rebind an lfun to the given object */
-            free_svalue(&(sp->u.lfun_closure->base.ob));
-            sp->u.lfun_closure->base.ob = ob;
+            closure_set_bound_object(&sp->u.lfun_closure->base, CLOSURE_LFUN, ob);
+            free_svalue(&ob);
             break;
 
         case CLOSURE_BOUND_LAMBDA:
@@ -6437,8 +6513,8 @@ v_bind_lambda (svalue_t *sp, int num_arg)
             {
                 /* We are the only user of the lambda: simply rebind it.
                  */
-                free_svalue(&(l->base.ob));
-                l->base.ob = ob;
+                closure_set_bound_object(&l->base, CLOSURE_BOUND_LAMBDA, ob);
+                free_svalue(&ob);
                 break;
             }
             else
@@ -6458,6 +6534,7 @@ v_bind_lambda (svalue_t *sp, int num_arg)
 
                 l2->lambda = l->lambda;
                 l->lambda->base.ref++;
+                closure_register_dependencies(&l2->base, CLOSURE_BOUND_LAMBDA);
                 l->base.ref--;
 
                 sp->u.bound_lambda = l2;
@@ -6480,6 +6557,7 @@ v_bind_lambda (svalue_t *sp, int num_arg)
             free_svalue(&ob); /* We created a new reference. */
 
             l->lambda = sp->u.lambda;
+            closure_register_dependencies(&l->base, CLOSURE_BOUND_LAMBDA);
               /* The ref to the unbound closure is just transferred from
                * sp to l->function.lambda.
                */
@@ -6707,7 +6785,7 @@ f_symbol_function (svalue_t *sp)
         }
 
         /* The closure was bound to the wrong object */
-        assign_current_object(&(sp->u.lfun_closure->base.ob), "symbol_function");
+        closure_set_bound_object(&sp->u.lfun_closure->base, CLOSURE_LFUN, current_object);
 
         free_svalue(&target); /* We adopted the reference */
 

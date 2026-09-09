@@ -7,6 +7,7 @@
 #include "bytecode.h"
 #include "svalue.h"
 #include "exec.h"
+#include "program_update.h"
 
 /* In case offsetof() is not a compiler builtin include stddef.h which
  * supplies a define as fallback. Needed for LAMBDA_VALUE_OFFSET */
@@ -25,6 +26,9 @@ struct closure_base_s
 {
     p_int ref;
       /* ref count */
+#ifdef USE_BLUEPRINT_UPDATE
+    program_dependency_t binding_dependency, target_dependency;
+#endif
     svalue_t ob;
       /* Normal or lightweight object the closure is bound to.
        * (Refcounted except for CLOSURE_UNBOUND_LAMBDA.)
@@ -146,6 +150,18 @@ extern int       replace_program_variable_adjust(replace_ob_t *r_ob, int var_idx
 extern void      replace_program_lfun_closure_adjust(replace_ob_t *r_ob);
 extern void      replace_program_lambda_adjust(replace_ob_t *r_ob);
 extern void      closure_init_base(closure_base_t * cl, svalue_t obj);
+#ifdef USE_BLUEPRINT_UPDATE
+extern void      closure_set_bound_object(closure_base_t *cl, int type, svalue_t ob);
+extern void      closure_init_dependencies(closure_base_t *cl);
+extern void      closure_register_dependencies(closure_base_t *cl, int type);
+extern void      closure_detach_dependencies(closure_base_t *cl);
+#else
+#define closure_set_bound_object(cl, type, value) \
+    assign_object_svalue(&(cl)->ob, value, "closure binding")
+#define closure_init_dependencies(cl) ((void)0)
+#define closure_register_dependencies(cl, type) ((void)0)
+#define closure_detach_dependencies(cl) ((void)0)
+#endif
 extern lambda_t *closure_new_lambda (svalue_t obj, unsigned short context_size, Bool raise_error);
 extern void      closure_lfun (svalue_t *dest, svalue_t obj, program_t *prog, int ix, unsigned short num, Bool raise_error);
 extern void      closure_literal(svalue_t *dest, int ix, unsigned short inhIndex, unsigned short num);

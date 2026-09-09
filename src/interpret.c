@@ -11022,6 +11022,10 @@ again:
         /* Copy header and code. */
         l =  (lambda_t*)(block + value_size);
         memcpy(l, orig, lambda_size);
+        closure_init_dependencies(&l->base);
+#ifdef USE_BLUEPRINT_UPDATE
+        l->base.ref = 1;
+#endif
         l->base.prog_ob = ref_valid_object(orig->base.prog_ob, "context_lambda");
         assign_object_svalue_no_free(&l->base.ob, orig->base.ob, "context_lambda");
 
@@ -11058,6 +11062,8 @@ again:
         orig_values = (svalue_t*)(((void*)orig) - ((void*)l) + ((void*)values));
         while (values != (void*)l)
             assign_svalue_no_free(values++, orig_values++);
+
+        closure_register_dependencies(&l->base, CLOSURE_LAMBDA);
 
         sp++;
         sp->type = T_CLOSURE;
