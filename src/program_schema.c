@@ -131,6 +131,8 @@ blocker (schema_compare_t *ctx, const char *code,
  */
 {
     mapping_t *record;
+    if (!ctx->blockers)
+        errorf("update_blueprint(): variable preparation failed (%s).\n", code);
     if (ctx->num_blockers > SCHEMA_MAX_BLOCKERS)
         return;
     if (ctx->num_blockers == SCHEMA_MAX_BLOCKERS)
@@ -920,6 +922,89 @@ finish:
     trim(removed, removals);
     return defaults_ready;
 } /* compare_variables() */
+
+void
+program_schema_prepare_variables (program_t *old, program_t *candidate,
+                                  mapping_t *report, svalue_t *old_values,
+                                  svalue_t *values, svalue_t *blueprint_values,
+                                  Bool blueprint, schema_budget_t *budget)
+
+/* Reuse the exact validated declaration map, never match by visible name.
+ * Reports contain diagnostic defaults only. Materialize each independent
+ * addition afresh from its immutable descriptor, including source additions.
+ */
+
+{
+    schema_compare_t ctx = { .budget = budget };
+    vector_t *matched = field(report, "matched")->u.vec;
+    vector_t *added = field(report, "added")->u.vec;
+
+    for (size_t i = 0; i < VEC_SIZE(matched); i++)
+    {
+        mapping_t *entry = matched->item[i].u.map;
+        p_int before = field(entry, "old_slot")->u.number;
+        p_int after = field(entry, "new_slot")->u.number;
+        spend_work(&ctx);
+        if (before < 0 || before >= old->num_variables
+         || after < 0 || after >= candidate->num_variables || values[after].type != T_INVALID)
+            errorf("update_blueprint(): invalid retained variable plan.\n");
+        assign_update_svalue_no_free(values + after, old_values + before);
+        MIGRATION_TEST_STEP();
+    }
+    for (size_t i = 0; i < VEC_SIZE(added); i++)
+    {
+        p_int slot = field(added->item[i].u.map, "new_slot")->u.number;
+        schema_identity_t identity = { .path = "$" };
+        const program_t *owner;
+        const struct schema_defaults_s *header;
+        const struct schema_default_s *description;
+        uint32_t index;
+        spend_work(&ctx);
+        if (slot < 0 || slot >= candidate->num_variables || values[slot].type != T_INVALID)
+            errorf("update_blueprint(): invalid added variable plan.\n");
+        if (!blueprint && !(candidate->variables[slot].type.t_flags & VAR_INITIALIZED))
+        {
+            if (!blueprint_values || blueprint_values[slot].type == T_INVALID)
+                errorf("update_blueprint(): shared blueprint variable unavailable.\n");
+            assign_update_rvalue_no_free(values + slot, blueprint_values + slot, budget);
+            MIGRATION_TEST_STEP();
+            continue;
+        }
+        if (!variable_identity(&ctx, candidate, slot, &identity, 0))
+            errorf("update_blueprint(): default declaration unavailable.\n");
+        owner = identity.program;
+        index = owner->variables[identity.slot].schema_default;
+        header = default_header(owner);
+        if (!header || !index || index > header->records)
+            errorf("update_blueprint(): default metadata unavailable.\n");
+        description = (const struct schema_default_s *)
+            (owner->schema_defaults + header->record_offset) + index - 1;
+        if (!default_record_valid(header, description))
+            errorf("update_blueprint(): invalid default metadata.\n");
+        if (description->status == SCHEMA_DEFAULT_INT_ZERO)
+            put_number(values + slot, 0);
+        else if (description->status == SCHEMA_DEFAULT_FLOAT_ZERO)
+            put_float(values + slot, 0.0);
+        else if (description->status != SCHEMA_DEFAULT_SUPPORTED
+              || !materialize_requested_default(&ctx, owner, header, description->root, values + slot))
+            errorf("update_blueprint(): default materialization limit exceeded.\n");
+        if (description->flags & SCHEMA_DEFAULT_RTT_CHECK)
+        {
+            Bool exhausted;
+            Bool compatible = check_rtt_compatibility_bounded(
+                owner->variables[identity.slot].type.t_type, values + slot, &budget->work, &exhausted);
+            if (exhausted || (!compatible && !(owner->flags & P_WARN_RTT_CHECKS)))
+                errorf("update_blueprint(): default type validation failed.\n");
+        }
+        MIGRATION_TEST_STEP();
+    }
+    for (int i = 0; i < candidate->num_variables; i++)
+    {
+        spend_work(&ctx);
+        if (values[i].type == T_INVALID)
+            errorf("update_blueprint(): incomplete variable plan.\n");
+    }
+} /* program_schema_prepare_variables() */
 
 static Bool
 signature_available (const program_t *prog, const function_t *head)

@@ -30,6 +30,15 @@ extern Bool program_schema_compare(program_t *old, program_t *candidate,
 extern Bool program_schema_compare_blueprint(program_t *old, program_t *candidate,
                                              svalue_t *result, schema_budget_t *budget,
                                              svalue_t *preparation);
+/* Populate an already rooted candidate-sized invalid block. The validated
+ * report supplies declaration matches; blueprint_values addresses either
+ * the complete prepared source block or the pinned loaded blueprint block.
+ * All old/source values remain untouched and independently owned.
+ */
+extern void program_schema_prepare_variables(program_t *old, program_t *candidate,
+                                             mapping_t *report, svalue_t *old_values,
+                                             svalue_t *values, svalue_t *blueprint_values,
+                                             Bool blueprint, schema_budget_t *budget);
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
 extern void program_schema_test_defaults(program_t *source, svalue_t *root);
 extern void program_schema_test_rtt(program_t *source);

@@ -105,8 +105,22 @@ program_dependencies_clear (object_t *ob)
 enum update_root
 {
     UPDATE_ORIGIN, UPDATE_SCHEMAS, UPDATE_DIAGNOSTICS, UPDATE_SOURCE, UPDATE_TARGETS,
-    UPDATE_BLUEPRINT_SCHEMA, UPDATE_BLUEPRINT_DEFAULTS, UPDATE_NUM_ROOTS
+    UPDATE_BLUEPRINT_SCHEMA, UPDATE_BLUEPRINT_DEFAULTS,
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    UPDATE_TEST_VALUES,
+#endif
+    UPDATE_NUM_ROOTS
 };
+typedef struct program_update_variables_s
+{
+    struct program_update_variables_s *next;
+    svalue_t object;              /* Pins the unchanged live owner. */
+    program_t *old_program;       /* Pins the exact loaded generation. */
+    svalue_t *values;             /* Candidate-sized, individually rooted slots. */
+    size_t num_values;            /* All slots valid or T_INVALID. */
+    Bool snapshot;               /* Loaded-mode blueprint, never installed. */
+} program_update_variables_t;
+
 typedef struct program_update_request_s
 {
     error_handler_t handler;
@@ -116,6 +130,7 @@ typedef struct program_update_request_s
     object_t *owner;              /* Non-owning; destruction unlinks it. */
     program_t *source_program;    /* Exact generation, independently pinned. */
     program_t *candidate;         /* Unpublished program, independently rooted. */
+    program_update_variables_t *variables;
     svalue_t roots[UPDATE_NUM_ROOTS];
     p_int id;
     p_int candidate_generation;
@@ -148,6 +163,9 @@ static Bool preparation_guard_active;
 static p_int last_id;
 
 static svalue_t *report_field(mapping_t *report, const char *name);
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+static void migration_test_begin(void);
+#endif
 
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
 static int report_test_countdown = -1;
@@ -297,6 +315,67 @@ unlink_owner (program_update_request_t *request)
 } /* unlink_owner() */
 
 static void
+release_variables (program_update_request_t *request)
+
+/* Staging rollback is deliberately narrower than postcommit retirement.
+ * All old variable blocks and every source/target object remain owned and
+ * unchanged until ALL prepared references have been released. An arbitrary
+ * retained/shared value (including a descendant in a projected range) still
+ * has that old owner; only newly materialized native literals can reach zero.
+ * Therefore these releases cannot finalize Python/LW objects or call LPC.
+ * Keep the busy request rooted throughout, including error recovery. Actual
+ * old-block retirement needs a separate protocol before publication exists.
+ */
+
+{
+    program_update_variables_t *stage;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    free_svalue(&request->roots[UPDATE_TEST_VALUES]);
+    put_number(&request->roots[UPDATE_TEST_VALUES], 0);
+#endif
+    for (stage = request->variables; stage; stage = stage->next)
+    {
+        svalue_t *values = stage->values;
+        size_t count = stage->num_values;
+        stage->values = NULL;
+        stage->num_values = 0;
+        for (size_t i = 0; i < count; i++)
+            free_svalue(values + i);
+        if (values) xfree(values);
+    }
+    while ((stage = request->variables))
+    {
+        request->variables = stage->next;
+        free_svalue(&stage->object);
+        free_prog(stage->old_program, MY_TRUE);
+        xfree(stage);
+    }
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (request == active && !strcmp(get_txt(request->roots[UPDATE_ORIGIN].u.str), "/fault_target"))
+    {
+        FILE *output = fopen("migration-released", "w");
+        if (output) { fputs("1\n", output); fclose(output); }
+    }
+#endif
+} /* release_variables() */
+
+static void
+variables_cleanup (error_handler_t *handler)
+
+/* errorf() resets the value stack before invoking master:runtime_error().
+ * Retire staging at that boundary, while no callback has yet had a chance
+ * to overwrite an old variable or destroy its owner. The backend setjmp is
+ * too late to establish that ownership guarantee.
+ */
+
+{
+    program_update_request_t *request = (program_update_request_t *)handler;
+    stack_gap_guard_t *previous = set_stack_gap_guard(&preparation_guard);
+    release_variables(request);
+    set_stack_gap_guard(previous);
+} /* variables_cleanup() */
+
+static void
 release_inputs (program_update_request_t *request)
 
 /* Release and zero the source and fixed target references of <request>,
@@ -311,6 +390,7 @@ release_inputs (program_update_request_t *request)
 
 {
     int i;
+    release_variables(request);
     for (i = UPDATE_SOURCE; i < UPDATE_NUM_ROOTS; i++)
     {
         free_svalue(&request->roots[i]);
@@ -343,6 +423,7 @@ free_request (program_update_request_t *request)
 
 {
     program_update_request_t **link = &requests;
+    release_variables(request);
     unlink_owner(request);
     unlink_work(&pending, request);
     unlink_work(&batch, request);
@@ -958,6 +1039,161 @@ describe_schemas (program_update_request_t *request)
     }
 } /* describe_schemas() */
 
+static mapping_t *
+variable_schema (program_update_request_t *request, program_t *old)
+{
+    vector_t *schemas = request->roots[UPDATE_SCHEMAS].u.vec;
+    for (size_t i = 0; i < VEC_SIZE(schemas); i++)
+    {
+        if (!request->budget.work)
+            errorf("update_blueprint(): variable generation work limit exceeded.\n");
+        request->budget.work--;
+        if (report_field(schemas->item[i].u.map, "old_generation")->u.number
+             == old->schema_generation)
+            return schemas->item[i].u.map;
+    }
+    errorf("update_blueprint(): variable generation plan unavailable.\n");
+    return NULL;
+}
+
+static program_update_variables_t *
+allocate_variables (program_update_request_t *request, object_t *object,
+                    program_t *candidate, Bool snapshot)
+{
+    program_update_variables_t *stage;
+    size_t count = candidate->num_variables;
+    size_t old_count = object->prog->num_variables;
+
+    if (count > request->budget.slots || old_count > request->budget.slots - count
+     || count > SSIZE_MAX / sizeof(svalue_t) || old_count > SSIZE_MAX / sizeof(svalue_t))
+        request_error(request, "VARIABLE_STORAGE_LIMIT", "migration variable slot limit exceeded.");
+    if (count > request->budget.work)
+        errorf("update_blueprint(): variable initialization work limit exceeded.\n");
+    request->budget.work -= count;
+    request->budget.slots -= count + old_count;
+    request_bytes(request, sizeof(*stage));
+    request_bytes(request, count * sizeof(svalue_t));
+    request_bytes(request, old_count * sizeof(svalue_t));
+    MIGRATION_TEST_STEP();
+    stage = xalloc(sizeof(*stage));
+    if (!stage) outofmemory("blueprint variable plan");
+    *stage = (program_update_variables_t){ .next = request->variables, .snapshot = snapshot };
+    request->variables = stage;
+    put_ref_object(&stage->object, object, "blueprint variable staging");
+    stage->old_program = object->prog;
+    reference_prog(stage->old_program, "blueprint variable staging");
+    MIGRATION_TEST_STEP();
+    if (count)
+    {
+        stage->values = xalloc(count * sizeof(svalue_t));
+        if (!stage->values) outofmemory("blueprint variable block");
+        for (size_t i = 0; i < count; i++)
+            stage->values[i].type = T_INVALID;
+        stage->num_values = count;
+    }
+    MIGRATION_TEST_STEP();
+    return stage;
+}
+
+static Bool
+same_variable_value (const svalue_t *left, const svalue_t *right)
+{
+    if (left->type != right->type) return MY_FALSE;
+    switch (left->type)
+    {
+    case T_INVALID:
+        return MY_TRUE;
+    case T_NUMBER:
+        return left->u.number == right->u.number;
+    case T_FLOAT:
+#ifdef FLOAT_FORMAT_2
+        return !memcmp(&left->u.float_number, &right->u.float_number, sizeof(double));
+#else
+        return left->u.mantissa == right->u.mantissa && left->x.exponent == right->x.exponent;
+#endif
+    case T_CLOSURE:
+    case T_LVALUE:
+    case T_SYMBOL:
+    case T_QUOTED_ARRAY:
+#ifdef USE_PYTHON
+    case T_PYTHON:
+#endif
+        if (left->x.generic != right->x.generic) return MY_FALSE;
+        /* FALLTHROUGH */
+    default:
+        return left->u.generic == right->u.generic;
+    }
+}
+
+static void
+prepare_variables (program_update_request_t *request)
+
+/* Prepare the complete source first: a clone skipping generations may need
+ * a shared addition that is already retained in this source generation.
+ * Loaded mode captures the actual blueprint values, including protected
+ * cells, and rechecks them at the final boundary. No program/block is installed.
+ */
+
+{
+    object_t *source = request->roots[UPDATE_SOURCE].u.ob;
+    program_t *candidate = request->source_from_path ? request->candidate : request->source_program;
+    program_update_variables_t *blueprint = allocate_variables(request, source, candidate,
+                                                              !request->source_from_path);
+    vector_t *targets = request->explicit_selection ? request->roots[UPDATE_TARGETS].u.vec : NULL;
+    object_t *object;
+    size_t index = 0;
+
+    if (request->source_from_path)
+        program_schema_prepare_variables(source->prog, candidate, variable_schema(request, source->prog),
+            source->variables, blueprint->values, NULL, MY_TRUE, &request->budget);
+    else
+        for (size_t i = 0; i < blueprint->num_values; i++)
+        {
+            if (!request->budget.work)
+                errorf("update_blueprint(): blueprint capture work limit exceeded.\n");
+            request->budget.work--;
+            assign_update_svalue_no_free(blueprint->values + i, source->variables + i);
+            MIGRATION_TEST_STEP();
+        }
+    for (object = targets ? NULL : obj_list; targets || object;
+         object = targets ? NULL : object->next_all)
+    {
+        program_update_variables_t *stage;
+        if (targets)
+        {
+            if (index == VEC_SIZE(targets)) break;
+            object = targets->item[index].type == T_OBJECT ? targets->item[index].u.ob : NULL;
+            index++;
+        }
+        if (!request->budget.work)
+            errorf("update_blueprint(): migration selection work limit exceeded.\n");
+        request->budget.work--;
+        if (!object || object->flags & O_DESTRUCTED || !(object->flags & O_CLONE)
+         || object->prog == candidate
+         || (!targets && !same_family(object, request->roots[UPDATE_ORIGIN].u.str)))
+            continue;
+        stage = allocate_variables(request, object, candidate, MY_FALSE);
+        program_schema_prepare_variables(object->prog, candidate, variable_schema(request, object->prog),
+            object->variables, stage->values, blueprint->values, MY_FALSE, &request->budget);
+    }
+    validate_source(request, MY_TRUE);
+    validate_targets(request, MY_FALSE);
+    validate_runtime_dependencies(request);
+    if (!request->source_from_path)
+        for (size_t i = 0; i < blueprint->num_values; i++)
+        {
+            if (!request->budget.work)
+                errorf("update_blueprint(): blueprint validation work limit exceeded.\n");
+            request->budget.work--;
+            if (!same_variable_value(blueprint->values + i, source->variables + i))
+                request_error(request, "SOURCE_CHANGED", "loaded blueprint values changed during preparation.");
+        }
+} /* prepare_variables() */
+
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+#include "../test/t-blueprint-migration/native.inc"
+#endif
+
 static void
 validate_capacity (program_update_request_t *self)
 
@@ -1530,12 +1766,16 @@ program_update_process (void)
         previous_preparation_guard = get_stack_gap_guard();
         if (setjmp(recovery.con.text))
         {
+            if (preparation_guard_active)
+                set_stack_gap_guard(&preparation_guard);
+            /* Release staged references before any live input/program roots.
+             * Error-stack cleanup owns only native materialization scratch.
+             */
+            release_variables(active);
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
             default_test_active = default_test_literal = MY_FALSE;
             report_test_countdown = -1;
 #endif
-            if (preparation_guard_active)
-                set_stack_gap_guard(&preparation_guard);
             if (!strcmp(active->failure_code, "IMPLEMENTATION_INCOMPLETE")
              || !strcmp(active->failure_code, "SCHEMA_INCOMPATIBLE"))
                 request_failure(active, "PREPARATION_FAILED", "Preparation failed before complete report evidence was available.");
@@ -1629,6 +1869,24 @@ program_update_process (void)
                 errorf("update_blueprint(): memory pressure preparing defaults.\n");
             if (!strcmp(active->failure_code, "IMPLEMENTATION_INCOMPLETE"))
                 validate_runtime_dependencies(active);
+            if (!strcmp(active->failure_code, "IMPLEMENTATION_INCOMPLETE"))
+            {
+                set_stack_gap_guard(&preparation_guard);
+                preparation_guard_active = MY_TRUE;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+                migration_test_begin();
+#endif
+                push_error_handler(variables_cleanup, &active->handler);
+                prepare_variables(active);
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+                migration_test_checkpoint(active);
+#endif
+                pop_stack(); /* Guarded staging cleanup, before callbacks. */
+                set_stack_gap_guard(previous_preparation_guard);
+                preparation_guard_active = MY_FALSE;
+                if (preparation_guard.failed)
+                    errorf("update_blueprint(): memory pressure preparing variables.\n");
+            }
             clear_current_object();
             /* Future compiler and migration hooks belong in this boundary. */
             mark_end_evaluation();
@@ -1713,7 +1971,14 @@ program_update_cleanup (cleanup_t *context)
 {
     program_update_request_t *request;
     for (request = requests; request; request = request->next)
+    {
         cleanup_vector(request->roots, UPDATE_NUM_ROOTS, context);
+        for (program_update_variables_t *stage = request->variables; stage; stage = stage->next)
+        {
+            cleanup_vector(&stage->object, 1, context);
+            if (stage->values) cleanup_vector(stage->values, stage->num_values, context);
+        }
+    }
 } /* program_update_cleanup() */
 
 #ifdef GC_SUPPORT
@@ -1732,6 +1997,17 @@ program_update_clear_refs (void)
     {
         clear_memory_reference(request);
         clear_ref_in_vector(request->roots, UPDATE_NUM_ROOTS);
+        for (program_update_variables_t *stage = request->variables; stage; stage = stage->next)
+        {
+            clear_memory_reference(stage);
+            clear_ref_in_vector(&stage->object, 1);
+            if (stage->old_program) clear_program_ref(stage->old_program, MY_TRUE);
+            if (stage->values)
+            {
+                clear_memory_reference(stage->values);
+                clear_ref_in_vector(stage->values, stage->num_values);
+            }
+        }
         if (request->source_program)
             clear_program_ref(request->source_program, MY_TRUE);
         if (request->candidate)
@@ -1753,6 +2029,17 @@ program_update_count_refs (void)
     {
         note_malloced_block_ref(request);
         count_ref_in_vector(request->roots, UPDATE_NUM_ROOTS);
+        for (program_update_variables_t *stage = request->variables; stage; stage = stage->next)
+        {
+            note_malloced_block_ref(stage);
+            count_ref_in_vector(&stage->object, 1);
+            if (stage->old_program) mark_program_ref(stage->old_program);
+            if (stage->values)
+            {
+                note_malloced_block_ref(stage->values);
+                count_ref_in_vector(stage->values, stage->num_values);
+            }
+        }
         if (request->source_program)
             mark_program_ref(request->source_program);
         if (request->candidate)
@@ -1775,6 +2062,16 @@ program_update_count_extra_refs (void)
     for (request = requests; request; request = request->next)
     {
         count_extra_ref_in_vector(request->roots, UPDATE_NUM_ROOTS);
+        for (program_update_variables_t *stage = request->variables; stage; stage = stage->next)
+        {
+            count_extra_ref_in_vector(&stage->object, 1);
+            if (stage->values) count_extra_ref_in_vector(stage->values, stage->num_values);
+            if (stage->old_program)
+            {
+                stage->old_program->extra_ref++;
+                count_extra_ref_in_prog(stage->old_program);
+            }
+        }
         if (request->source_program)
         {
             request->source_program->extra_ref++;

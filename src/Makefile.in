@@ -733,5 +733,6 @@ object.o gcollect.o interpret.o : program_schema.h
 
 # The test-only include is optional in source-only release distributions.
 program_schema.o : $(wildcard ../test/t-blueprint-update/defaults_native.inc)
+program_update.o : $(wildcard ../test/t-blueprint-migration/native.inc)
 
 array.o mapping.o mstrings.o : program_update.h

@@ -253,6 +253,12 @@ extern void normalize_svalue(svalue_t *svp, bool collapse_lvalues);
 extern void assign_svalue_no_free(svalue_t *to, svalue_t *from);
 extern void assign_rvalue_no_free(svalue_t *to, svalue_t *from);
 extern void assign_rvalue_no_free_no_collapse(svalue_t *to, svalue_t *from);
+#ifdef USE_BLUEPRINT_UPDATE
+struct schema_budget_s;
+extern void assign_update_svalue_no_free(svalue_t *to, svalue_t *from);
+extern void assign_update_rvalue_no_free(svalue_t *to, svalue_t *from,
+                                         struct schema_budget_s *budget);
+#endif
 extern void assign_svalue(svalue_t *dest, svalue_t *v);
 extern void assign_rvalue(svalue_t *dest, svalue_t *v);
 extern void copy_svalue_no_free (svalue_t *to, svalue_t *from);

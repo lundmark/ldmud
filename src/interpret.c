@@ -1763,6 +1763,32 @@ internal_assign_svalue_no_free (svalue_t *to, svalue_t *from)
 
 } /* internal_assign_svalue_no_free() */
 
+#ifdef USE_BLUEPRINT_UPDATE
+void
+assign_update_svalue_no_free (svalue_t *to, svalue_t *from)
+
+/* Retain an exact variable representation without normalizing its source.
+ * In particular, migration must retain protected cells and even obsolete
+ * object/coroutine wrappers until ordinary data cleaning visits them.
+ * The destination must already be a rooted, empty ownership slot.
+ */
+
+{
+    if (from->type == T_OBJECT)
+    {
+        *to = *from;
+        ref_object(to->u.ob, "blueprint variable staging");
+    }
+    else if (from->type == T_COROUTINE)
+    {
+        *to = *from;
+        ref_coroutine(to->u.coroutine);
+    }
+    else
+        internal_assign_svalue_no_free(to, from);
+} /* assign_update_svalue_no_free() */
+#endif
+
 /*-------------------------------------------------------------------------*/
 static INLINE void
 inl_copy_svalue_no_free (svalue_t *to, svalue_t *from)
@@ -1974,6 +2000,138 @@ internal_assign_rvalue_no_free ( svalue_t *to, svalue_t *from )
     }
 
 } /* internal_assign_rvalue_no_free() */
+
+#ifdef USE_BLUEPRINT_UPDATE
+static void
+update_copy_bytes (schema_budget_t *budget, size_t count, size_t unit,
+                   size_t header)
+{
+    if (header >= budget->bytes || count > (SSIZE_MAX - header) / unit
+     || count > (budget->bytes - header - 1) / unit)
+        errorf("update_blueprint(): shared value storage limit exceeded.\n");
+    budget->bytes -= header + count * unit;
+}
+
+static void
+update_copy_rvalue (svalue_t *to, svalue_t *from, schema_budget_t *budget,
+                    unsigned int depth)
+
+/* The ordinary rvalue helpers normalize source cells and backing mappings.
+ * Added shared variables need the same value semantics, without those
+ * mutations. Every allocated result is installed in its rooted destination
+ * before another allocation. Container values themselves remain shared;
+ * only ranges and mutable strings require materialization.
+ */
+
+{
+    if (!budget->work || depth >= BLUEPRINT_UPDATE_MAX_LITERAL_DEPTH)
+        errorf("update_blueprint(): shared value work limit exceeded.\n");
+    budget->work--;
+    if (from->type == T_LVALUE)
+    {
+        switch (from->x.lvalue_type)
+        {
+        case LVALUE_PROTECTED:
+            /* normalize_lvalue() zeroes obsolete references in a protected
+             * cell, including closures. Raw closure values, however, retain
+             * their representation during ordinary clone initialization.
+             */
+            if (destructed_object_ref(&from->u.protected_lvalue->val))
+                put_number(to, 0);
+            else
+                update_copy_rvalue(to, &from->u.protected_lvalue->val, budget, depth + 1);
+            return;
+        case LVALUE_PROTECTED_CHAR:
+            put_number(to, read_protected_char(from->u.protected_char_lvalue));
+            return;
+        case LVALUE_PROTECTED_MAPENTRY:
+        {
+            struct protected_mapentry_lvalue *entry = from->u.protected_mapentry_lvalue;
+            svalue_t *value;
+            push_number(inter_sp, 0);
+            update_copy_rvalue(inter_sp, &entry->key, budget, depth + 1);
+            value = get_map_value(entry->map, inter_sp);
+            if (value != &const0 && destructed_object_ref(value + entry->index))
+                put_number(to, 0);
+            else
+                update_copy_rvalue(to, value == &const0 ? value : value + entry->index,
+                                   budget, depth + 1);
+            pop_stack();
+            return;
+        }
+        case LVALUE_PROTECTED_RANGE:
+        case LVALUE_PROTECTED_MAP_RANGE:
+        {
+            svalue_t *values;
+            size_t start, length;
+            Bool absent = MY_FALSE;
+            if (from->x.lvalue_type == LVALUE_PROTECTED_RANGE)
+            {
+                struct protected_range_lvalue *range = from->u.protected_range_lvalue;
+                start = range->index1;
+                length = range->index2 > range->index1 ? range->index2 - range->index1 : 0;
+                if (range->vec.type == T_STRING || range->vec.type == T_BYTES)
+                {
+                    string_t *str;
+                    update_copy_bytes(budget, length, 1, sizeof(string_t) + 1);
+                    str = length ? mstr_extract(range->vec.u.str, start, start + length - 1)
+                                 : ref_mstring(range->vec.type == T_STRING ? STR_EMPTY : empty_byte_string);
+                    if (!str) outofmemory("blueprint shared string range");
+                    if (range->vec.type == T_STRING) put_string(to, str);
+                    else put_bytes(to, str);
+                    return;
+                }
+                assert(range->vec.type == T_POINTER);
+                values = range->vec.u.vec->item;
+            }
+            else
+            {
+                struct protected_map_range_lvalue *range = from->u.protected_map_range_lvalue;
+                start = range->index1;
+                length = range->index2 - range->index1;
+                push_number(inter_sp, 0);
+                update_copy_rvalue(inter_sp, &range->key, budget, depth + 1);
+                values = get_map_value(range->map, inter_sp);
+                absent = values == &const0;
+            }
+            if ((max_array_size && length > max_array_size) || length > budget->slots)
+                errorf("update_blueprint(): shared range slot limit exceeded.\n");
+            update_copy_bytes(budget, length, sizeof(svalue_t), sizeof(vector_t));
+            budget->slots -= length;
+            put_array(to, allocate_array(length));
+            if (stack_gap_guard_failed())
+                errorf("update_blueprint(): memory pressure copying shared range.\n");
+            for (size_t i = 0; i < length; i++)
+                update_copy_rvalue(&to->u.vec->item[i], absent ? &const0 : values + start + i,
+                                   budget, depth + 1);
+            if (from->x.lvalue_type == LVALUE_PROTECTED_MAP_RANGE)
+                pop_stack();
+            return;
+        }
+        default:
+            fatal("Invalid blueprint shared lvalue type %d.\n", from->x.lvalue_type);
+        }
+    }
+    if ((from->type == T_STRING || from->type == T_BYTES) && mstr_mutable(from->u.str))
+    {
+        string_t *str;
+        size_t length = mstrsize(from->u.str);
+        update_copy_bytes(budget, length, 1, sizeof(string_t) + 1);
+        str = new_n_mstring(get_txt(from->u.str), length, from->u.str->info.unicode);
+        if (!str) outofmemory("blueprint shared mutable string");
+        if (from->type == T_STRING) put_string(to, str);
+        else put_bytes(to, str);
+    }
+    else
+        internal_assign_svalue_no_free(to, from);
+}
+
+void
+assign_update_rvalue_no_free (svalue_t *to, svalue_t *from, schema_budget_t *budget)
+{
+    update_copy_rvalue(to, from, budget, 0);
+} /* assign_update_rvalue_no_free() */
+#endif
 
 /*-------------------------------------------------------------------------*/
 INLINE void
