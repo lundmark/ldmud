@@ -1,5 +1,6 @@
 #pragma strong_types, save_types
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 #include "/inc/gc.inc"
 
 #ifdef __BLUEPRINT_UPDATE__
@@ -41,11 +42,12 @@ void inspect()
         mapping report = update_blueprint_result(request);
         string label = sprintf("point %d countdown %d mode %d recovery %d",
                                cases[current][0], cases[current][1], cases[current][2], recovering);
-        require(report["status"] == "failed" && !report["updated"], label + ": no migration");
+        require(report["status"] == (recovering || cases[current][0] == 99 ? "completed" : "failed"),
+                label + ": only fault-free attempts install");
         require(recovering || cases[current][0] == 99
-                ? report["errors"][0]["code"] == "IMPLEMENTATION_INCOMPLETE"
+                ? blueprint_outcome(report) == "completed"
                 : member(({"PREPARATION_FAILED", "COMPILE_FAILED", "COMPILE_RESOURCE_FAILED",
-                           "RESOURCE_FAILED", "REPORT_ALLOCATION_FAILED"}), report["errors"][0]["code"]) >= 0,
+                           "RESOURCE_FAILED", "REPORT_ALLOCATION_FAILED"}), blueprint_outcome(report)) >= 0,
                 label + ": expected precise failure boundary");
         if (!recovering && cases[current][0] != 99)
             require(!sizeof(report["variable_changes"]), label + ": no partial terminal report");
@@ -106,6 +108,10 @@ void next_case()
 
 void run(closure callback)
 {
+#ifndef __BLUEPRINT_UPDATE_TESTING__
+    msg("BLUEPRINT_INSTRUMENTED: default_faults.c requires test build; skipped.\n");
+    funcall(callback, 0); return;
+#endif
     done = callback;
     cases = ({});
     for (int mode = 0; mode < 3; mode++)

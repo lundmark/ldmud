@@ -1,4 +1,5 @@
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 #ifdef __BLUEPRINT_UPDATE__
 #define GC_LOG "blocker-cycles.gc.log"
 closure done;
@@ -26,10 +27,10 @@ void next();
 void inspect()
 {
     mapping report = update_blueprint_result(request);
-    string expected = stage == 2 || kind == 6 || kind == 7 ? "IMPLEMENTATION_INCOMPLETE"
+    string expected = stage == 2 || kind == 6 || kind == 7 ? "completed"
                                 : kind == 3 || kind == 5 ? "LIVE_COROUTINE" : "LIVE_CLOSURE";
     mixed err = catch(
-        require(report["errors"][0]["code"] == expected,
+        require(blueprint_outcome(report) == expected,
                 sprintf("kind %d stage %d expected %s, got %O", kind, stage, expected, report["errors"])),
         require(report["matched"] == 1, "counts survive GC and compatibility rejection"); publish);
     if (err) { clean(); funcall(done, 1); return; }

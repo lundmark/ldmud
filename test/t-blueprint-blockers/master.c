@@ -1,4 +1,5 @@
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 
 #ifdef __BLUEPRINT_UPDATE__
 object blueprint, target, other;
@@ -26,8 +27,8 @@ void inspect()
 {
     mapping report = update_blueprint_result(request);
     mixed err = catch(
-        require(report["status"] == "failed" && !report["updated"], label + " remains a preparation failure"),
-        require(report["errors"][0]["code"] == expected,
+        require(report["status"] == (expected == "completed" ? "completed" : "failed"), label + " has its expected outcome"),
+        require(blueprint_outcome(report) == expected,
                 sprintf("%s: expected %s, got %O", label, expected, report["errors"])),
         require(target.read_value() == 41, label + " preserves state"); publish);
     if (err) { clean(); shutdown(1); return; }
@@ -64,7 +65,7 @@ void next()
         blueprint = load_object("target");
         target = clone_object(blueprint);
         other = clone_object(blueprint);
-        expected = "IMPLEMENTATION_INCOMPLETE";
+        expected = "completed";
         if (step < 30)
         {
             int kind = step / 2;

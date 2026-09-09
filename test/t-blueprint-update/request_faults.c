@@ -67,6 +67,13 @@ void inspect()
                     "normal array limits apply to fresh report values");
             require(!!catch(limited((: update_blueprint_result(request) :), LIMIT_MAPPING_KEYS, 1)),
                     "normal mapping limits apply to fresh report values");
+            /* The first attempt now migrated previous. Load a newer candidate
+             * so the next request still needs an actual schema/report plan.
+             */
+            string next_source = read_file("requests_fault_target.c") + "int another=2;\n";
+            destruct(blueprint); rm("requests_fault_target.c");
+            write_file("requests_fault_target.c", next_source);
+            blueprint=load_object("requests_fault_target");
             rm("requests-budget"); write_file("requests-budget", "2000\n");
             request = update_blueprint(blueprint, ({previous}));
             phase = 1;
@@ -83,6 +90,10 @@ void inspect()
 }
 void run(closure callback)
 {
+#ifndef __BLUEPRINT_UPDATE_TESTING__
+    msg("BLUEPRINT_INSTRUMENTED: request_faults.c requires test build; skipped.\n");
+    funcall(callback, 0); return;
+#endif
     object other;
     done = callback;
     cleanup();

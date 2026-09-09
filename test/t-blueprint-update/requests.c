@@ -1,5 +1,6 @@
 #pragma strong_types, save_types
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 #include "/inc/gc.inc"
 #include "/sys/configuration.h"
 #ifdef __BLUEPRINT_UPDATE__
@@ -15,7 +16,7 @@ void require(int condition, string description);
 
 void heart_beat()
 {
-    if (nested && update_blueprint_result(request)["status"] == "failed")
+    if (nested && update_blueprint_result(request)["status"] == "completed")
     {
         saw_terminal = update_blueprint_result(nested)["status"] == "pending";
         configure_object(this_object(), OC_HEART_BEAT, 0);
@@ -235,8 +236,9 @@ void inspect()
         }
         mapping report = update_blueprint_result(request);
         mixed *changes = report["variable_changes"];
-        require(report["status"] == "failed" && !report["updated"] && !report["blueprint_updated"],
-                "phase one never migrates");
+        int success = member(({0,1,2,3,6,7,8,11,12,13,17}), phase) >= 0;
+        require(report["status"] == (success ? "completed" : "failed"), "strict request outcome");
+        if (!success) require(!report["updated"] && !report["blueprint_updated"], "failure preserves every member");
         if (phase == 0)
         {
             require(report["matched"] == 3 && report["already_current"] == 1
@@ -245,22 +247,22 @@ void inspect()
             foreach (mapping change: changes)
                 require(member(({"selected_a", "selected_b"}), change["removed"][0]["name"]) >= 0,
                         "caller mutation cannot widen saved selection");
-            require(clones[0].value() == 11 && clones[1].value() == 22 && clones[3].value() == 33,
-                    "all old behaviors unchanged");
+            require(clones[0].value() == 44 && clones[1].value() == 44 && clones[3].value() == 33,
+                    "only selected old generations install the loaded candidate");
         }
         else if (phase >= 7)
         {
             if (phase >= 20 && phase <= 22)
             {
                 mapping earlier = update_blueprint_result(nested);
-                require(report["errors"][0]["code"] == (phase == 22 ? "SELECTION_SCAN_LIMIT" : "REPLACEMENT_PENDING")
+                require(blueprint_outcome(report) == (phase == 22 ? "SELECTION_SCAN_LIMIT" : "REPLACEMENT_PENDING")
                         && report["matched"] == (phase == 22 ? 0 : phase == 20 ? 1 : 2)
                         && report["destroyed"] == (phase == 20),
                         "earlier batch hook replacement retains complete source-path selection counts");
                 if (phase == 22)
                     require(strstr(report["errors"][0]["message"], "counts are unavailable") >= 0,
                             "incomplete final scan publishes no prefix or stale selection counts");
-                require(hook_calls == 1 && earlier["errors"][0]["code"] == "IMPLEMENTATION_INCOMPLETE"
+                require(hook_calls == 1 && blueprint_outcome(earlier) == "completed"
                         && earlier["completed_at"] == report["completed_at"],
                         "both independent requests terminate in the same detached batch");
                 require(blueprint.value() == 41 && clones[1].value() == 41 && side.value() == 17,
@@ -272,7 +274,7 @@ void inspect()
             else if (phase == 18 || phase == 19)
             {
                 mixed *blocks = changes[0]["blockers"];
-                require(report["errors"][0]["code"] == (phase == 18
+                require(blueprint_outcome(report) == (phase == 18
                         ? "SCHEMA_INCOMPATIBLE" : "SCHEMA_DIAGNOSTIC_LIMIT"),
                         "schema blocker cap and overflow have distinct explicit outcomes");
                 require(sizeof(blocks) == (phase == 18 ? 128 : 129)
@@ -290,7 +292,7 @@ void inspect()
             }
             else if (phase == 17)
             {
-                require(report["errors"][0]["code"] == "IMPLEMENTATION_INCOMPLETE"
+                require(blueprint_outcome(report) == "completed"
                         && sizeof(changes) == 1 && changes[0]["added"][0]["default"]["value"][0] == 1,
                         "source-only full schema reuses the single prepared literal");
                 require(!report["matched"] && blueprint.value() == 41,
@@ -301,7 +303,7 @@ void inspect()
             }
             else if (phase >= 15)
             {
-                require(member(({"REPLACEMENT_PENDING", "UNSUPPORTED_OBJECT"}), report["errors"][0]["code"]) >= 0,
+                require(member(({"REPLACEMENT_PENDING", "UNSUPPORTED_OBJECT"}), blueprint_outcome(report)) >= 0,
                         "replacement queued after admission or inside compiler hook blocks preparation");
                 require(report["matched"] == 1 && !report["destroyed"],
                         "replacement conflict retains the complete surviving selection count");
@@ -315,43 +317,44 @@ void inspect()
                 require(hook_calls == 1 && !clones[0] && !report["matched"]
                         && report["destroyed"] == (phase == 12),
                         "compiler hook removal determines surviving execution selection");
-                require(report["errors"][0]["code"] == "IMPLEMENTATION_INCOMPLETE",
+                require(blueprint_outcome(report) == "completed",
                         "a removed unsupported clone cannot remain an execution blocker");
             }
             else if (phase == 7 || phase == 8)
             {
                 require(hook_calls == 1 && report["matched"] == (phase == 7 ? 2 : 1),
                         "all discovery follows compiler hooks; explicit membership never widens");
-                require(report["errors"][0]["code"] == "IMPLEMENTATION_INCOMPLETE",
+                require(blueprint_outcome(report) == "completed",
                         "unselected unsupported survivor does not block explicit request");
                 if (phase == 7)
                     require(saw_terminal, "heartbeat sees terminal request while compiler-hook submission waits next tick");
             }
             else
             {
-                require(report["errors"][0]["code"] == "UNSUPPORTED_OBJECT",
-                        sprintf("unsupported surviving selection fails strictly: %d %O", phase, report["errors"][0]["code"]));
+                require(blueprint_outcome(report) == "UNSUPPORTED_OBJECT",
+                        sprintf("unsupported surviving selection fails strictly: %d %O", phase, blueprint_outcome(report)));
                 require(report["matched"] == (phase == 9 ? 2 : 1),
                         "unsupported survivors still have complete surviving selection counts");
             }
-            require(blueprint.value() == 41 && (!clones[0] || clones[0].value() == 41),
-                    "post-hook validation preserves live source and target programs");
+            require(blueprint.value() == (success ? 42 : 41)
+                    && (!clones[0] || clones[0].value() == (success ? 42 : 41)),
+                    "post-hook success installs and rejection preserves the family");
         }
         else if (phase == 5 || phase == 6)
         {
-            mixed *diagnostics = report["errors"][1..];
+            mixed *diagnostics = report["errors"][(phase == 6 ? 0 : 1)..];
             require(sizeof(diagnostics) > 0, "compiler diagnostics survive private context cleanup");
             require(diagnostics[0]["line"] > 0 && sizeof(diagnostics[0]["message"])
                     && diagnostics[0]["warning"] == (phase == 6), "compiler diagnostic location and severity");
             if (phase == 5)
                 require(diagnostics[0]["file"] == "/requests_error.h"
-                        && report["errors"][0]["code"] == "COMPILE_FAILED", sprintf("include syntax diagnostic and failure reason: %O %O", diagnostics[0]["file"], report["errors"][0]["code"]));
+                        && blueprint_outcome(report) == "COMPILE_FAILED", sprintf("include syntax diagnostic and failure reason: %O %O", diagnostics[0]["file"], blueprint_outcome(report)));
             else
-                require(report["errors"][0]["code"] == "IMPLEMENTATION_INCOMPLETE", "warning preserves successful preparation");
+                require(blueprint_outcome(report) == "completed", "warning preserves successful preparation");
             diagnostics[0]["message"] = "tampered";
-            require(update_blueprint_result(request)["errors"][1]["message"] != "tampered",
+            require(update_blueprint_result(request)["errors"][phase == 6 ? 0 : 1]["message"] != "tampered",
                     "diagnostic copy isolation");
-            require(blueprint.value() == 1, "compiler diagnostics leave live code unchanged");
+            require(blueprint.value() == (phase == 6 ? 2 : 1), "warning-only compilation installs; syntax failure preserves code");
             rm("requests_error.h");
         }
         else if (phase == 2)
@@ -365,7 +368,7 @@ void inspect()
                 require(report["candidate_generation"] > 0
                         && member(map(changes[0]["blockers"], (: $1["code"] :)), "STRUCT_LAYOUT_CHANGED") >= 0,
                         "source-only incompatible struct retains candidate and layout evidence");
-                require(report["errors"][0]["code"] == "SCHEMA_INCOMPATIBLE", "schema failure is explicit");
+                require(blueprint_outcome(report) == "SCHEMA_INCOMPATIBLE", "schema failure is explicit");
                 require(member(map(report["errors"][1..], (: $1["code"] :)), "STRUCT_LAYOUT_CHANGED") >= 0,
                         "errors contains generation-specific schema blockers");
             }
@@ -387,6 +390,14 @@ void inspect()
 
 void run(closure callback)
 {
+#ifndef __BLUEPRINT_UPDATE_TESTING__
+    if (file_size("requests-batch-scan-only") >= 0)
+    {
+        msg("BLUEPRINT_INSTRUMENTED: reduced batch scan requires test build; skipped.\n");
+        funcall(callback, 0);
+        return;
+    }
+#endif
     done = callback;
     if (file_size("requests-removal-only") >= 0) phase = 11;
     if (file_size("requests-single-default-only") >= 0) phase = 17;

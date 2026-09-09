@@ -3,16 +3,17 @@ SYNOPSIS
         int update_blueprint(string|object source, int|object* targets)
 
 DESCRIPTION
-        Queue one deferred blueprint update preparation. This experimental
-        implementation requires USE_BLUEPRINT_UPDATE. It does not migrate
-        objects: requests finish with status "failed", and a compatible
-        preparation reports IMPLEMENTATION_INCOMPLETE.
+        Queue one deferred, strict blueprint update. This experimental
+        implementation requires USE_BLUEPRINT_UPDATE. Compatible requests
+        install the complete selected cohort before heartbeat dispatch.
+        Object identity, retained state, inventory, and scheduling survive;
+        create(), reset(), and __INIT() are not replayed.
 
         A string source must name an already loaded ordinary blueprint.
         The request captures that object and its exact program, then privately
         compiles the file at execution against its captured parent programs.
         The source blueprint participates implicitly, even with targets ({}).
-        The candidate is never registered or published as a live program.
+        The candidate remains private until the complete cohort is ready.
 
         An object source must be the actual loaded ordinary blueprint. Its
         exact program is the candidate; this mode does not compile a file or
@@ -41,9 +42,13 @@ DESCRIPTION
         gets one attempt at the next periodic backend tick after the current
         stack returns, before heartbeat dispatch. Nested submissions wait
         for the following tick. Processing also runs without object heartbeats.
-        Destruction of the requester cancels its pending/in-flight requests
-        and removes its cached reports. Source destruction or reloading cannot
-        substitute a new identity for the captured source.
+        Destruction of the requester cancels uncommitted requests. Once all
+        new programs and variables are installed, the completed outcome is
+        immutable, including if old-value finalizers destroy the requester
+        or raise errors. The family remains reserved until retirement ends.
+        Source destruction or reloading cannot substitute a new identity for
+        the captured source. Compiler and master-hook external effects are
+        outside rollback; precommit failure leaves the cohort unchanged.
 
         Configurable defaults are 64 pending/in-flight requests globally,
         8 per owner, 10000 selected clones, 1000000 examined objects/raw array

@@ -1,4 +1,5 @@
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 
 #ifdef __BLUEPRINT_UPDATE__
 closure done;
@@ -30,15 +31,18 @@ void inspect()
     mixed err = catch(funcall(function void()
     {
         mapping report = update_blueprint_result(request);
-        require(report["errors"][0]["code"] == "IMPLEMENTATION_INCOMPLETE",
+        require(blueprint_outcome(report) == "completed",
                 sprintf("generation preparation: %O", report["errors"]));
-        require(read_file("migration-observed") == (step ? "2\n" : "4\n"),
+#ifdef __BLUEPRINT_UPDATE_TESTING__
+        require(read_file("migration-observed") == (step ? "0\n" : "4\n"),
                 "exact selected generations prepared");
+#endif
         require(oldest.value() == 41 && middle.value() == 83 && current.value() == 127,
                 "each old generation retains its final live value");
         require(oldest.shared_value()[0] == 41 && current.shared_value()[0] == 127,
                 "retained shared declarations preserve clone-owned state");
-        require(report["matched"] == 3 && report["already_current"] == step,
+        require(report["matched"] == 3 && report["already_current"] == (step ? 3 : 0)
+                && report["updated"] == (step ? 0 : 3),
                 "selection counts preserved");
         require(blueprint_alias[0][0] == 199, "shared added slot did not overwrite blueprint cell");
     }); publish);
@@ -51,7 +55,7 @@ void inspect()
 void submit()
 {
     rm("migration-observed"); rm("migration-expect");
-    write_file("migration-expect", step ? "2 1\n" : "4 1\n");
+    write_file("migration-expect", step ? "0 1\n" : "4 1\n");
     request = step ? update_blueprint(blueprint, ({oldest,middle,current}))
                    : update_blueprint("generations_target", ({oldest,middle,current}));
     call_out(#'inspect, __ALARM_TIME__ + 1);

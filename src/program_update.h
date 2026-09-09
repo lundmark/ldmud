@@ -80,10 +80,10 @@ extern void program_update_detach(void);
 extern void program_update_process(void);
 extern Bool program_update_compilation_valid(void);
 
-/* Destruction removes non-owning owner links and marks active work canceled.
+/* Destruction removes non-owning owner links and cancels uncommitted work.
  * Shutdown requires an idle backend with no remaining admission/evaluation.
- * Current native teardown is non-reentrant; see the source contracts before
- * adding compiler cleanup or native release hooks that can reenter the VM.
+ * Callback-capable retirement keeps the request rooted and its family busy;
+ * committed outcomes survive owner destruction and retirement callbacks.
  */
 
 extern void program_update_owner_destructed(object_t *owner);

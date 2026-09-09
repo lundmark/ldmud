@@ -1,5 +1,6 @@
 #pragma strong_types, save_types
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 #include "/inc/gc.inc"
 #include "/inc/deep_eq.inc"
 
@@ -49,8 +50,8 @@ void inspect()
                          "explicit_zero", "negative", "fraction", "text", "octets"});
         mixed *expected = blueprint.values();
 
-        require(report["status"] == "failed" && report["updated"] == 0,
-                "default preparation does not migrate");
+        require(report["status"] == "completed" && report["updated"] == 1,
+                "supported scalar defaults migrate");
         require(sizeof(changes) == 1, "old generation described");
         require(sizeof(changes[0]["added"]) == sizeof(names), "all added declarations described");
         for (int index = 0; index < sizeof(names); index++)
@@ -70,8 +71,8 @@ void inspect()
                     && bytesp(description["value"]) == bytesp(expected[index]),
                     name + ": ordinary scalar type parity");
         }
-        require(previous.version() == 1 && previous.retained_value() == 41,
-                "old executable and retained value unchanged");
+        require(previous.version() == 2 && previous.retained_value() == 41,
+                "installed executable retains the live value");
         clean();
         run_composites();
     }); publish);
@@ -192,8 +193,9 @@ void inspect_shared()
     mixed err = catch(funcall(function void()
     {
         mapping report = update_blueprint_result(request);
-        require(report["updated"] == 0 && blueprint.version() == 2,
-                "source default preparation leaves loaded blueprint unchanged");
+        require(report["updated"] == (shared_case < 2 ? 1 : 0)
+                && blueprint.version() == (shared_case == 1 || shared_case == 2 ? 3 : 2),
+                "source installation follows mode and default compatibility");
         if (shared_case < 2)
         {
             mixed *generations = filter(report["variable_changes"],
@@ -207,7 +209,7 @@ void inspect_shared()
                     "shared live value does not enter terminal report");
             require(!sizeof(generations[0]["blockers"]),
                     "retained blueprint initializer is not demanded");
-            require(previous.version() == 1, "old clone remains executable");
+            require(previous.version() == (shared_case ? 3 : 2), "old clone installs candidate code");
         }
         else
         {
@@ -216,8 +218,8 @@ void inspect_shared()
                     "empty target set retains complete implicit blueprint evidence");
             require(sizeof(report["variable_changes"][0]["blueprint_defaults"]) == 1,
                     "required blueprint addition is described even without clones");
-            require(report["errors"][0]["code"] == (shared_case == 2
-                        ? "IMPLEMENTATION_INCOMPLETE" : "SCHEMA_INCOMPATIBLE"),
+            require(blueprint_outcome(report) == (shared_case == 2
+                        ? "completed" : "SCHEMA_INCOMPATIBLE"),
                     "empty target set still validates needed blueprint defaults");
         }
         clean();

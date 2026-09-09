@@ -1,4 +1,5 @@
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 
 #ifdef __BLUEPRINT_UPDATE__
 closure done;
@@ -28,9 +29,11 @@ void inspect()
     mixed err = catch(funcall(function void()
     {
         mapping report = update_blueprint_result(request);
-        require(report["errors"][0]["code"] == "IMPLEMENTATION_INCOMPLETE",
+        require(blueprint_outcome(report) == "completed",
                 sprintf("alias preparation completes: %O", report["errors"]));
+#ifdef __BLUEPRINT_UPDATE_TESTING__
         require(read_file("migration-observed") == "3\n", "protected cells prepared");
+#endif
         aliases[0] = 91;
         require(first.value() == 91 && second.value() == 83, "retained variable alias and clone isolation");
         aliases[1] = "XYZW";
@@ -45,7 +48,8 @@ void inspect()
         require(first.map_value()["key",0] == 123 && first.map_value()["key",2] == 21,
                 "mapping entry and range aliases preserved");
         aliases[5] = 72;
-        require(first.removed_value() == 72, "removed cell still attached before publication");
+        require(aliases[5] == 72 && !function_exists("removed_value", first),
+                "removed cell survives independently of the installed schema");
         destruct(first);
         aliases[5] = 73;
         require(aliases[5] == 73, "removed cell survives detached from destroyed object");
@@ -72,7 +76,8 @@ void run(closure callback)
     aliases = first.aliases(); other_aliases = second.aliases();
     rm("aliases_target.c");
     write_file("aliases_target.c", "#pragma init_variables\n"
-        "mixed *stored, *refarray; mapping map; mixed *array; string text; int retained;\n");
+        "mixed *stored, *refarray; mapping map; mixed *array; string text; int retained;\n"
+        "int value(){return retained;} string text_value(){return text;} mixed *array_value(){return array;} mapping map_value(){return map;}\n");
     write_file("migration-expect", "3 1\n");
     request = update_blueprint("aliases_target", ({first, second}));
     call_out(#'inspect, __ALARM_TIME__ + 1);

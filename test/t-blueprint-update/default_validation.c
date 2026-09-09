@@ -1,5 +1,6 @@
 #pragma strong_types, save_types
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 #include "/inc/deep_eq.inc"
 #ifdef __BLUEPRINT_UPDATE__
 closure done;
@@ -31,11 +32,13 @@ void inspect()
         mapping report = update_blueprint_result(request);
         if (sizeof(cases[current]) > 5)
         {
-            require(report["errors"][0]["code"] == (cases[current][5] == 1
-                        ? "SCHEMA_INCOMPATIBLE" : "IMPLEMENTATION_INCOMPLETE"),
+            require(blueprint_outcome(report) == (cases[current][5] == 1
+                        ? "SCHEMA_INCOMPATIBLE" : "completed"),
                     cases[current][0] + ": selective nonfinite default demand");
-            require(previous.version() == 1 && blueprint.version() == 1,
-                    "nonfinite candidate initialization never executes");
+            require(previous.version() == (cases[current][5] == 1 ? 1 : 2)
+                    && blueprint.version() == (cases[current][5] == 1 ? 1 : 2)
+                    && previous.value() == 0,
+                    "nonfinite initializer is never evaluated for a retained slot");
         }
         else
         {
@@ -51,8 +54,8 @@ void inspect()
         if (cases[current][0] == "included identifier")
             require(description["file"] == "validation_location.h" && description["line"] == 3,
                     sprintf("identifier location precedes initializer lookahead and include return: %O:%O", description["file"], description["line"]));
-        require(previous.version() == 1 && blueprint.version() == 2,
-                "validation preserves live program generations");
+        require(report["status"] == "completed" && previous.version() == 2 && blueprint.version() == 2,
+                "supported defaults install the loaded candidate");
         }
         clean();
         if (++current < sizeof(cases))

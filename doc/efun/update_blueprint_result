@@ -12,13 +12,13 @@ DESCRIPTION
           id                    Monotonic request identifier.
           origin                Canonical source load name.
           selection             "all" or "explicit".
-          status                "pending" or "failed" in this implementation.
+          status                "pending", "completed", or "failed".
           candidate_generation  Exact candidate's diagnostic generation label.
           matched               Surviving selected clones, including current ones.
-          updated               Always zero: migration is not implemented.
+          updated               Selected clones that received the candidate.
           already_current       Clones with the exact candidate program identity.
           destroyed             Destroyed identities from the saved explicit set.
-          blueprint_updated     Always zero: migration is not implemented.
+          blueprint_updated     One if the source blueprint was updated.
           variable_changes      Generation-specific schema and default evidence.
           errors                Terminal reason, compiler diagnostics, and schema blockers.
           completed_at          Completion time in seconds, zero while pending.
@@ -49,8 +49,10 @@ DESCRIPTION
         actual old generation appears only once in the outer array. The
         blueprint_blockers array retains source-default preparation blockers.
 
-        The first error has "code" and "message". Compatible preparation
-        ends with IMPLEMENTATION_INCOMPLETE. SCHEMA_INCOMPATIBLE retains
+        Failed requests begin errors with a reason containing "code" and
+        "message". Completed requests contain only any compiler warnings;
+        an empty selection or an already-current cohort can complete with
+        zero updated clones. SCHEMA_INCOMPATIBLE retains
         generation/layout/default blockers in variable_changes and errors.
         Each schema error includes old_generation, candidate_generation, and
         role ("generation" or "blueprint"). Source, target, replacement,
@@ -69,7 +71,9 @@ DESCRIPTION
         Each generation/role retains at most 128 concrete schema blockers;
         overflow adds one SCHEMA_DIAGNOSTIC_LIMIT row and an explicit terminal
         reason while preserving the bounded declaration evidence.
-        No terminal report holds source/target objects or program pointers.
+        Reports expose no source/target objects or program pointers. Internal
+        retirement roots are released before a completed record becomes
+        eligible for expiry or eviction.
 
         Each read returns independent nested arrays and mappings, preserving
         sharing within the returned value. Mutation or an allocation/evaluation
@@ -83,7 +87,8 @@ DESCRIPTION
         do not renew this time. At most 256 terminal reports are cached;
         eviction removes the oldest completion, breaking equal-time ties by
         the lower ID. This cache is separate from pending-request capacity.
-        Requester destruction removes its reports immediately.
+        Requester destruction removes uncommitted requests and failed reports;
+        committed reports remain readable by the master until expiry/eviction.
 
 SEE ALSO
         update_blueprint(E)

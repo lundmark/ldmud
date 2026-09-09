@@ -1,4 +1,5 @@
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 
 #ifdef __BLUEPRINT_UPDATE__
 closure done;
@@ -30,10 +31,11 @@ void inspect()
     mixed err = catch(funcall(function void()
     {
         mapping report = update_blueprint_result(request);
-        string expected = points[step] < 0 ? "IMPLEMENTATION_INCOMPLETE" : "PREPARATION_FAILED";
-        require(report["errors"][0]["code"] == expected,
+        string expected = points[step] < 0 ? "completed" : "PREPARATION_FAILED";
+        require(blueprint_outcome(report) == expected,
                 sprintf("point %d expected %s, got %O", points[step], expected, report["errors"]));
-        require(report["matched"] == 2 && !report["updated"], "complete counts, no publication");
+        require(report["matched"] == 2 && report["updated"] == (points[step] < 0 ? 2 : 0),
+                "complete counts and publication only on recovery");
         if (points[step] >= 0)
             require(find_object("master").released_before_error(), "rollback precedes runtime_error hook");
         require(blueprint.value() == 7 && first.value() == 41 && second.value() == 83,
@@ -67,7 +69,11 @@ void run(closure callback)
     blueprint.seed(7); first.seed(41); second.seed(83); alias=first.aliases();
     alias[0] = 42; require(first.value() == 42, "fixture owns a real protected variable alias"); alias[0] = 41;
     rm("fault_target.c");
-    write_file("fault_target.c", "#pragma init_variables\nmixed *array; mixed *fresh=({({19}),([\"x\":({23})])}); int retained;\n");
+    write_file("fault_target.c", "#pragma init_variables\nmixed *array; mixed *fresh=({({19}),([\"x\":({23})])}); int retained;\n"
+        "int value(){return retained;}\n");
+#ifndef __BLUEPRINT_UPDATE_TESTING__
+    points = ({-1});
+#endif
     submit();
 }
 #endif

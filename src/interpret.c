@@ -23374,11 +23374,32 @@ opcdump (string_t * fname)
 #ifdef TRACE_CODE
 
 /*-------------------------------------------------------------------------*/
+void
+invalidate_program_trace (program_t *prog)
+
+/* The instruction ring borrows bytecode. In-place updates preserve objects,
+ * so destruction cleanup cannot protect entries from an old program's final
+ * release. Invalidate borrowed fields only: counted history objects remain
+ * owned until ordinary overwrite/cleanup, outside atomic publication.
+ */
+
+{
+    for (int i = 0; i < TOTAL_TRACE_LENGTH; i++)
+        if (previous_programs[i] == prog)
+        {
+            previous_instruction[i] = 0;
+            previous_programs[i] = NULL;
+            previous_pc[i] = NULL;
+        }
+}
+
+/*-------------------------------------------------------------------------*/
 static char *
-get_arg (int a)
+get_arg (int a, program_t *prog)
 
 /* Return the argument for the instruction at previous_pc[<a>] as a string.
- * If there is no argument, return "".
+ * <prog> is the still-live recorded program, or NULL. If there is no safe
+ * program-backed argument to decode, return "".
  *
  * Helper function for last_instructions().
  */
@@ -23386,11 +23407,29 @@ get_arg (int a)
 {
     static char buff[12];
     bytecode_p from, to;
+    p_uint first, limit;
     int b;
 
     b = (a+1) % TOTAL_TRACE_LENGTH;
+    /* Operand lengths depend on BOTH entries. A live instruction can precede
+     * an invalidated one; never subtract null or unrelated bytecode pointers.
+     */
+    if (!prog || !previous_instruction[a] || !previous_instruction[b]
+     || !previous_pc[a] || !previous_pc[b]
+     || previous_programs[a] != previous_programs[b])
+        return "";
     from = previous_pc[a];
     to = previous_pc[b];
+    /* Efun closures execute a temporary native stack fragment; lambda code
+     * also has ownership independent of the recorded current program. Its
+     * address can outlive that storage. Compare address ranges without pointer
+     * subtraction, then decode only bytes owned by the proven live program.
+     */
+    first = (p_uint)prog->program;
+    limit = (p_uint)PROGRAM_END(*prog);
+    if ((p_uint)from < first || (p_uint)from >= limit
+     || (p_uint)to < first || (p_uint)to > limit)
+        return "";
 
     if (to - from < 2)
         return "";
@@ -23420,6 +23459,35 @@ get_arg (int a)
 
     return "";
 } /* get_arg() */
+
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+void
+program_update_trace_test (program_t *prog, Bool retired)
+{
+    static int entries, adjacent;
+    if (!retired)
+    {
+        entries = adjacent = 0;
+        for (int i = 0; i < TOTAL_TRACE_LENGTH; i++)
+            if (previous_instruction[i] && previous_programs[i] == prog)
+            {
+                int before = (i + TOTAL_TRACE_LENGTH - 1) % TOTAL_TRACE_LENGTH;
+                entries++;
+                if (previous_instruction[before] && previous_programs[before] != prog)
+                    adjacent++;
+            }
+        assert(entries && adjacent);
+        return;
+    }
+    /* prog is now a freed address: compare only, never dereference it. */
+    for (int i = 0; i < TOTAL_TRACE_LENGTH; i++)
+        assert(previous_programs[i] != prog);
+    last_instructions(TOTAL_TRACE_LENGTH, MY_FALSE, NULL);
+    last_instructions(TOTAL_TRACE_LENGTH, MY_TRUE, NULL);
+    debug_message("BLUEPRINT_TRACE_NATIVE: %d retired entries, %d adjacent boundaries; both trace modes after final release.\n",
+                  entries, adjacent);
+}
+#endif
 
 /*-------------------------------------------------------------------------*/
 static void
@@ -23558,20 +23626,21 @@ last_instructions (int length, Bool verbose, svalue_t **svpp)
         i = (i + 1) % TOTAL_TRACE_LENGTH;
         if (previous_instruction[i] != 0)
         {
+            program_t *ppr = previous_programs[i];
+            Bool live_program = program_exists(ppr, previous_objects[i]);
             if (verbose)
             {
                 string_t *file;
-                program_t *ppr;
                 bytecode_p ppc;
 
-                ppr = previous_programs[i];
-                ppc = previous_pc[i]+1;
-                if (!program_exists(ppr, previous_objects[i]))
+                ppc = (bytecode_p)((p_uint)previous_pc[i] + 1);
+                if (!live_program)
                 {
                     file = ref_mstring(STR_PROG_DEALLOCATED);
                     line = 0;
                 }
-                else if (ppc < ppr->program || ppc > PROGRAM_END(*ppr))
+                else if ((p_uint)ppc < (p_uint)ppr->program
+                      || (p_uint)ppc > (p_uint)PROGRAM_END(*ppr))
                 {
                     file = ref_mstring(STR_UNKNOWN_LAMBDA);
                     line = 0;
@@ -23604,7 +23673,7 @@ last_instructions (int length, Bool verbose, svalue_t **svpp)
             snprintf(buf, sizeof(buf)-40, "%6p: %3d %8s %-26s (%td:%3td)"
                    , previous_pc[i]
                    , previous_instruction[i] /* instrs.h has these numbers */
-                   , get_arg(i)
+                   , get_arg(i, live_program ? ppr : NULL)
                    , get_f_name(previous_instruction[i])
                    , (stack_size[i] + 1)
                    , (abs_stack_size[i])

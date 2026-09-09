@@ -1,5 +1,6 @@
 #pragma strong_types, save_types
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 #include "/inc/gc.inc"
 #ifdef __BLUEPRINT_UPDATE__
 closure done;
@@ -122,16 +123,16 @@ void inspect()
             call_out(#'inspect, __ALARM_TIME__ + 1);
             return;
         }
-        require(result["status"] == "failed" && result["updated"] == 0,
-                spec[0] + ": preparation never migrates");
+        require(result["status"] == (spec[3] == "completed" ? "completed" : "failed"),
+                spec[0] + ": successful candidates install; failures remain atomic");
         if (spec[3] == "VALIDATION_FAILED")
             require(member(({"COMPILE_FAILED", "COMPILE_RESOURCE_FAILED", "COMPILE_CALLBACK_FAILED",
                             "SOURCE_INVALIDATED", "RESOURCE_FAILED", "PREPARATION_FAILED", "REPORT_ALLOCATION_FAILED"}),
-                           result["errors"][0]["code"]) >= 0
+                           blueprint_outcome(result)) >= 0
                     && sizeof(result["errors"][0]["message"]), spec[0] + ": precise terminal failure");
         else
-            require(result["errors"][0]["code"] == spec[3], spec[0] + ": terminal outcome");
-        if (spec[3] == "IMPLEMENTATION_INCOMPLETE" || spec[3] == "SCHEMA_INCOMPATIBLE")
+            require(blueprint_outcome(result) == spec[3], spec[0] + ": terminal outcome");
+        if (spec[3] == "completed" || spec[3] == "SCHEMA_INCOMPATIBLE")
         {
             require(result["candidate_generation"] > 0, spec[0] + ": candidate retained for schema comparison");
             require(sizeof(result["variable_changes"]) == 1, spec[0] + ": old generation described");
@@ -319,6 +320,14 @@ void next_case()
 
 void run(closure callback)
 {
+#ifndef __BLUEPRINT_UPDATE_TESTING__
+    if (file_size("staging-faults") >= 0)
+    {
+        msg("BLUEPRINT_INSTRUMENTED: compiler fault sweep requires test build; skipped.\n");
+        funcall(callback, 0);
+        return;
+    }
+#endif
     string simple = "int version() { return 1; }\n";
     string structure = "#pragma strong_types, rtt_checks\n"
         "struct data { int first; }; struct data value;\n"
@@ -334,7 +343,7 @@ void run(closure callback)
         "struct data|string choice(int n) { return n ? (<data> 1, \"new\") : \"other\"; }\n";
     done = callback;
     cases = ({
-        ({"execution source", simple, "int execution_time;\n" + simple, "IMPLEMENTATION_INCOMPLETE"}),
+        ({"execution source", simple, "int execution_time;\n" + simple, "completed"}),
         ({"failed compilation", simple, "This is not valid LPC.\n", "VALIDATION_FAILED"}),
         ({"failed struct initializer", simple,
             "struct new_data { string first; string second; };\n"
@@ -342,15 +351,15 @@ void run(closure callback)
             "VALIDATION_FAILED"}),
         ({"missing parent", simple, "inherit \"staging_absent\";\n" + simple, "VALIDATION_FAILED"}),
         ({"pinned parent", "inherit \"staging_parent\";\n" + simple,
-            "inherit \"staging_parent\";\n" + simple, "IMPLEMENTATION_INCOMPLETE"}),
+            "inherit \"staging_parent\";\n" + simple, "completed"}),
         ({"removed parent source", "inherit \"staging_parent\";\n" + simple,
-            "inherit \"staging_parent\";\n" + simple, "IMPLEMENTATION_INCOMPLETE"}),
+            "inherit \"staging_parent\";\n" + simple, "completed"}),
         ({"reloaded parent", "inherit \"staging_parent\";\n" + simple,
-            "inherit \"staging_parent\";\n" + simple, "IMPLEMENTATION_INCOMPLETE"}),
+            "inherit \"staging_parent\";\n" + simple, "completed"}),
         ({"unrelated loaded parent", simple, "inherit \"staging_parent\";\n" + simple, "VALIDATION_FAILED"}),
         ({"ambiguous parent", "inherit \"staging_left\"; inherit \"staging_right\";\n" + simple,
             "inherit \"staging_parent\";\n" + simple, "VALIDATION_FAILED"}),
-        ({"equivalent struct", structure, structure + "#include \"staging_hook.h\"\n", "IMPLEMENTATION_INCOMPLETE"}),
+        ({"equivalent struct", structure, structure + "#include \"staging_hook.h\"\n", "completed"}),
         ({"struct prototype", structure, changed_structure, "SCHEMA_INCOMPATIBLE"}),
         ({"failed prototype", structure, changed_structure + "struct never_defined;\n", "VALIDATION_FAILED"}),
         ({"hidden parent struct", "inherit \"staging_parent\";\n" + structure,
@@ -368,7 +377,7 @@ void run(closure callback)
         ({"destroy requester", simple,
             "#include \"staging_hook.h\"\n#include \"staging_hook.h\"\n" + simple, "VALIDATION_FAILED"}),
         ({"throw hook", simple, "#include \"staging_hook.h\"\n" + simple, "VALIDATION_FAILED"}),
-        ({"recovery", simple, simple, "IMPLEMENTATION_INCOMPLETE"})
+        ({"recovery", simple, simple, "completed"})
     });
     if (file_size("staging-faults") >= 0)
     {
@@ -464,7 +473,7 @@ void run(closure callback)
                 "#pragma warn_dead_code\nint version() { return 1; string unreachable = \"value\"; }\n", "VALIDATION_FAILED"}),
             ({"type context allocation", simple,
                 "struct data { int first; };\n" + simple, "VALIDATION_FAILED"}),
-            ({"recovery", simple, simple, "IMPLEMENTATION_INCOMPLETE"})
+            ({"recovery", simple, simple, "completed"})
         });
     }
     if (file_size("staging-fault-case") >= 0)

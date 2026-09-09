@@ -1,5 +1,6 @@
 #pragma strong_types, save_types
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 #include "/inc/gc.inc"
 #ifdef __BLUEPRINT_UPDATE__
 closure done;
@@ -31,15 +32,15 @@ void inspect()
     mixed err = catch(funcall(function void()
     {
         mapping report = update_blueprint_result(request);
-        string code = report["errors"][0]["code"];
-        require(report["status"] == "failed" && !report["updated"] && blueprint.value() == 41,
-                "diagnostic construction never changes live code or values");
+        string code = blueprint_outcome(report);
+        require(!report["updated"] && blueprint.value() == (code == "completed" ? 99 : 41),
+                "diagnostic success installs; construction failures preserve code");
         if (!phase)
         {
-            if (code == "IMPLEMENTATION_INCOMPLETE")
+            if (code == "completed")
             {
                 require(point > 10 && point < 64, "diagnostic faults reached every rooted row boundary");
-                require(sizeof(report["errors"]) == 3, "both ordinary warnings survive final compiler cleanup");
+                require(sizeof(report["errors"]) == 2, "both ordinary warnings survive final compiler cleanup");
                 phase = 1;
             }
             else
@@ -89,6 +90,10 @@ void next()
 }
 void run(closure callback)
 {
+#ifndef __BLUEPRINT_UPDATE_TESTING__
+    msg("BLUEPRINT_INSTRUMENTED: request_diagnostics.c requires test build; skipped.\n");
+    funcall(callback, 0); return;
+#endif
     done = callback;
     next();
 }

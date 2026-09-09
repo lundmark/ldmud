@@ -1,4 +1,5 @@
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 #include "/inc/gc.inc"
 #ifdef __BLUEPRINT_UPDATE__
 closure done;
@@ -27,9 +28,9 @@ void inspect()
 {
     mapping report = update_blueprint_result(request);
     mixed err = catch(
-        require(report["errors"][0]["code"] == expected,
+        require(blueprint_outcome(report) == expected,
                 sprintf("case %d expected %s, got %O", phase, expected, report["errors"])),
-        require(report["matched"] == 1 && !report["updated"], "selection count and no migration"); publish);
+        require(report["matched"] == 1 && report["updated"] == (expected == "completed" ? 1 : 0), "selection count and no migration"); publish);
     if (err) { clean(); funcall(done, 1); return; }
     msg("PYTHON_BLOCKER_CASE %d: %s\n", phase, expected);
     phase++;
@@ -76,7 +77,7 @@ void next()
         blueprint = load_object("python_target");
         target = clone_object(blueprint);
         blocker_hold(target, kind);
-        expected = phase % 2 || kind == 11 || kind == 12 ? "IMPLEMENTATION_INCOMPLETE"
+        expected = phase % 2 || kind == 11 || kind == 12 ? "completed"
                  : kind < 6 || kind == 13 || kind == 14 ? "PYTHON_HANDLE"
                  : kind == 10 ? "LIVE_COROUTINE" : "LIVE_CLOSURE";
         start_gc(#'collected);

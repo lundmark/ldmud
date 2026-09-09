@@ -1,4 +1,5 @@
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 
 #ifdef __BLUEPRINT_UPDATE__
 closure done;
@@ -28,10 +29,12 @@ void inspect()
     mixed err = catch(funcall(function void()
     {
         mapping report = update_blueprint_result(request);
-        require(report["errors"][0]["code"] == "IMPLEMENTATION_INCOMPLETE",
+        require(blueprint_outcome(report) == "completed",
                 sprintf("preparation completes: %O", report["errors"]));
+#ifdef __BLUEPRINT_UPDATE_TESTING__
         require(read_file("migration-observed") == "3\n", "three variable blocks were prepared");
-        require(report["updated"] == 0, "preparation does not publish");
+#endif
+        require(report["updated"] == 2 && report["blueprint_updated"], "whole cohort installed");
         require(blueprint.state() == 7 && first.state() == 41 && second.state() == 83,
                 "distinct live values unchanged on rollback");
         require(first.array_value()[0] == 41 && second.array_value()[0] == 83,
@@ -64,7 +67,9 @@ void run(closure callback)
     protected_handles = ({blueprint.handles(), first.handles(), second.handles()});
     rm("migration_target.c");
     write_file("migration_target.c", "#pragma init_variables\n"
-        "mapping map; mixed *fresh=({({19}),([\"x\":({23})])}); mixed dead, finished, lightweight, stale, stale_cell; mixed *array; int retained; float zero;\n");
+        "mapping map; mixed *fresh=({({19}),([\"x\":({23})])}); mixed dead, finished, lightweight, stale, stale_cell; mixed *array; int retained; float zero;\n"
+        "void clear() { array[1]=0; map[\"self\"]=0; }\n"
+        "int state() { return retained; } mixed *array_value() { return array; }\n");
     write_file("migration-expect", "3 1\n");
     request = update_blueprint("migration_target", ({first, second}));
     call_out(#'inspect, __ALARM_TIME__ + 1);

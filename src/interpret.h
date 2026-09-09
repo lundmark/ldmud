@@ -16,6 +16,13 @@
 #include "bytecode.h"
 #include "svalue.h"
 
+#ifdef TRACE_CODE
+extern void invalidate_program_trace(program_t *prog);
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+extern void program_update_trace_test(program_t *prog, Bool retired);
+#endif
+#endif
+
 /* --- Types --- */
 
 /* --- struct control_stack: one control stack element

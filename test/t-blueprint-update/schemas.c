@@ -27,7 +27,9 @@ void inspect()
         mapping result = update_blueprint_result(request);
         mixed *changes = result["variable_changes"];
         mixed *spec = cases[current];
-        require(result["status"] == "failed" && result["updated"] == 0, "diagnostics do not migrate");
+        if (spec[0] != "budget boundary")
+            require(result["status"] == (spec[4] ? "failed" : "completed"),
+                    spec[0] + ": compatible schemas install and blockers fail");
         if (spec[0] == "budget boundary")
         {
             require((!sizeof(changes) && result["errors"][0]["code"] == "REPORT_SIZE_LIMIT"

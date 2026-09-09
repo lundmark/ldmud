@@ -2,6 +2,7 @@
 
 #define OWN_PRIVILEGE_VIOLATION
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 #include "/inc/gc.inc"
 
 int checks;
@@ -119,12 +120,12 @@ void check_invalidated_source(int from_path)
             mapping report = update_blueprint_result(pending_id);
             require(report["status"] == "failed" && report["updated"] == 0
                     && sizeof(report["errors"])
-                    && report["errors"][0]["code"] == "SOURCE_INVALIDATED",
+                    && blueprint_outcome(report) == "SOURCE_INVALIDATED",
                     from_path ? "deferred string source invalidation"
                               : "deferred object source invalidation");
             require(replacement.behavior_version() == 2
-                    && first.behavior_version() == 1 && first.hp_value() == 41
-                    && second.behavior_version() == 1 && second.hp_value() == 73,
+                    && first.behavior_version() == 2 && first.hp_value() == 41
+                    && second.behavior_version() == 2 && second.hp_value() == 73,
                     "source revalidation preserves reloaded blueprint and old clones");
             if (!from_path)
                 source_invalidated(1);
@@ -197,16 +198,16 @@ void advance()
         {
             int previous_id = pending_id;
             mapping report = update_blueprint_result(pending_id);
-            require(report["status"] == "failed" && report["updated"] == 0
-                    && report["completed_at"] > 0 && sizeof(report["errors"])
-                    && report["errors"][0]["code"] == "IMPLEMENTATION_INCOMPLETE",
-                    "backend prototype fails without migrating");
-            report["errors"][0]["code"] = "modified";
-            require(update_blueprint_result(pending_id)["errors"][0]["code"]
-                    == "IMPLEMENTATION_INCOMPLETE", "nested result copy isolation");
-            require(first.behavior_version() == 1 && second.behavior_version() == 1
+            require(report["status"] == "completed" && report["updated"] == (stage < 2 ? 2 : 0)
+                    && report["completed_at"] > 0 && !sizeof(report["errors"])
+                    && blueprint_outcome(report) == "completed",
+                    "backend completes migration and no-op requests");
+            report["variable_changes"] += ({"modified"});
+            require(member(update_blueprint_result(pending_id)["variable_changes"], "modified") < 0,
+                    "nested result copy isolation");
+            require(first.behavior_version() == 2 && second.behavior_version() == 2
                     && first.hp_value() == 41 && second.hp_value() == 73,
-                    "prototype preserves programs and state");
+                    "installed programs preserve retained state");
             stage++;
             if (stage == 1)
                 pending_id = update_blueprint("/target.c");

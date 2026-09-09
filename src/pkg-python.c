@@ -440,7 +440,7 @@ static bool python_start_thread();
 static void python_finish_thread(bool started);
 static void python_save_context();
 static void python_clear_context();
-static void python_restore_context();
+static PyObject *python_restore_context();
 
 /* -- Python definitions and functions --- */
 
@@ -17261,7 +17261,21 @@ call_lpc_secure (CClosureFun fun, int num_arg, void* data)
     struct error_recovery_info error_recovery_info;
     struct control_stack *save_csp;
     svalue_t *save_sp;
-    bool result = false;
+    volatile bool result = false;
+    /* Native final-owner disposal must not unwind its partially drained
+     * free_svalue queue. LPC callbacks have their own recovery and must keep
+     * ordinary resource/error semantics, including secure_apply_error and
+     * Python context restoration. Suspend the guard for this entire boundary.
+     */
+    stack_gap_guard_t *save_guard = set_stack_gap_guard(NULL);
+    bool external = python_is_external;
+    svalue_t save_ob = current_object;
+    object_t *save_command = command_giver;
+    /* The restored wrapper pins an LW context even if nested Python entry
+     * replaces its ContextVar. Its LPC ownership remains on the normal Python
+     * GC lists. current_object itself is always a borrowed reference.
+     */
+    PyObject *context_ref = external ? python_restore_context() : NULL;
 
     error_recovery_info.rt.last = rt_context;
     error_recovery_info.rt.type = ERROR_RECOVERY_APPLY;
@@ -17281,21 +17295,18 @@ call_lpc_secure (CClosureFun fun, int num_arg, void* data)
          * a reference here.
          */
         string_t *error = ref_mstring(current_error);
-        secure_apply_error(save_sp, save_csp, python_is_external);
+        secure_apply_error(save_sp, save_csp, external);
 
-        PyErr_SetString(PyExc_RuntimeError, get_txt(current_error));
+        PyErr_SetString(PyExc_RuntimeError, get_txt(error));
         free_mstring(error);
     }
     else
     {
-        svalue_t save_ob = current_object;
-
-        if(python_is_external)
+        if(external)
         {
             /* We do externally called python code
              * in the context of the master ob.
              */
-            python_restore_context();
             if (current_object.type == T_NUMBER)
                 set_current_object(master_ob);
             mark_start_evaluation();
@@ -17304,15 +17315,18 @@ call_lpc_secure (CClosureFun fun, int num_arg, void* data)
         (*fun)(num_arg, data);
         result = true;
 
-        if(python_is_external)
-        {
-            mark_end_evaluation();
-            python_save_context();
-            current_object = save_ob;
-        }
+        if(external) mark_end_evaluation();
+    }
+    if (external)
+    {
+        python_save_context();
+        current_object = save_ob;
+        command_giver = save_command;
     }
 
     rt_context = error_recovery_info.rt.last;
+    set_stack_gap_guard(save_guard);
+    Py_XDECREF(context_ref);
 
     return result;
 } /* call_lpc_secure() */
@@ -17540,17 +17554,18 @@ python_restore_contextvar_object (PyObject* contextvar, object_t** object)
 } /* python_restore_contextvar_object() */
 
 /*-------------------------------------------------------------------------*/
-static void
+static PyObject *
 python_restore_contextvar_value (PyObject* contextvar, svalue_t* dest)
 
-/* Restore an LPC value from the corresponding Python context variable.
+/* Borrow an object/LW value and return its retained Python wrapper. The caller
+ * must hold this wrapper until the borrowed native context has been restored.
  */
 
 {
     PyObject *val;
 
     if (!contextvar)
-        return;
+        return NULL;
 
     if (PyContextVar_Get(contextvar, NULL, &val) < 0)
     {
@@ -17561,29 +17576,50 @@ python_restore_contextvar_value (PyObject* contextvar, svalue_t* dest)
         *dest = const0;
     else
     {
-        if (python_to_svalue(dest, val) != NULL)
-            *dest = const0;
-        Py_DECREF(val);
+        *dest = const0;
+        if (ldmud_object_check(val))
+        {
+            object_t *ob = ((ldmud_object_t *)val)->lpc_object;
+            if (ob && !(ob->flags & O_DESTRUCTED))
+            {
+                dest->type = T_OBJECT;
+                dest->u.ob = ob;
+            }
+        }
+        else if (ldmud_lwobject_check(val))
+        {
+            lwobject_t *ob = ((ldmud_lwobject_t *)val)->lpc_lwobject;
+            if (ob)
+            {
+                dest->type = T_LWOBJECT;
+                dest->u.lwob = ob;
+            }
+        }
+        return val;
     }
-} /* python_restore_contextvar_object() */
+    return NULL;
+} /* python_restore_contextvar_value() */
 #endif
 
 /*-------------------------------------------------------------------------*/
-static void
+static PyObject *
 python_restore_context ()
 
 /* Restore the current context (current object, current command giver) from
  * the corresponding Python context variables. Should only be called for
- * external calls.
+ * external calls. The returned Python wrapper keeps a borrowed LW current
+ * object alive until the caller restores the previous native context.
  */
 
 {
 #ifdef USE_PYTHON_CONTEXT
-    python_restore_contextvar_value(python_contextvar_current_object, &current_object);
+    PyObject *context = python_restore_contextvar_value(python_contextvar_current_object, &current_object);
     python_restore_contextvar_object(python_contextvar_command_giver, &command_giver);
+    return context;
 #else
     clear_current_object();
     command_giver = NULL;
+    return NULL;
 #endif
 } /* python_restore_context() */
 

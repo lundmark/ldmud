@@ -1,11 +1,12 @@
-/* Deferred blueprint update request ownership and reporting.
- * This stage privately compiles candidates but performs no migration. Terminal failure state is
+/* Deferred blueprint update transactions and request ownership.
+ * Terminal failure state is
  * reserved in the admission allocation. Schema diagnostics may allocate within
  * the backend recovery boundary, with partial summaries rooted in the request.
  */
 #include "driver.h"
 #ifdef USE_BLUEPRINT_UPDATE
 #include <assert.h>
+#include <stdio.h>
 #include "program_update.h"
 #include "program_schema.h"
 #include "prolang.h"
@@ -114,10 +115,10 @@ enum update_root
 typedef struct program_update_variables_s
 {
     struct program_update_variables_s *next;
-    svalue_t object;              /* Pins the unchanged live owner. */
-    program_t *old_program;       /* Pins the exact loaded generation. */
-    svalue_t *values;             /* Candidate-sized, individually rooted slots. */
-    size_t num_values;            /* All slots valid or T_INVALID. */
+    svalue_t object;              /* Pins the live owner through retirement. */
+    program_t *old_program;       /* Preparation pin, then retired ownership. */
+    svalue_t *values;             /* New slots, then the detached old block. */
+    size_t num_values;            /* Initialized prefix still owned by record. */
     Bool snapshot;               /* Loaded-mode blueprint, never installed. */
 } program_update_variables_t;
 
@@ -134,7 +135,7 @@ typedef struct program_update_request_s
     svalue_t roots[UPDATE_NUM_ROOTS];
     p_int id;
     p_int candidate_generation;
-    p_int matched, already_current, destroyed;
+    p_int matched, already_current, destroyed, updated;
     size_t num_diagnostics, num_blockers;
     size_t target_limit, scan_limit;
     schema_budget_t budget;
@@ -145,6 +146,8 @@ typedef struct program_update_request_s
     Bool source_has_clones;
     Bool explicit_selection;
     Bool terminal;
+    Bool committed;              /* Immutable outcome, independent of cleanup. */
+    Bool blueprint_updated;
     Bool busy;                   /* Admission or current backend evaluation. */
     Bool canceled;
 } program_update_request_t;
@@ -154,6 +157,7 @@ static program_update_request_t *requests;
 static program_update_request_t *pending;
 static program_update_request_t *batch;
 static program_update_request_t *active;
+static unsigned int cleanup_depth;
 /* Static storage outlives compiler handlers and every guarded program
  * release, including recovery after a suspended callback boundary.
  */
@@ -315,39 +319,102 @@ unlink_owner (program_update_request_t *request)
 } /* unlink_owner() */
 
 static void
+retirement_test_checkpoint (program_update_request_t *request)
+{
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING) && defined(GC_SUPPORT)
+    FILE *input;
+    int countdown;
+    if (!request->committed || strcmp(get_txt(request->roots[UPDATE_ORIGIN].u.str), "/retire_target")) return;
+    input = fopen("retirement-gc", "r");
+    if (!input) return;
+    if (fscanf(input, "%d", &countdown) != 1) countdown = 0;
+    fclose(input);
+    if (--countdown > 0)
+    {
+        input = fopen("retirement-gc", "w");
+        if (input) { fprintf(input, "%d\n", countdown); fclose(input); }
+        return;
+    }
+    remove("retirement-gc");
+    size_t saved_array = max_array_size, saved_mapping = max_mapping_size, saved_keys = max_mapping_keys;
+    int32 saved_eval = max_eval_cost, saved_file = max_file_xfer, saved_byte = max_byte_xfer;
+    int32 saved_callouts = max_callouts, saved_use = use_eval_cost;
+    int32 saved_cost = eval_cost, saved_assigned = assigned_eval_cost;
+    p_int saved_memory = max_memory;
+    int saved_privilege = malloc_privilege;
+    /* This call is AFTER free_svalue returned and its queue fully drained.
+     * The partial old block, all later records, active/batch/pending requests
+     * remain on the ordinary roots. No LPC evaluation or stack handler exists.
+     */
+    assert(request->busy && active == request);
+    assert(batch && pending && request->variables->num_values > 0);
+    clear_state();
+    garbage_collection();
+    max_array_size = saved_array; max_mapping_size = saved_mapping; max_mapping_keys = saved_keys;
+    max_eval_cost = saved_eval; max_file_xfer = saved_file; max_byte_xfer = saved_byte;
+    max_callouts = saved_callouts; use_eval_cost = saved_use;
+    eval_cost = saved_cost; assigned_eval_cost = saved_assigned;
+    max_memory = saved_memory; malloc_privilege = saved_privilege;
+    debug_message("BLUEPRINT_RETIREMENT_NATIVE_GC: partial retirement and request queues remain rooted.\n");
+#else
+    (void)request;
+#endif
+}
+
+static void
 release_variables (program_update_request_t *request)
 
-/* Staging rollback is deliberately narrower than postcommit retirement.
+/* Dispose staged or retired blocks with persistent ownership/cursors. All
+ * records remain linked until all variable slots have drained. Native
+ * pressure is guarded by the caller; each free_svalue queue drains before
+ * control can reach a GC checkpoint. Python finalizers can reenter LPC only
+ * through its complete secure error boundary, with that guard suspended.
+ *
+ * Staging rollback is deliberately narrower than postcommit retirement.
  * All old variable blocks and every source/target object remain owned and
  * unchanged until ALL prepared references have been released. An arbitrary
  * retained/shared value (including a descendant in a projected range) still
  * has that old owner; only newly materialized native literals can reach zero.
  * Therefore these releases cannot finalize Python/LW objects or call LPC.
- * Keep the busy request rooted throughout, including error recovery. Actual
- * old-block retirement needs a separate protocol before publication exists.
+ * Postcommit these values may instead be the final arbitrary owner: the
+ * whole cohort and immutable outcome have already been installed, and busy
+ * retains the request/family reservation throughout callback-capable release.
  */
 
 {
     program_update_variables_t *stage;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (request->committed && !strcmp(get_txt(request->roots[UPDATE_ORIGIN].u.str), "/retire_target")
+     && remove("retirement-pressure") == 0)
+    {
+        test_stack_gap_failure();
+        debug_message("BLUEPRINT_RETIREMENT_PRESSURE: native disposal guard latched; committed outcome retained.\n");
+    }
+#endif
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
     free_svalue(&request->roots[UPDATE_TEST_VALUES]);
     put_number(&request->roots[UPDATE_TEST_VALUES], 0);
 #endif
     for (stage = request->variables; stage; stage = stage->next)
     {
-        svalue_t *values = stage->values;
-        size_t count = stage->num_values;
+        while (stage->num_values)
+        {
+            free_svalue(stage->values + --stage->num_values);
+            retirement_test_checkpoint(request);
+        }
+        if (stage->values) xfree(stage->values);
         stage->values = NULL;
-        stage->num_values = 0;
-        for (size_t i = 0; i < count; i++)
-            free_svalue(values + i);
-        if (values) xfree(values);
     }
     while ((stage = request->variables))
     {
-        request->variables = stage->next;
         free_svalue(&stage->object);
-        free_prog(stage->old_program, MY_TRUE);
+        if (stage->old_program)
+        {
+            program_t *old = stage->old_program;
+            stage->old_program = NULL;
+            free_prog(old, MY_TRUE);
+        }
+        request->variables = stage->next;
         xfree(stage);
     }
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
@@ -371,7 +438,7 @@ variables_cleanup (error_handler_t *handler)
 {
     program_update_request_t *request = (program_update_request_t *)handler;
     stack_gap_guard_t *previous = set_stack_gap_guard(&preparation_guard);
-    release_variables(request);
+    if (!request->committed) release_variables(request);
     set_stack_gap_guard(previous);
 } /* variables_cleanup() */
 
@@ -382,10 +449,9 @@ release_inputs (program_update_request_t *request)
  * then release its independently pinned program. The origin and reserved
  * terminal record survive. Repeated calls are harmless after completion.
  *
- * These native releases must not reenter LPC or garbage collection while
- * the record is being dismantled. TODO: Future compiler cleanup or native
- * finalizer hooks require a rooted retirement state and pointers cleared
- * before potentially reentrant releases, rather than this current contract.
+ * The caller keeps the record busy and globally rooted, with a native
+ * stack-gap guard installed. Consumed fields are invalidated before any
+ * finalizer; the free queue must drain before a native GC checkpoint.
  */
 
 {
@@ -404,37 +470,49 @@ release_inputs (program_update_request_t *request)
     }
     if (request->source_program)
     {
-        free_prog(request->source_program, MY_TRUE);
+        program_t *source = request->source_program;
+#if defined(TRACE_CODE) && defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        Bool trace_test = request->committed && !strcmp(get_txt(request->roots[UPDATE_ORIGIN].u.str), "/trace_target");
+        if (trace_test) assert(source->ref == 1);
+#endif
         request->source_program = NULL;
+        free_prog(source, MY_TRUE);
+#if defined(TRACE_CODE) && defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        if (trace_test) program_update_trace_test(source, MY_TRUE);
+#endif
     }
 } /* release_inputs() */
 
 static void
 free_request (program_update_request_t *request)
 
-/* Unlink the globally rooted <request> from all work and owner chains,
- * release its remaining references, and free the record. The caller must
+/* Release <request> while it remains busy and globally rooted, then unlink
+ * its final root in a nonreentrant tail. The caller must
  * ensure no stack handler or active evaluation will use it afterwards.
  *
- * This teardown is currently synchronous and non-reentrant. Once removed
- * from requests, the record is no longer a GC root. Future cleanup hooks
- * must provide a separate rooted retirement phase before changing this.
+ * The native guard prevents disposal pressure from abandoning the global
+ * free_svalue queue. Python-to-LPC calls suspend it within their own complete
+ * error boundary; ordinary callback errors cannot unwind native disposal.
  */
 
 {
-    program_update_request_t **link = &requests;
-    release_variables(request);
+    program_update_request_t **link;
+    stack_gap_guard_t guard = { MY_FALSE };
+    stack_gap_guard_t *previous = set_stack_gap_guard(&guard);
+    request->busy = MY_TRUE;
     unlink_owner(request);
     unlink_work(&pending, request);
     unlink_work(&batch, request);
-    while (*link != request)
-        link = &(*link)->next;
-    *link = request->next;
     release_inputs(request);
     free_svalue(&request->roots[UPDATE_ORIGIN]);
     free_svalue(&request->roots[UPDATE_SCHEMAS]);
     free_svalue(&request->roots[UPDATE_DIAGNOSTICS]);
+    link = &requests;
+    while (*link != request)
+        link = &(*link)->next;
+    *link = request->next;
     xfree(request);
+    set_stack_gap_guard(previous);
 } /* free_request() */
 
 static void
@@ -457,17 +535,19 @@ expire_reports (void)
 /* Drop terminal reports older than the retention interval, then evict
  * the oldest remaining terminal reports until the cache fits its bound.
  * Pending, admitted, and currently executing requests remain rooted.
- * Only non-reentrant native teardown is allowed from this routine.
+ * Eligible terminal reports own only native immutable summary values;
+ * callback-capable input retirement finishes before busy is cleared.
  */
 
 {
     program_update_request_t *request, *next, *oldest;
     size_t count = 0;
     time_t now = report_time();
+    if (cleanup_depth) return;
     for (request = requests; request; request = next)
     {
         next = request->next;
-        if (!request->terminal)
+        if (!request->terminal || request->busy)
             continue;
         if (now - request->completed_at >= BLUEPRINT_UPDATE_REPORT_TTL)
             free_request(request);
@@ -478,7 +558,7 @@ expire_reports (void)
     {
         oldest = NULL;
         for (request = requests; request; request = request->next)
-            if (request->terminal
+            if (request->terminal && !request->busy
              && (!oldest || request->completed_at < oldest->completed_at
               || (request->completed_at == oldest->completed_at
                && request->id < oldest->id)))
@@ -648,7 +728,7 @@ program_update_compile_failure(const char *code, const char *message)
  * Preserve the more specific identity failure from callback revalidation.
  */
 {
-    if (active && (!strcmp(active->failure_code, "IMPLEMENTATION_INCOMPLETE")
+    if (active && (!strcmp(active->failure_code, "PREPARATION_PENDING")
                 || !strcmp(active->failure_code, "COMPILE_FAILED")))
         request_failure(active, code, message);
 }
@@ -1190,6 +1270,93 @@ prepare_variables (program_update_request_t *request)
         }
 } /* prepare_variables() */
 
+static void
+prepare_publication (program_update_request_t *request)
+
+/* All allocations and swap IO precede the irreversible stores. The candidate
+ * keeps its inherited graph alive, while each old generation remains pinned
+ * by its preparation record. Removing these swap images is safe on rollback.
+ */
+
+{
+    program_t *candidate = request->source_from_path ? request->candidate : request->source_program;
+    for (program_update_variables_t *stage = request->variables; stage; stage = stage->next)
+    {
+        program_t *old = stage->old_program;
+        if (old->swap_num != -1 && !old->line_numbers && !load_line_numbers_from_swap(old))
+            outofmemory("blueprint publication line numbers");
+        remove_prog_swap(old, MY_TRUE);
+    }
+    if (request->source_from_path)
+    {
+        assert(!candidate->blueprint && candidate->swap_num == -1);
+        for (size_t i = 0; i < candidate->num_structs; i++)
+            if (candidate->struct_defs[i].inh == STRUCT_INH_LOCAL)
+                assert(candidate->struct_defs[i].type && candidate->struct_defs[i].type->prog_id);
+    }
+    if (preparation_guard.failed)
+        errorf("update_blueprint(): memory pressure preparing publication.\n");
+    request->completed_at = report_time();
+#if defined(TRACE_CODE) && defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (!strcmp(get_txt(request->roots[UPDATE_ORIGIN].u.str), "/trace_target"))
+        program_update_trace_test(request->source_program, MY_FALSE);
+#endif
+}
+
+static void
+commit_variables (program_update_request_t *request)
+
+/* The complete transaction: counted-reference/pointer stores only. Records
+ * allocated during preparation take ownership of the displaced blocks and
+ * programs. No release, allocation, callback or collection belongs here.
+ */
+
+{
+    program_t *candidate = request->source_from_path ? request->candidate : request->source_program;
+    if (request->source_from_path)
+    {
+        candidate->blueprint = request->roots[UPDATE_SOURCE].u.ob;
+        candidate->blueprint->ref++;
+        for (size_t i = 0; i < candidate->num_structs; i++)
+            if (candidate->struct_defs[i].inh == STRUCT_INH_LOCAL)
+                struct_publish_type(candidate->struct_defs[i].type);
+    }
+    for (program_update_variables_t *stage = request->variables; stage; stage = stage->next)
+    {
+        object_t *ob;
+        svalue_t *old_values;
+        size_t old_count;
+        if (stage->snapshot) continue;
+        ob = stage->object.u.ob;
+        old_values = ob->variables;
+        old_count = stage->old_program->num_variables;
+#ifdef TRACE_CODE
+        invalidate_program_trace(stage->old_program);
+#endif
+        /* Drop the duplicate preparation pin without releasing the program;
+         * the record now owns the reference formerly held by the object.
+         */
+        assert(stage->old_program->ref >= 2);
+        stage->old_program->ref--;
+        candidate->ref++;
+        ob->prog = candidate;
+        ob->variables = stage->values;
+        stage->values = old_values;
+        stage->num_values = old_count;
+#ifdef DEBUG
+        ob->extra_num_variables = candidate->num_variables;
+#endif
+        tot_alloc_object_size += ((long)candidate->num_variables - (long)old_count) * (long)sizeof(svalue_t);
+        if (ob->flags & O_CLONE) request->updated++;
+        else request->blueprint_updated = MY_TRUE;
+    }
+    /* Freeze the outcome before any old value can run a finalizer. The family
+     * remains reserved until busy is cleared after all retirement is done.
+     */
+    request->committed = MY_TRUE;
+    request->terminal = MY_TRUE;
+}
+
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
 #include "../test/t-blueprint-migration/native.inc"
 #endif
@@ -1208,7 +1375,7 @@ validate_capacity (program_update_request_t *self)
     size_t inflight = 0, owned = 0;
     for (request = requests; request; request = request->next)
     {
-        if (request->terminal || request == self)
+        if ((request->terminal && !request->busy) || request == self)
             continue;
         inflight++;
         if (request->owner == self->owner)
@@ -1252,6 +1419,10 @@ v_update_blueprint (svalue_t *sp, int num_arg)
     vector_t *selection;
     size_t i, unique = 0;
     inter_sp = sp;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (active && active->committed)
+        assert(!get_stack_gap_guard()); /* Entire LPC callback/error boundary. */
+#endif
     expire_reports();
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
     if (remove("requests-last-id") == 0)
@@ -1294,7 +1465,7 @@ v_update_blueprint (svalue_t *sp, int num_arg)
 #endif
     request->budget = (schema_budget_t){ BLUEPRINT_UPDATE_MAX_BYTES,
                                          SCHEMA_MAX_WORK, BLUEPRINT_UPDATE_MAX_VARIABLE_SLOTS };
-    request_failure(request, "IMPLEMENTATION_INCOMPLETE", "Blueprint migration is not implemented.");
+    request_failure(request, "PREPARATION_PENDING", "Blueprint preparation has not completed.");
     request->busy = MY_TRUE;
     request->owner = get_current_object();
     request->owner_next = request->owner->program_updates;
@@ -1560,6 +1731,10 @@ f_update_blueprint_result (svalue_t *sp)
                                BLUEPRINT_UPDATE_MAX_BYTES / sizeof(svalue_t), 0 };
     report_copy_t copy = { .budget = &budget, .num_pointers = &num_pointers };
     inter_sp = sp;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (active && active->committed)
+        assert(!get_stack_gap_guard()); /* Includes the callback error hook. */
+#endif
     expire_reports();
     for (request = requests; request; request = request->next)
         if (request->id && request->id == sp->u.number && !request->canceled)
@@ -1595,13 +1770,15 @@ f_update_blueprint_result (svalue_t *sp)
     put_number(report_field(report, "id"), request->id);
     put_ref_string(report_field(report, "origin"), request->roots[UPDATE_ORIGIN].u.str);
     put_c_string(report_field(report, "selection"), request->explicit_selection ? "explicit" : "all");
-    put_c_string(report_field(report, "status"), request->terminal ? "failed" : "pending");
+    put_c_string(report_field(report, "status"), request->committed ? "completed" : request->terminal ? "failed" : "pending");
     for (i = 0; i < sizeof(numeric_fields) / sizeof(numeric_fields[0]); i++)
         put_number(report_field(report, numeric_fields[i]), 0);
     put_number(report_field(report, "candidate_generation"), request->terminal ? request->candidate_generation : 0);
     put_number(report_field(report, "matched"), request->terminal ? request->matched : 0);
     put_number(report_field(report, "already_current"), request->terminal ? request->already_current : 0);
     put_number(report_field(report, "destroyed"), request->terminal ? request->destroyed : 0);
+    put_number(report_field(report, "updated"), request->updated);
+    put_number(report_field(report, "blueprint_updated"), request->blueprint_updated);
     put_number(report_field(report, "completed_at"), request->completed_at);
     copy.pointers = REPORT_TEST_NULL(push_new_pointer_table());
     if (!copy.pointers) outofmemory("blueprint report identity table");
@@ -1620,18 +1797,22 @@ f_update_blueprint_result (svalue_t *sp)
     report_test_step();
     report_copy_units(&budget, 1, sizeof(vector_t));
     if (request->terminal)
-        report_copy_units(&budget, 1 + request->num_diagnostics + request->num_blockers, sizeof(svalue_t));
-    put_array(field, allocate_array(request->terminal ? 1 + request->num_diagnostics + request->num_blockers : 0));
+        report_copy_units(&budget, !request->committed + request->num_diagnostics + request->num_blockers, sizeof(svalue_t));
+    put_array(field, allocate_array(request->terminal ? !request->committed + request->num_diagnostics + request->num_blockers : 0));
     if (request->terminal)
     {
+        size_t offset = !request->committed;
+        if (!request->committed)
+        {
         error = REPORT_TEST_NULL(allocate_mapping(2, 1));
         if (!error)
             outofmem(2, "blueprint update failure report");
         put_mapping(&field->u.vec->item[0], error);
         put_c_string(report_field(error, "code"), request->failure_code);
         put_c_string(report_field(error, "message"), request->failure_message);
+        }
         for (i = 0; i < request->num_diagnostics; i++)
-            copy_report_value(&field->u.vec->item[i + 1],
+            copy_report_value(&field->u.vec->item[i + offset],
                               &request->roots[UPDATE_DIAGNOSTICS].u.vec->item[i], &copy);
         if (request->roots[UPDATE_SCHEMAS].type == T_POINTER)
             for (size_t generation = 0; generation < VEC_SIZE(request->roots[UPDATE_SCHEMAS].u.vec); generation++)
@@ -1644,7 +1825,7 @@ f_update_blueprint_result (svalue_t *sp)
                     blocks = get_map_value(schema, inter_sp);
                     pop_stack();
                     for (size_t j = 0; j < VEC_SIZE(blocks->u.vec); j++)
-                        copy_report_value(&field->u.vec->item[++i], &blocks->u.vec->item[j], &copy);
+                        copy_report_value(&field->u.vec->item[offset + i++], &blocks->u.vec->item[j], &copy);
                 }
             }
     }
@@ -1743,14 +1924,25 @@ program_update_process (void)
  * only appends to pending. Owner destruction marks a busy request canceled
  * instead of freeing it from under the active evaluation.
  *
- * Current finalization uses only non-reentrant native reference releases.
- * TODO: Before adding reentrant compiler/native cleanup, retain the busy
- * state and a GC-visible retirement root until release is fully complete.
- * The present busy-to-terminal transition is not such a retirement protocol.
+ * Committed requests remain busy and reserve their family during retirement.
+ * Native disposal cannot unwind its free queue; callback entry suspends the
+ * native pressure guard only inside a complete Python-to-LPC error boundary.
  */
 
 {
     struct error_recovery_info recovery;
+    const size_t saved_array = max_array_size, saved_mapping = max_mapping_size;
+    const size_t saved_keys = max_mapping_keys;
+    const int32 saved_eval = max_eval_cost, saved_file = max_file_xfer;
+    const int32 saved_byte = max_byte_xfer, saved_callouts = max_callouts;
+    const int32 saved_use = use_eval_cost;
+    const p_int saved_memory = max_memory;
+    const int saved_privilege = malloc_privilege;
+    /* A preceding player command can leave these borrowed identities set at
+     * the periodic boundary. Candidate authorization belongs to its requester.
+     */
+    clear_state();
+    eval_cost = assigned_eval_cost = 0;
     expire_reports();
     recovery.rt.last = rt_context;
     recovery.rt.type = ERROR_RECOVERY_BACKEND;
@@ -1766,8 +1958,14 @@ program_update_process (void)
         previous_preparation_guard = get_stack_gap_guard();
         if (setjmp(recovery.con.text))
         {
-            if (preparation_guard_active)
-                set_stack_gap_guard(&preparation_guard);
+            /* A native disposal queue cannot be recovered after an unwind.
+             * Its guard and the Python callback boundary must contain errors.
+             * Never turn an irreversible installation into a failed report.
+             */
+            if (active->committed)
+                fatal("Unexpected unwind during blueprint retirement.\n");
+            set_stack_gap_guard(&preparation_guard);
+            preparation_guard_active = MY_TRUE;
             /* Release staged references before any live input/program roots.
              * Error-stack cleanup owns only native materialization scratch.
              */
@@ -1776,7 +1974,7 @@ program_update_process (void)
             default_test_active = default_test_literal = MY_FALSE;
             report_test_countdown = -1;
 #endif
-            if (!strcmp(active->failure_code, "IMPLEMENTATION_INCOMPLETE")
+            if (!strcmp(active->failure_code, "PREPARATION_PENDING")
              || !strcmp(active->failure_code, "SCHEMA_INCOMPATIBLE"))
                 request_failure(active, "PREPARATION_FAILED", "Preparation failed before complete report evidence was available.");
             mark_end_evaluation();
@@ -1848,7 +2046,7 @@ program_update_process (void)
                 if (!active->candidate)
                     errorf("update_blueprint(): candidate compilation failed.\n");
                 request_bytes(active, active->candidate->total_size);
-                request_failure(active, "IMPLEMENTATION_INCOMPLETE", "Blueprint migration is not implemented.");
+                request_failure(active, "PREPARATION_PENDING", "Blueprint preparation has not completed.");
             }
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
             if (active->candidate)
@@ -1867,9 +2065,9 @@ program_update_process (void)
             preparation_guard_active = MY_FALSE;
             if (preparation_guard.failed)
                 errorf("update_blueprint(): memory pressure preparing defaults.\n");
-            if (!strcmp(active->failure_code, "IMPLEMENTATION_INCOMPLETE"))
+            if (!strcmp(active->failure_code, "PREPARATION_PENDING"))
                 validate_runtime_dependencies(active);
-            if (!strcmp(active->failure_code, "IMPLEMENTATION_INCOMPLETE"))
+            if (!strcmp(active->failure_code, "PREPARATION_PENDING"))
             {
                 set_stack_gap_guard(&preparation_guard);
                 preparation_guard_active = MY_TRUE;
@@ -1881,14 +2079,16 @@ program_update_process (void)
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
                 migration_test_checkpoint(active);
 #endif
-                pop_stack(); /* Guarded staging cleanup, before callbacks. */
+                prepare_publication(active);
+                if (!strcmp(active->failure_code, "PREPARATION_PENDING"))
+                    commit_variables(active);
+                pop_stack(); /* Rollback unless ownership was committed. */
                 set_stack_gap_guard(previous_preparation_guard);
                 preparation_guard_active = MY_FALSE;
-                if (preparation_guard.failed)
+                if (preparation_guard.failed && !active->committed)
                     errorf("update_blueprint(): memory pressure preparing variables.\n");
             }
             clear_current_object();
-            /* Future compiler and migration hooks belong in this boundary. */
             mark_end_evaluation();
         }
         if (active->candidate)
@@ -1898,9 +2098,9 @@ program_update_process (void)
             preparation_guard_active = MY_TRUE;
             active->candidate = NULL;
             free_prog(candidate, MY_TRUE);
-            if (preparation_guard.failed)
+            if (preparation_guard.failed && !active->committed)
             {
-                    request_failure(active, "RESOURCE_FAILED", "Memory pressure while releasing the private candidate.");
+                request_failure(active, "RESOURCE_FAILED", "Memory pressure while releasing the private candidate.");
                 free_svalue(&active->roots[UPDATE_SCHEMAS]);
                 put_number(&active->roots[UPDATE_SCHEMAS], 0);
                 active->candidate_generation = 0;
@@ -1909,19 +2109,33 @@ program_update_process (void)
             set_stack_gap_guard(previous_preparation_guard);
             preparation_guard_active = MY_FALSE;
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
-            candidate_test_checkpoint(active, MY_FALSE);
+            if (!active->committed) candidate_test_checkpoint(active, MY_FALSE);
 #endif
         }
-        if (active->canceled)
+        if (active->canceled && !active->committed)
             free_request(active);
         else
         {
+            set_stack_gap_guard(&preparation_guard);
             release_inputs(active);
+            clear_state();
+            set_stack_gap_guard(previous_preparation_guard);
             active->busy = MY_FALSE;
             active->terminal = MY_TRUE;
-            active->completed_at = report_time();
+            if (!active->committed) active->completed_at = report_time();
         }
         active = NULL;
+        max_array_size = saved_array;
+        max_mapping_size = saved_mapping;
+        max_mapping_keys = saved_keys;
+        max_eval_cost = saved_eval;
+        max_file_xfer = saved_file;
+        max_byte_xfer = saved_byte;
+        max_callouts = saved_callouts;
+        max_memory = saved_memory;
+        use_eval_cost = saved_use;
+        malloc_privilege = saved_privilege;
+        eval_cost = assigned_eval_cost = 0;
     }
     rt_context = recovery.rt.last;
     expire_reports();
@@ -1930,9 +2144,9 @@ program_update_process (void)
 void
 program_update_owner_destructed (object_t *owner)
 
-/* Cancel every request owned by the destructing <owner>, including cached
- * reports, and remove all non-owning owner links. A busy admission or active
- * backend request stays globally rooted with canceled set; its own error
+/* Cancel uncommitted requests owned by the destructing <owner> and remove
+ * all non-owning owner links. Committed outcomes remain immutable. A busy
+ * admission or backend request stays globally rooted with canceled set; its own error
  * handler or backend frame performs the eventual release. Other records
  * are synchronously freed. Call before <owner>'s storage can disappear.
  */
@@ -1942,7 +2156,9 @@ program_update_owner_destructed (object_t *owner)
     {
         program_update_request_t *request = owner->program_updates;
         unlink_owner(request);
-        if (request->busy)
+        if (request->committed)
+            continue;
+        if (request->busy || cleanup_depth)
             request->canceled = MY_TRUE;
         else
             free_request(request);
@@ -1954,7 +2170,7 @@ program_update_shutdown (void)
 
 /* Free every remaining request and report during idle backend shutdown.
  * No admission handler or active request evaluation may still own a record.
- * Uses the same non-reentrant native teardown contract as free_request().
+ * Uses the same rooted, guarded retirement contract as free_request().
  */
 
 {
@@ -1962,14 +2178,36 @@ program_update_shutdown (void)
         free_request(requests);
 } /* program_update_shutdown() */
 
+typedef struct update_cleanup_context_s
+{
+    error_handler_t handler;
+    stack_gap_guard_t guard;
+    stack_gap_guard_t *previous;
+} update_cleanup_context_t;
+
+static void
+update_cleanup_end (error_handler_t *handler)
+{
+    update_cleanup_context_t *context = (update_cleanup_context_t *)handler;
+    cleanup_depth--;
+    set_stack_gap_guard(context->previous);
+}
+
 void
 program_update_cleanup (cleanup_t *context)
 
 /* Include request-owned aggregate roots in the ordinary data-clean pass,
  * which compacts mapping hashes before the collector clears references.
+ * Invalid coroutine/closure cleanup can release arbitrary descendants. Keep
+ * all existing request links stable through callbacks, and restore the guard
+ * and traversal protection even if a data-clean allocation raises an error.
  */
 {
     program_update_request_t *request;
+    update_cleanup_context_t cleanup = {0};
+    push_error_handler(update_cleanup_end, &cleanup.handler);
+    cleanup.previous = set_stack_gap_guard(&cleanup.guard);
+    cleanup_depth++;
     for (request = requests; request; request = request->next)
     {
         cleanup_vector(request->roots, UPDATE_NUM_ROOTS, context);
@@ -1979,6 +2217,7 @@ program_update_cleanup (cleanup_t *context)
             if (stage->values) cleanup_vector(stage->values, stage->num_values, context);
         }
     }
+    pop_stack();
 } /* program_update_cleanup() */
 
 #ifdef GC_SUPPORT

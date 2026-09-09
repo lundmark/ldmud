@@ -1,4 +1,5 @@
 #include "/inc/base.inc"
+#include "/inc/blueprint.inc"
 #ifdef __BLUEPRINT_UPDATE__
 closure done;
 object blueprint, target, remote;
@@ -34,9 +35,9 @@ void inspect()
 {
     mapping report = update_blueprint_result(request);
     mixed err = catch(
-        require(report["errors"][0]["code"] == expected,
+        require(blueprint_outcome(report) == expected,
                 sprintf("case %d expected %s, got %O", phase, expected, report["errors"])),
-        require(report["matched"] == 1 && !report["updated"], "selection count and no migration"),
+        require(report["matched"] == 1 && report["updated"] == (expected == "completed" && phase != 12 ? 1 : 0), "selection count and no migration"),
         require(report["already_current"] == (phase == 12), "only changing programs need compatibility"),
         require(sizeof(report["variable_changes"]) == (phase == 12 ? 0 : 1),
                 "runtime rejection preserves schema diagnostics"),
@@ -74,27 +75,27 @@ void next()
             case 2: held = bind_lambda(remote.handle(), target); break;
             case 3:
                 held = bind_lambda(target.handle(5), remote);
-                expected = "IMPLEMENTATION_INCOMPLETE";
+                expected = "completed";
                 break;
             case 4: case 5:
                 held = target.handle(5); alias = held;
                 held = bind_lambda(held, remote);
-                if (phase == 5) { alias = 0; expected = "IMPLEMENTATION_INCOMPLETE"; }
+                if (phase == 5) { alias = 0; expected = "completed"; }
                 break;
             case 6:
                 held = bind_lambda(remote.handle(), target); alias = held;
                 bind_lambda(held, remote);
-                expected = "IMPLEMENTATION_INCOMPLETE";
+                expected = "completed";
                 break;
             case 7:
                 held = bind_lambda(target.handle(0), remote);
                 destruct(remote);
-                expected = "IMPLEMENTATION_INCOMPLETE";
+                expected = "completed";
                 break;
             case 8:
                 held = bind_lambda(remote.handle(), target);
                 destruct(remote);
-                expected = "IMPLEMENTATION_INCOMPLETE";
+                expected = "completed";
                 break;
             case 9:
                 /* Diagnostic creator is the target program's blueprint;
@@ -102,19 +103,19 @@ void next()
                  */
                 held = target.foreign(remote);
                 held = bind_lambda(held, remote);
-                expected = "IMPLEMENTATION_INCOMPLETE";
+                expected = "completed";
                 break;
             case 10: held = bind_lambda(target.handle(0), new_lwobject("remote")); break;
             case 11: held = bind_lambda(new_lwobject("remote").handle(), target); break;
             case 12:
                 held = ({blueprint.handle(0), target.handle(3)});
-                expected = "IMPLEMENTATION_INCOMPLETE";
+                expected = "completed";
                 break;
             case 13:
                 /* Old target migrates, but the source blueprint does not. */
                 destruct(blueprint); blueprint = load_object("bindings_target");
                 held = blueprint.handle(0);
-                expected = "IMPLEMENTATION_INCOMPLETE";
+                expected = "completed";
                 break;
             case 14:
                 destruct(blueprint); blueprint = load_object("bindings_target");
@@ -123,7 +124,7 @@ void next()
             case 15:
                 held = bind_lambda(target.foreign(remote), remote);
                 destruct(blueprint); blueprint = load_object("bindings_target");
-                expected = "IMPLEMENTATION_INCOMPLETE";
+                expected = "completed";
                 break;
             case 16:
                 held = target.handle(0);
@@ -137,7 +138,7 @@ void next()
                         ({#'call_other, this_object(), "moved", ({#'this_object}), 'item})
                     })));
                 move_object(target, remote);
-                expected = "IMPLEMENTATION_INCOMPLETE";
+                expected = "completed";
                 break;
         }
         request = phase >= 12 && phase <= 15 ? update_blueprint(blueprint, ({target}))

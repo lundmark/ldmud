@@ -921,6 +921,9 @@ init_lexer(void)
 #endif
 #ifdef USE_BLUEPRINT_UPDATE
     add_permanent_define_str("__BLUEPRINT_UPDATE__", -1, "1");
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    add_permanent_define_str("__BLUEPRINT_UPDATE_TESTING__", -1, "1");
+#endif
 #endif
 #ifdef USE_JSON
     add_permanent_define_str("__JSON__", -1, "1");
