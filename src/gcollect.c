@@ -14,8 +14,8 @@
  *
  * Additionally this module also offers a couple of functions to 'clean up'
  * an object, ie. to scan all data referenced by this object for destructed
- * objects and remove those references, and to change all untabled strings
- * into tabled strings. These functions are used by the garbage collector
+ * objects and remove those references, and to table immutable strings.
+ * These functions are used by the garbage collector
  * to deallocate as much memory by normal means as possible; but they
  * are also called from the backend as part of the regular reset/swap/cleanup
  * handling.
@@ -468,7 +468,11 @@ cleanup_vector (svalue_t *svp, size_t num, cleanup_t * context)
 
         case T_STRING:
         case T_BYTES:
-            if (!mstr_tabled(p->u.str))
+            /* Protected character and range lvalues depend on the identity
+             * of mutable storage, including the value in a backing cell.
+             * Tabling a copy here would detach those aliases.
+             */
+            if (!mstr_tabled(p->u.str) && !mstr_mutable(p->u.str))
                 p->u.str = make_tabled(p->u.str);
             break;
 
@@ -517,18 +521,14 @@ cleanup_vector (svalue_t *svp, size_t num, cleanup_t * context)
                     break;
 
                 case LVALUE_PROTECTED_CHAR:
-                    NOOP;
+                    if (p->u.protected_char_lvalue->var != NULL)
+                        cleanup_vector(&p->u.protected_char_lvalue->var->val, 1, context);
                     break;
 
                 case LVALUE_PROTECTED_RANGE:
-                    /* Only clean, if it's a vector.
-                     * We don't want to make that string tabled.
-                     */
-                    if (p->u.protected_range_lvalue->vec.type == T_POINTER)
-                    {
-                        cleanup_vector(&p->u.protected_range_lvalue->vec, 1, context);
+                    cleanup_vector(&p->u.protected_range_lvalue->vec, 1, context);
+                    if (p->u.protected_range_lvalue->var != NULL)
                         cleanup_vector(&p->u.protected_range_lvalue->var->val, 1, context);
-                    }
                     break;
 
                 case LVALUE_PROTECTED_MAPENTRY:
@@ -571,7 +571,7 @@ cleanup_single_object (object_t * obj, cleanup_t * context)
  * had to be swapped in.
  *
  * The function checks all variables of this object for references
- * to destructed objects and removes them. Also, untabled strings
+ * to destructed objects and removes them. Also, immutable, untabled strings
  * are made tabled.
  */
 
@@ -1114,6 +1114,15 @@ clear_string_ref (string_t *p)
 
 {
     p->info.ref = 0;
+    if (mstr_mutable(p))
+    {
+        /* These lists are weak: unreachable lvalues are swept without
+         * running their destructors. Rebuild the lists from marked lvalues
+         * after all reference clearing has finished.
+         */
+        p->u.mutable.char_lvalues = NULL;
+        p->u.mutable.range_lvalues = NULL;
+    }
 } /* clear_string_ref() */
 
 /*-------------------------------------------------------------------------*/
@@ -1577,6 +1586,13 @@ clear_ref_in_vector (svalue_t *svp, size_t num)
                     {
                         lv->ref = 0;
                         clear_string_ref(lv->str);
+
+                        struct protected_lvalue* var = lv->var;
+                        if (var != NULL && var->ref)
+                        {
+                            var->ref = 0;
+                            clear_ref_in_vector(&var->val, 1);
+                        }
                     }
                     break;
                 }
@@ -1590,7 +1606,7 @@ clear_ref_in_vector (svalue_t *svp, size_t num)
                         clear_ref_in_vector(&lv->vec, 1);
 
                         struct protected_lvalue* var = lv->var;
-                        if (var->ref)
+                        if (var != NULL && var->ref)
                         {
                             var->ref = 0;
                             clear_ref_in_vector(&var->val, 1);
@@ -1791,6 +1807,27 @@ gc_count_ref_in_vector (svalue_t *svp, size_t num
                     if (CHECK_REF(lv))
                     {
                         MARK_MSTRING_REF(lv->str);
+                        if (mstr_mutable(lv->str))
+                        {
+                            lv->next = lv->str->u.mutable.char_lvalues;
+                            lv->str->u.mutable.char_lvalues = lv;
+                        }
+
+                        struct protected_lvalue* var = lv->var;
+                        if (var != NULL)
+                        {
+                            if (CHECK_REF(var))
+                            {
+#ifdef CHECK_OBJECT_GC_REF
+                                gc_count_ref_in_vector(&var->val, 1, file, line);
+#else
+                                count_ref_in_vector(&var->val, 1);
+#endif
+                                num_protected_lvalues++;
+                            }
+                            var->ref++;
+                        }
+
                         num_protected_lvalues++;
                     }
                     lv->ref++;
@@ -1807,18 +1844,27 @@ gc_count_ref_in_vector (svalue_t *svp, size_t num
 #else
                         count_ref_in_vector(&lv->vec, 1);
 #endif
+                        if ((lv->vec.type == T_STRING || lv->vec.type == T_BYTES)
+                         && mstr_mutable(lv->vec.u.str))
+                        {
+                            lv->next = lv->vec.u.str->u.mutable.range_lvalues;
+                            lv->vec.u.str->u.mutable.range_lvalues = lv;
+                        }
 
                         struct protected_lvalue* var = lv->var;
-                        if (CHECK_REF(var))
+                        if (var != NULL)
                         {
+                            if (CHECK_REF(var))
+                            {
 #ifdef CHECK_OBJECT_GC_REF
-                            gc_count_ref_in_vector(&var->val, 1, file, line);
+                                gc_count_ref_in_vector(&var->val, 1, file, line);
 #else
-                            count_ref_in_vector(&var->val, 1);
+                                count_ref_in_vector(&var->val, 1);
 #endif
-                            num_protected_lvalues++;
+                                num_protected_lvalues++;
+                            }
+                            var->ref++;
                         }
-                        var->ref++;
 
                         num_protected_lvalues++;
                     }

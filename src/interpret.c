@@ -24076,14 +24076,18 @@ count_extra_ref_in_vector (svalue_t *svp, size_t num)
                     break;
 
                 case LVALUE_PROTECTED_CHAR:
+                    if (p->u.protected_char_lvalue->var != NULL
+                     && NULL != register_pointer(ptable, p->u.protected_char_lvalue->var))
+                        count_extra_ref_in_vector(&p->u.protected_char_lvalue->var->val, 1);
                     break;
 
                 case LVALUE_PROTECTED_RANGE:
-                    if (p->u.protected_range_lvalue->vec.type == T_POINTER
-                     && NULL != register_pointer(ptable, p->u.protected_range_lvalue))
+                    if (NULL != register_pointer(ptable, p->u.protected_range_lvalue))
                     {
                         count_extra_ref_in_vector(&p->u.protected_range_lvalue->vec, 1);
-                        count_extra_ref_in_vector(&p->u.protected_range_lvalue->var->val, 1);
+                        if (p->u.protected_range_lvalue->var != NULL
+                         && NULL != register_pointer(ptable, p->u.protected_range_lvalue->var))
+                            count_extra_ref_in_vector(&p->u.protected_range_lvalue->var->val, 1);
                     }
                     break;
 
@@ -24197,14 +24201,18 @@ check_extra_ref_in_vector (svalue_t *svp, size_t num)
                     break;
 
                 case LVALUE_PROTECTED_CHAR:
+                    if (p->u.protected_char_lvalue->var != NULL
+                     && NULL != register_pointer(ptable, p->u.protected_char_lvalue->var))
+                        check_extra_ref_in_vector(&p->u.protected_char_lvalue->var->val, 1);
                     break;
 
                 case LVALUE_PROTECTED_RANGE:
-                    if (p->u.protected_range_lvalue->vec.type == T_POINTER
-                     && NULL != register_pointer(ptable, p->u.protected_range_lvalue))
+                    if (NULL != register_pointer(ptable, p->u.protected_range_lvalue))
                     {
                         check_extra_ref_in_vector(&p->u.protected_range_lvalue->vec, 1);
-                        check_extra_ref_in_vector(&p->u.protected_range_lvalue->var->val, 1);
+                        if (p->u.protected_range_lvalue->var != NULL
+                         && NULL != register_pointer(ptable, p->u.protected_range_lvalue->var))
+                            check_extra_ref_in_vector(&p->u.protected_range_lvalue->var->val, 1);
                     }
                     break;
 
