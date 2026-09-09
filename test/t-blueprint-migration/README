@@ -1,0 +1,27 @@
+Run the ordinary migration and focused acceptance fixtures from test/:
+
+    ./run.sh t-blueprint-migration t-blueprint-failures.sh t-blueprint-swap.sh
+
+The two shell runners require Python 3; set PYTHON to its absolute executable
+if the environment's python3 command is a version-manager shim. They use the
+standard DRIVER and DRIVER_DEFAULTS variables, including Valgrind options.
+
+t-blueprint-failures.sh partitions the complete request countdown across eight
+isolated drivers in DEBUG plus BLUEPRINT_UPDATE_TESTING builds. Every point
+through the first successful request must occur exactly once in each of the
+path/explicit, path/all and loaded/explicit modes. Ordinary enabled builds run
+all three successful migrations without the private controls. Disabled builds
+report the conditional skip. Compiler-specific and fresh-result-copy failures
+remain in t-blueprint-update's existing optional control fixtures.
+
+t-blueprint-swap.sh tests actual program and variable swap states around
+admission, deferred execution and successful publication. It omits the automatic
+--check-refcounts pass because that pass unswaps objects on every backend loop.
+The private native fixture checks references explicitly after swap preparation,
+before publication; the LPC fixture also checks ordinary GC at each swap state.
+
+Each worker inherits its own already-bound loopback socket. No guessed port
+range or public testing efun is needed. Worker lifetimes and the overall sweep
+are bounded. Signals terminate owned drivers and temporary mudlibs are removed.
+The result log includes the aggregate outcome. Its .d directory retains exact
+commands, fixture hashes, exits, driver logs, swap GC evidence and coverage.json.

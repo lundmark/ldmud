@@ -2,7 +2,66 @@
 static int migration_test_countdown = -1;
 
 static Bool
-migration_test_collect (program_update_request_t *request)
+migration_swap_fail (program_update_request_t *request, int point)
+
+/* Exercise existing recoverable swap-in allocation failure paths. This
+ * control never simulates corrupt disk IO, whose driver contract is fatal.
+ */
+
+{
+    FILE *file;
+    int selected;
+    if (!request || request != active
+     || strcmp(get_txt(request->roots[UPDATE_ORIGIN].u.str), "/swap_target"))
+        return MY_FALSE;
+    file = fopen("migration-swap-fault", "r");
+    if (!file) return MY_FALSE;
+    if (fscanf(file, "%d", &selected) != 1) selected = 0;
+    fclose(file);
+    if (selected != point) return MY_FALSE;
+    remove("migration-swap-fault");
+    file = fopen("migration-swap-observed", "w");
+    if (file) { fprintf(file, "failure %d\n", point); fclose(file); }
+    debug_message("BLUEPRINT_SWAP_FAILURE: point %d.\n", point);
+    return MY_TRUE;
+}
+
+static size_t
+migration_line_hash (program_t *program)
+
+/* Removing an old image must preserve the complete resident line table. */
+
+{
+    size_t hash = 0;
+    if (program->line_numbers)
+    {
+        unsigned char *bytes = (unsigned char *)program->line_numbers;
+        for (size_t i = 0; i < program->line_numbers->size; i++)
+            hash = hash * 31 + bytes[i];
+    }
+    return hash;
+}
+
+static void
+migration_swap_prepared (program_update_request_t *request, int images, int cold)
+
+/* All swap IO is complete, publication has not begun, and the complete
+ * staged cohort is still independently rooted. The automatic DEBUG checker
+ * is disabled by this fixture because it erases the swap states under test.
+ */
+
+{
+    FILE *file;
+    if (strcmp(get_txt(request->roots[UPDATE_ORIGIN].u.str), "/swap_target")) return;
+    assert(images > 0 && cold > 0);
+    check_a_lot_ref_counts(NULL);
+    file = fopen("migration-swap-observed", "w");
+    if (file) { fprintf(file, "%d %d\n", images, cold); fclose(file); }
+    debug_message("BLUEPRINT_SWAP_PREPARED: %d images invalidated, %d cold line tables preserved; references checked.\n", images, cold);
+}
+
+static Bool
+migration_test_collect (program_update_request_t *request, Bool evaluating)
 {
 #ifdef GC_SUPPORT
     FILE *skip = fopen("migration-no-gc", "r");
@@ -17,10 +76,15 @@ migration_test_collect (program_update_request_t *request)
      * rollback handler. This checkpoint is only called between complete
      * slot operations, with no materializer/key scratch left on the stack.
      */
-    assert(inter_sp->type == T_ERROR_HANDLER && inter_sp->u.error_handler == &request->handler);
-    inter_sp->type = T_INVALID;
-    pop_stack();
-    mark_end_evaluation();
+    Bool handler = inter_sp->type == T_ERROR_HANDLER && inter_sp->u.error_handler == &request->handler;
+    assert(!request->variables || handler);
+    assert(!handler || evaluating);
+    if (handler)
+    {
+        inter_sp->type = T_INVALID;
+        pop_stack();
+    }
+    if (evaluating) mark_end_evaluation();
     clear_state();
     garbage_collection();
     max_array_size = saved_array; max_mapping_size = saved_mapping; max_mapping_keys = saved_keys;
@@ -28,14 +92,70 @@ migration_test_collect (program_update_request_t *request)
     max_callouts = saved_callouts; use_eval_cost = saved_use;
     eval_cost = saved_cost; assigned_eval_cost = saved_assigned;
     max_memory = saved_memory; malloc_privilege = saved_privilege;
-    mark_start_evaluation();
-    set_current_object(request->owner);
-    push_error_handler(variables_cleanup, &request->handler);
+    if (evaluating)
+    {
+        mark_start_evaluation();
+        set_current_object(request->owner);
+    }
+    if (handler) push_error_handler(variables_cleanup, &request->handler);
     return MY_TRUE;
 #else
     (void)request;
+    (void)evaluating;
     return MY_FALSE;
 #endif
+}
+
+static int
+migration_pipeline_read (void)
+
+/* The authorized test master owns this private marker. The control and all
+ * of its call sites disappear without DEBUG plus BLUEPRINT_UPDATE_TESTING.
+ */
+
+{
+    FILE *input = fopen("migration-pipeline", "r");
+    int countdown = -1;
+    if (input)
+    {
+        if (fscanf(input, "%d", &countdown) != 1) countdown = -1;
+        fclose(input);
+    }
+    return countdown;
+}
+
+static Bool
+migration_pipeline_fail (program_update_request_t *request, const char *point)
+
+/* Keep countdown ownership on its request, including across compiler hooks
+ * that submit another family. A NULL allocator result follows the existing
+ * caller's allocation-failure path; this seam itself never enters GC/LPC.
+ */
+
+{
+    if (request->pipeline_countdown < 0) return MY_FALSE;
+    request->pipeline_steps++;
+    if (request->pipeline_countdown--) return MY_FALSE;
+    request->pipeline_triggered = MY_TRUE;
+    debug_message("BLUEPRINT_PIPELINE_FAIL: %d %s.\n", request->pipeline_steps - 1, point);
+    return MY_TRUE;
+}
+
+static void
+migration_pipeline_step (program_update_request_t *request, const char *point, Bool collect)
+
+/* A scratch-free ownership boundary can legally collect before failure.
+ * Admission and allocator-internal boundaries must unwind normally instead.
+ */
+
+{
+    if (!migration_pipeline_fail(request, point)) return;
+    if (collect)
+    {
+        Bool collected = migration_test_collect(request, MY_TRUE);
+        debug_message("BLUEPRINT_PIPELINE_GC: %s, %d collections.\n", point, collected);
+    }
+    outofmemory("injected blueprint request preparation allocation");
 }
 
 static void
@@ -55,13 +175,15 @@ migration_test_begin (void)
 void
 program_update_migration_test_step (void)
 {
+    if (active)
+        PIPELINE_TEST_STEP(active, "partial variable ownership", MY_TRUE);
     if (!active || migration_test_countdown < 0) return;
     if (migration_test_countdown--) return;
     migration_test_countdown = -1;
     /* Native collection with partial blocks rooted, after a completed
      * ownership operation. Never enter GC from inside free_svalue's queue.
      */
-    Bool collected = migration_test_collect(active);
+    Bool collected = migration_test_collect(active, MY_TRUE);
     debug_message("BLUEPRINT_MIGRATION_ROLLBACK_GC: partial preparation remains rooted, %d collections.\n", collected);
     errorf("update_blueprint(): injected partial variable preparation failure.\n");
 }
@@ -272,7 +394,7 @@ validate:
     MIGRATION_REQUIRE(objects == expected);
     if (collect && !collected)
     {
-        collections += migration_test_collect(request);
+        collections += migration_test_collect(request, MY_TRUE);
         collected = MY_TRUE;
         goto validate;
     }

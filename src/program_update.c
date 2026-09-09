@@ -150,6 +150,12 @@ typedef struct program_update_request_s
     Bool blueprint_updated;
     Bool busy;                   /* Admission or current backend evaluation. */
     Bool canceled;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    int pipeline_countdown;       /* Private complete-request failure sweep. */
+    int pipeline_steps;
+    Bool pipeline_allocations;    /* Only schema/default native allocations. */
+    Bool pipeline_triggered;
+#endif
 } program_update_request_t;
 
 /* Admission, detached batch, and terminal requests all stay on this root. */
@@ -169,6 +175,17 @@ static p_int last_id;
 static svalue_t *report_field(mapping_t *report, const char *name);
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
 static void migration_test_begin(void);
+static int migration_pipeline_read(void);
+static Bool migration_pipeline_fail(program_update_request_t *request, const char *point);
+static void migration_pipeline_step(program_update_request_t *request, const char *point, Bool collect);
+static Bool migration_swap_fail(program_update_request_t *request, int point);
+static size_t migration_line_hash(program_t *program);
+static void migration_swap_prepared(program_update_request_t *request, int images, int cold);
+#define PIPELINE_TEST_STEP(request, point, collect) migration_pipeline_step(request, point, collect)
+#define SWAP_TEST_FAIL(request, point) migration_swap_fail(request, point)
+#else
+#define PIPELINE_TEST_STEP(request, point, collect) ((void)0)
+#define SWAP_TEST_FAIL(request, point) MY_FALSE
 #endif
 
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
@@ -247,6 +264,10 @@ default_test_begin(void)
 Bool
 program_update_default_test_fail(int point)
 {
+    if (point <= DEFAULT_TEST_CHAIN && active && active->pipeline_allocations
+     && preparation_guard_active && get_stack_gap_guard() == &preparation_guard
+     && migration_pipeline_fail(active, default_test_literal ? "literal allocation" : "schema allocation"))
+        return MY_TRUE;
     /* Allocator sites are selected separately for literal construction and
      * schema/report ownership. Ordinary LPC callbacks have another guard.
      */
@@ -643,7 +664,7 @@ validate_object (object_t *object, string_t *origin, Bool source,
     if (!same_family(object, origin))
         object_error(request, object, "UNRELATED_TARGET", "unrelated target.");
     if (object->flags & O_SWAPPED)
-        if (load_ob_from_swap(object) < 0)
+        if (SWAP_TEST_FAIL(request, 1) || load_ob_from_swap(object) < 0)
             object_error(request, object, "SWAP_FAILED", "cannot unswap object.");
     name = get_txt(origin);
     if (*name == '/')
@@ -1154,6 +1175,7 @@ allocate_variables (program_update_request_t *request, object_t *object,
     request_bytes(request, sizeof(*stage));
     request_bytes(request, count * sizeof(svalue_t));
     request_bytes(request, old_count * sizeof(svalue_t));
+    PIPELINE_TEST_STEP(request, "retirement record allocation", MY_TRUE);
     MIGRATION_TEST_STEP();
     stage = xalloc(sizeof(*stage));
     if (!stage) outofmemory("blueprint variable plan");
@@ -1165,6 +1187,7 @@ allocate_variables (program_update_request_t *request, object_t *object,
     MIGRATION_TEST_STEP();
     if (count)
     {
+        PIPELINE_TEST_STEP(request, "variable block allocation", MY_TRUE);
         stage->values = xalloc(count * sizeof(svalue_t));
         if (!stage->values) outofmemory("blueprint variable block");
         for (size_t i = 0; i < count; i++)
@@ -1280,12 +1303,31 @@ prepare_publication (program_update_request_t *request)
 
 {
     program_t *candidate = request->source_from_path ? request->candidate : request->source_program;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    int images = 0, cold = 0;
+#endif
     for (program_update_variables_t *stage = request->variables; stage; stage = stage->next)
     {
         program_t *old = stage->old_program;
-        if (old->swap_num != -1 && !old->line_numbers && !load_line_numbers_from_swap(old))
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        size_t line_hash;
+        images += old->swap_num != -1;
+        cold += old->swap_num != -1 && !old->line_numbers;
+#endif
+        PIPELINE_TEST_STEP(request, "publication swap preparation", MY_TRUE);
+        if (old->swap_num != -1 && !old->line_numbers
+         && (SWAP_TEST_FAIL(request, 2) || !load_line_numbers_from_swap(old)))
             outofmemory("blueprint publication line numbers");
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        line_hash = migration_line_hash(old);
+#endif
         remove_prog_swap(old, MY_TRUE);
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        assert(old->swap_num == -1 && migration_line_hash(old) == line_hash);
+#endif
+        if (SWAP_TEST_FAIL(request, 3))
+            outofmemory("injected failure after blueprint swap image invalidation");
+        PIPELINE_TEST_STEP(request, "publication swap image removed", MY_TRUE);
     }
     if (request->source_from_path)
     {
@@ -1297,6 +1339,9 @@ prepare_publication (program_update_request_t *request)
     if (preparation_guard.failed)
         errorf("update_blueprint(): memory pressure preparing publication.\n");
     request->completed_at = report_time();
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    migration_swap_prepared(request, images, cold);
+#endif
 #if defined(TRACE_CODE) && defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
     if (!strcmp(get_txt(request->roots[UPDATE_ORIGIN].u.str), "/trace_target"))
         program_update_trace_test(request->source_program, MY_FALSE);
@@ -1404,8 +1449,8 @@ v_update_blueprint (svalue_t *sp, int num_arg)
  * Check master privilege and revalidate mutable facts before assigning a
  * positive driver-lifetime ID. Invalid admission raises without consuming
  * an ID. Admission performs no compilation or migration. The backend
- * prepares a candidate and reports failure before migration on the next
- * eligible periodic tick.
+ * attempts the complete transaction once on the next eligible periodic
+ * tick and retains a completed or failed result.
  *
  * Consume <num_arg> values ending at <sp>, replacing them with the ID,
  * and return the new stack pointer. Admission failures are cleaned through
@@ -1418,6 +1463,9 @@ v_update_blueprint (svalue_t *sp, int num_arg)
     object_t *source;
     vector_t *selection;
     size_t i, unique = 0;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    int pipeline_countdown = -1;
+#endif
     inter_sp = sp;
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
     if (active && active->committed)
@@ -1438,10 +1486,20 @@ v_update_blueprint (svalue_t *sp, int num_arg)
     if (!source)
         errorf("update_blueprint(): source blueprint is not loaded.\n");
     validate_object(source, source->load_name, MY_TRUE, MY_TRUE, NULL);
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (!strcmp(get_txt(source->load_name), "/fault_target"))
+        pipeline_countdown = migration_pipeline_read();
+    if (pipeline_countdown == 0)
+        outofmemory("injected blueprint request allocation");
+#endif
     request = xalloc(sizeof(*request));
     if (!request)
         outofmem(sizeof(*request), "blueprint update request");
     *request = (program_update_request_t){0};
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    request->pipeline_countdown = pipeline_countdown > 0 ? pipeline_countdown - 1 : -1;
+    request->pipeline_steps = 1;
+#endif
     for (i = 0; i < UPDATE_NUM_ROOTS; i++)
         put_number(&request->roots[i], 0);
     request->target_limit = BLUEPRINT_UPDATE_MAX_TARGETS;
@@ -1477,6 +1535,7 @@ v_update_blueprint (svalue_t *sp, int num_arg)
     put_ref_object(&request->roots[UPDATE_SOURCE], source, "blueprint update");
     request->source_program = source->prog;
     reference_prog(source->prog, "blueprint update");
+    PIPELINE_TEST_STEP(request, "captured source and program", MY_FALSE);
     request->source_from_path = arg->type == T_STRING;
     request->explicit_selection = num_arg == 2 && arg[1].type == T_POINTER;
     request_bytes(request, sizeof(*request) + request->source_program->total_size
@@ -1493,8 +1552,10 @@ v_update_blueprint (svalue_t *sp, int num_arg)
                    ? VEC_SIZE(selection) : request->target_limit;
         request_bytes(request, 2 * (sizeof(vector_t) + capacity * sizeof(svalue_t))
                       + 4096 + (capacity < 256 ? capacity + 1 : 256) * 4096);
+        PIPELINE_TEST_STEP(request, "selection array allocation", MY_FALSE);
         put_array(&request->roots[UPDATE_TARGETS], allocate_array(capacity));
         copy = request->roots[UPDATE_TARGETS].u.vec;
+        PIPELINE_TEST_STEP(request, "selection identity table allocation", MY_FALSE);
         identities = push_new_pointer_table();
         if (!identities) outofmemory("blueprint target identity table");
         for (i = 0; i < VEC_SIZE(selection); i++)
@@ -1506,6 +1567,7 @@ v_update_blueprint (svalue_t *sp, int num_arg)
             if (lookup_pointer(identities, target))
                 continue;
             request_bytes(request, 128); /* Pointer table record and bucket allowance. */
+            PIPELINE_TEST_STEP(request, "selection identity allocation", MY_FALSE);
             find_add_pointer(identities, target, MY_TRUE);
             validate_object(target, source->load_name, MY_FALSE, MY_TRUE, request);
             if (!(target->flags & O_CLONE))
@@ -1513,8 +1575,10 @@ v_update_blueprint (svalue_t *sp, int num_arg)
             if (unique == request->target_limit)
                 errorf("update_blueprint(): explicit clone target limit exceeded.\n");
             assign_svalue_no_free(&copy->item[unique++], &selection->item[i]);
+            PIPELINE_TEST_STEP(request, "captured selected object", MY_FALSE);
         }
         pop_stack(); /* Temporary identity table; copied objects remain rooted. */
+        PIPELINE_TEST_STEP(request, "trimmed selection allocation", MY_FALSE);
         selection = slice_array(copy, 0, unique - 1);
         free_svalue(&request->roots[UPDATE_TARGETS]);
         put_array(&request->roots[UPDATE_TARGETS], selection);
@@ -1532,6 +1596,7 @@ v_update_blueprint (svalue_t *sp, int num_arg)
     if (request->explicit_selection) validate_targets(request, MY_TRUE);
     if (last_id == PINT_MAX)
         errorf("update_blueprint(): request identifiers exhausted.\n");
+    PIPELINE_TEST_STEP(request, "validated admission", MY_FALSE);
     request->id = ++last_id;
     request->busy = MY_FALSE;
     tail = &pending;
@@ -1980,6 +2045,22 @@ program_update_process (void)
             mark_end_evaluation();
             abort_compile_file_context();
             clear_state();
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+            if (active->pipeline_triggered)
+            {
+                FILE *file;
+                Bool collected;
+                active->pipeline_allocations = MY_FALSE;
+                /* Error-stack handlers and compiler/free queues have fully
+                 * unwound. Partial report/default roots still belong to the
+                 * request and are traversable before they are discarded.
+                 */
+                collected = migration_test_collect(active, MY_FALSE);
+                file = fopen("migration-pipeline-collected", "w");
+                if (file) { fprintf(file, "%d\n", collected); fclose(file); }
+                debug_message("BLUEPRINT_PIPELINE_ERROR_GC: partial reports remain rooted, %d collections.\n", collected);
+            }
+#endif
             /* Partial summaries are never exposed as completed evidence. */
             free_svalue(&active->roots[UPDATE_SCHEMAS]);
             put_number(&active->roots[UPDATE_SCHEMAS], 0);
@@ -2019,6 +2100,7 @@ program_update_process (void)
             set_current_object(active->owner);
             if (active->source_from_path)
             {
+                PIPELINE_TEST_STEP(active, "candidate compilation entry", MY_TRUE);
                 set_stack_gap_guard(&preparation_guard);
                 preparation_guard_active = MY_TRUE;
                 request_failure(active, "COMPILE_FAILED", "Candidate compilation failed.");
@@ -2047,7 +2129,10 @@ program_update_process (void)
                     errorf("update_blueprint(): candidate compilation failed.\n");
                 request_bytes(active, active->candidate->total_size);
                 request_failure(active, "PREPARATION_PENDING", "Blueprint preparation has not completed.");
+                PIPELINE_TEST_STEP(active, "retained candidate and final cohort", MY_TRUE);
             }
+            else
+                PIPELINE_TEST_STEP(active, "loaded source and final cohort", MY_TRUE);
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
             if (active->candidate)
                 candidate_test_checkpoint(active, MY_TRUE);
@@ -2056,11 +2141,16 @@ program_update_process (void)
             preparation_guard_active = MY_TRUE;
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
             default_test_begin();
+            active->pipeline_allocations = MY_TRUE;
 #endif
             describe_schemas(active);
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
             default_test_active = default_test_literal = MY_FALSE;
+            active->pipeline_allocations = MY_FALSE;
+            if (active->pipeline_triggered)
+                outofmemory("injected optional blueprint schema allocation");
 #endif
+            PIPELINE_TEST_STEP(active, "complete rooted schema report", MY_TRUE);
             set_stack_gap_guard(previous_preparation_guard);
             preparation_guard_active = MY_FALSE;
             if (preparation_guard.failed)
@@ -2073,13 +2163,21 @@ program_update_process (void)
                 preparation_guard_active = MY_TRUE;
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
                 migration_test_begin();
+                active->pipeline_allocations = MY_TRUE;
 #endif
                 push_error_handler(variables_cleanup, &active->handler);
                 prepare_variables(active);
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+                active->pipeline_allocations = MY_FALSE;
+                if (active->pipeline_triggered)
+                    outofmemory("injected optional blueprint variable allocation");
                 migration_test_checkpoint(active);
 #endif
                 prepare_publication(active);
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+                if (active->pipeline_countdown >= 0)
+                    debug_message("BLUEPRINT_PIPELINE_COMPLETE: %d checkpoints.\n", active->pipeline_steps);
+#endif
                 if (!strcmp(active->failure_code, "PREPARATION_PENDING"))
                     commit_variables(active);
                 pop_stack(); /* Rollback unless ownership was committed. */
