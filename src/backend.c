@@ -29,6 +29,7 @@
  */
 
 #include "driver.h"
+#include "async_io.h"
 #include "typedefs.h"
 
 #include "my-alloca.h"
@@ -902,6 +903,10 @@ backend (void)
         python_process_pending_jobs();
 #endif /* USE_PYTHON */
 
+#ifdef USE_ASYNC_IO
+        async_io_remove_stale();
+        async_io_dispatch();
+#endif
         do_state_check(2, "before get_message()");
 
         /*
@@ -1839,4 +1844,3 @@ f_debug_message (svalue_t *sp)
 } /* f_debug_message() */
 
 /***************************************************************************/
-

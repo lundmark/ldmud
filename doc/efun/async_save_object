@@ -1,0 +1,60 @@
+SYNOPSIS
+        void async_save_object(string file, closure callback)
+        void async_save_object(string file, closure callback, int format)
+
+DESCRIPTION
+        Capture this object's persistent variables and queue an atomic
+        background file replacement. Requires --enable-use-async-io.
+
+        The format, default version, excluded nosave/static variables,
+        supported values, shared references and cycles follow save_object().
+        An omitted format or -1 selects the current save format. Supported
+        explicit versions are 0 through 3. Lightweight objects are unsupported.
+
+        The master valid_write() operation is "save_object". Path handling
+        matches save_object(): a trailing .c is stripped, then .o is appended.
+        Supplying "player.o" therefore writes "player.o.o".
+
+        Serialization completes during this call. Accepted immutable bytes
+        retain the captured values when the source is subsequently modified
+        or destroyed. Only filesystem work runs in the helper. This reduces
+        blocking file I/O, but does not move serialization CPU time away from
+        the game loop. The serializer uses a bounded output sink rather than
+        constructing an additional complete save string.
+
+        callback receives 0 after the complete save has been written, closed
+        successfully and renamed into place, or -1 on failure. It never runs
+        inline. Admission, permission, invalid format, serialization, encoding
+        and capacity errors are synchronous and do not arrange a callback.
+        Nested save serialization is rejected while a serializer is active,
+        including reentry through a Python __save__ hook. Permission hooks
+        may submit saves before serialization starts.
+
+        The helper creates a unique exclusive temporary file in the target
+        directory, writes and closes it, then renames it over the destination.
+        Failure before rename preserves the old destination. New saves use
+        mode 0640, restricted by the inherited umask. The old destination is
+        never unlinked first. If the helper loses its reply after rename, a
+        reported failure can have an uncertain committed result; there is no
+        automatic retry. Completion is not a power-loss durability guarantee.
+
+        A helper failure before its temporary-file identity is acknowledged,
+        or failure to obtain that identity, can leave an unannounced temporary
+        file. Known temporary files are cleaned only after verifying their
+        identity; unrelated files are never removed by guessing a filename.
+
+        Queue bounds, callback context, FIFO ordering and shutdown behavior
+        are shared with async_write(). Wait for this callback before calling
+        restore_object() or synchronously replacing the same save path.
+
+EXAMPLES
+        void saved(int result)
+        {
+            if (result) debug_message("Player save failed.\n");
+        }
+
+        async_save_object("save/player", #'saved);
+
+SEE ALSO
+        async_write(E), save_object(E), restore_object(E),
+        save_value(E), valid_write(M), notify_shutdown(M)

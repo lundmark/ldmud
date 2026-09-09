@@ -5,6 +5,10 @@
  */
 
 #include "driver.h"
+#include "async_io.h"
+#ifdef USE_ASYNC_IO
+#include "async_io_protocol.h"
+#endif
 #include "typedefs.h"
 
 #include "my-alloca.h"
@@ -2061,5 +2065,69 @@ v_write_file (svalue_t *sp, int num_arg)
     return sp;
 } /* v_write_file() */
 
-/***************************************************************************/
+#ifdef USE_ASYNC_IO
+/* Capture and encode on the interpreter thread. Hook execution and every
+ * allocation are covered by stack owners before the immutable request is
+ * published. The writer sees only copied native path and payload bytes. */
+svalue_t *
+f_async_write(svalue_t *sp)
+{
+    svalue_t *arg = sp - 3;
+    async_request_t *request;
+    struct iconv_error_context *iec;
+    string_t *file;
+    char *input;
+    size_t remaining;
+    Bool flushing = MY_FALSE;
 
+    if (arg[2].u.number != 0 && arg[2].u.number != 1)
+        errorf("Bad flag for async_write(): expected 0 or 1.\n");
+    if (memchr(get_txt(arg[0].u.str), '\0', mstrsize(arg[0].u.str)))
+        errorf("Embedded NUL in async_write() path.\n");
+    inter_sp = sp;
+    request = async_io_begin(arg + 3);
+    file = check_valid_path(arg[0].u.str, current_object, STR_WRITE_FILE, MY_TRUE);
+    if (!file)
+        errorf("Permission denied for async_write().\n");
+    push_string(inter_sp, file);
+    if (memchr(get_txt(file), '\0', mstrsize(file)))
+        errorf("Embedded NUL in async_write() resolved path.\n");
+    async_io_set_path(request, convert_path_str_to_native_or_throw(ref_mstring(file)));
+    free_svalue(inter_sp--);
+    async_io_validate(request);
+
+    iec = xalloc(sizeof(*iec));
+    if (!iec)
+        errorf("Out of memory for async_write() encoding.\n");
+    iec->cd = iconv_init();
+    push_error_handler(iconv_error_handler, &iec->head);
+    iec->cd = get_file_encoding(arg[0].u.str, false, NULL, NULL);
+    async_io_validate(request);
+    input = get_txt(arg[1].u.str);
+    remaining = mstrsize(arg[1].u.str);
+    while (true)
+    {
+        char output[4096], *next = output;
+        size_t available = sizeof(output), result;
+        int error;
+        if (remaining)
+            result = iconv(iec->cd, &input, &remaining, &next, &available);
+        else
+        {
+            flushing = MY_TRUE;
+            result = iconv(iec->cd, NULL, NULL, &next, &available);
+        }
+        error = errno;
+        async_io_append(request, output, next - output);
+        if (result == (size_t)-1 && error != E2BIG)
+            errorf("async_write() encoding failed: %s.\n", strerror(error));
+        if (result != (size_t)-1 && flushing)
+            break;
+    }
+    free_svalue(inter_sp--); /* Close the conversion descriptor. */
+    async_io_publish(request, arg[2].u.number ? AIO_OP_OVERWRITE : AIO_OP_APPEND);
+    return pop_n_elems(4, inter_sp);
+}
+#endif /* USE_ASYNC_IO */
+
+/***************************************************************************/

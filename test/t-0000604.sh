@@ -11,8 +11,12 @@ for option in ${DRIVER_DEFAULTS}; do
     esac
 done
 # the crash is alignment sensitive, so check command lines of varying lengths
+set --
+if [ -n "${ASYNC_IO_HELPER:-}" ]; then
+    set -- --async-io-helper "$ASYNC_IO_HELPER"
+fi
 for extra in 0 01 012 0123 01234 012345 0123456 01234567; do
-    ${DRIVER} --erq "/bin/true ${extra}" ${OPTIONS} -m. ${PORT}\
+    ${DRIVER} --erq "/bin/true ${extra}" ${OPTIONS} "$@" -m. ${PORT}\
         -Mgeneric/shutdown --debug-file=/dev/null > ${TEST_LOGFILE} || exit 1
 done
 echo "Success." >&2

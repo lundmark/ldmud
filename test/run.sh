@@ -22,6 +22,23 @@ if ${DRIVER} --options | grep -q 'Python supported'; then
     DRIVER_DEFAULTS="$DRIVER_DEFAULTS --python-script startup.py"
 fi
 
+if "${DRIVER}" --options | grep -q 'Async file I/O supported'; then
+    if [ -z "${ASYNC_IO_HELPER:-}" ]; then
+        ASYNC_IO_HELPER="$(CDPATH= cd -- "$(dirname -- "$DRIVER")" && pwd)/ldmud-async-io"
+    fi
+    case "$ASYNC_IO_HELPER" in
+        /*) ;;
+        *) ASYNC_IO_HELPER="$(pwd)/$ASYNC_IO_HELPER" ;;
+    esac
+    if [ ! -x "$ASYNC_IO_HELPER" ]; then
+        echo "Missing executable async file helper: $ASYNC_IO_HELPER" >&2
+        exit 1
+    fi
+else
+    ASYNC_IO_HELPER=
+fi
+export ASYNC_IO_HELPER
+
 while [ $# -gt 0 ]
 do
     case "$1" in
@@ -63,15 +80,20 @@ run_single_test()
     export GCOV_PREFIX="$PWD/coverage/${TESTNAME}/"
     export LLVM_PROFILE_FILE="$PWD/coverage/${TESTNAME}.profraw"
 
+    set --
+    if [ -n "$ASYNC_IO_HELPER" ]; then
+        set -- --async-io-helper "$ASYNC_IO_HELPER"
+    fi
+
     if [ -d "${TESTNAME}" ]
     then
-	${DRIVER} ${DRIVER_DEFAULTS} -Mmaster -m"${TESTNAME}" ${PORT} \
+	${DRIVER} ${DRIVER_DEFAULTS} "$@" -Mmaster -m"${TESTNAME}" ${PORT} \
               --debug-file ".${TEST_LOGFILE}"  > "${TEST_OUTPUTFILE}" 2> "${TEST_ERRFILE}" \
         || { echo "Test ${TESTNAME} FAILED."; echo "\t${TESTNAME}" >> ./log/fails; }
     else
         case ${TESTNAME} in
         *.c)
-            ${DRIVER} ${DRIVER_DEFAULTS} -M"${TESTNAME}" -m. ${PORT} \
+            ${DRIVER} ${DRIVER_DEFAULTS} "$@" -M"${TESTNAME}" -m. ${PORT} \
                   --debug-file ${TEST_LOGFILE} > "${TEST_OUTPUTFILE}" 2> "${TEST_ERRFILE}" \
             || { echo "Test ${TESTNAME} FAILED."; echo "\t${TESTNAME}" >> ./log/fails; }
         ;;

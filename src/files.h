@@ -19,6 +19,8 @@ extern svalue_t *f_rm (svalue_t *sp);
 extern svalue_t *f_rmdir (svalue_t *sp);
 extern svalue_t *f_write_bytes (svalue_t *sp);
 extern svalue_t *v_write_file (svalue_t *sp, int num_arg);
+#ifdef USE_ASYNC_IO
+extern svalue_t *f_async_write(svalue_t *sp);
+#endif
 
 #endif /* FILES_H__ */
-

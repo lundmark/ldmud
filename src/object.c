@@ -190,6 +190,10 @@
 #include "xalloc.h"
 
 #include "pkg-python.h"
+#include "async_io.h"
+#ifdef USE_ASYNC_IO
+#include "async_io_protocol.h"
+#endif
 
 #include "i-current_object.h"
 
@@ -5538,8 +5542,7 @@ static const char save_file_suffix[] = ".o";
 
 static struct pointer_table *ptable = NULL;
   /* The pointer_table used to register all arrays and mappings.
-   * If an error happens during the save, this table probably won't
-   * be deallocated.
+   * The active save cleanup owner releases it on success or error.
    */
 
 static char number_buffer[36];
@@ -5574,6 +5577,16 @@ static int save_object_descriptor = -1;
 static strbuf_t save_string_buffer;
   /* When saving to a string: the string buffer.
    */
+
+static Bool save_active = MY_FALSE;
+  /* Python save hooks may call LPC. Reject nested saves while the global
+   * serializer state belongs to another operation.
+   */
+
+#ifdef USE_ASYNC_IO
+static async_request_t *save_async_request = NULL;
+  /* A bounded sink for asynchronous capture; NULL for legacy saves. */
+#endif
 
 static mp_int current_sv_id_number;
   /* The highest ID number so far assigned to a shared value when
@@ -5690,6 +5703,11 @@ write_buffer (void)
     char *start;
 
     start = save_object_bufstart;
+#ifdef USE_ASYNC_IO
+    if (save_async_request)
+        async_io_append(save_async_request, start, SAVE_OBJECT_BUFSIZE);
+    else
+#endif
     if (save_object_descriptor >= 0)
     {
 
@@ -7245,8 +7263,11 @@ register_python_ob (svalue_t *svp)
         }
         else
         {
-            free_mstring(name);
             free_svalue(&val);
+            /* save_python_ob() lends the type name; it is not our reference.
+             * An incomplete registration cannot produce a valid snapshot.
+             */
+            outofmem(sizeof(*data), "Python save data");
         }
     }
 } /* register_python_ob() */
@@ -7403,282 +7424,99 @@ register_svalue (svalue_t *svp)
 } /* register_svalue() */
 
 /*-------------------------------------------------------------------------*/
-svalue_t *
-v_save_object (svalue_t *sp, int numarg)
+typedef struct save_cleanup_s
+{
+    error_handler_t head;
+    Bool active;
+    int descriptor;
+    char *names;
+    char *temporary;
+} save_cleanup_t;
 
-/* EFUN save_object()
- *
- *   int    save_object (string file, [int version])
- *   string save_object ([int version])
- *
- * Save the variables of the current object to the file <file> (the suffix
- * ".o" will be appended. Returns 0 if the save file could be created,
- * and non-zero otherwise (file could not be written, or current object
- * is destructed).
- *
- * The <file>.o will not be written immediately: first the savefile will
- * be created as <file>.o.tmp, which is after completion renamed to <file>.o.
- *
- * The validity of the filename is checked with a call to check_valid_path().
- *
- * In the second form, the a string with all variables and values is
- * returned directly, or 0 if an error occurs. This string can be used
- * with restore_object() to restore the variable values.
- *
- * In both forms, the optional argument <version> determines the format
- * of the save file. A value of '-1' creates the format native to the
- * driver. Currently the formats 0 and 1 are supported.
- *
- * TODO: "save_object()" looks nice, but maybe call that "save_variables()"?
+static void
+save_cleanup (error_handler_t *arg)
+
+/* Release serialization state on normal return and every error unwind.
+ * A filename hook may reenter before this owner becomes active.
  */
 
 {
-    static char save_object_header[]
-      = { '#', SAVE_OBJECT_VERSION, ':', SAVE_OBJECT_HOST, '\n'
-        };
-      /* The version string to write
-       */
+    save_cleanup_t *cleanup = (save_cleanup_t *)arg;
 
-    object_t *ob;
-      /* The object to save - just a local copy of current_object.
-       */
-    char *file;
-      /* The filename read from the stack, NULL if not saving
-       * to a file.
-       */
-    char *name;
-      /* Buffer for the final and the temporary filename.
-       * name itself points to the final filename.
-       */
-    char *tmp_name;
-      /* Pointer to the temporary filename in the buffer of name.
-       */
-    char save_buffer[SAVE_OBJECT_BUFSIZE];
-      /* The write buffer
-       */
-    long len;
-    int i;
-    int f;
-    svalue_t *v;
-    variable_t *names;
-
-    f = -1;
-    file = NULL;
-    name = NULL;
-    tmp_name = NULL;
-    save_version = CURRENT_VERSION;
-
-    /* Test the arguments */
-    switch (numarg)
+    if (cleanup->active)
     {
-    case 0:
-        strbuf_zero(&save_string_buffer);
-        break;
-
-    case 1:
-        if (sp->type == T_STRING)
-        {
-            file = get_txt(sp->u.str);
-        }
-        else if (sp->type == T_NUMBER)
-        {
-            if (sp->u.number < -1 || sp->u.number > CURRENT_VERSION)
-            {
-                errorf("Illegal value for arg 1 to save_object(): %"PRIdPINT", "
-                      "expected -1..%d\n"
-                     , sp->u.number, CURRENT_VERSION
-                     );
-                /* NOTREACHED */
-                return sp;
-            }
-
-            strbuf_zero(&save_string_buffer);
-            save_version = sp->u.number >= 0 ? sp->u.number
-                                             : CURRENT_VERSION;
-        }
-        else
-        {
-            vefun_gen_arg_error(1, sp, sp);
-            /* NOTREACHED */
-            return sp;
-        }
-        break;
-
-    case 2:
-        if (sp[-1].type != T_STRING)
-            vefun_arg_error(1, T_STRING, sp-1, sp);
-        if (sp->type != T_NUMBER)
-            vefun_arg_error(2, T_NUMBER, sp, sp);
-
-        file = get_txt(sp[-1].u.str);
-
-        if (sp->u.number < -1 || sp->u.number > CURRENT_VERSION)
-        {
-            errorf("Illegal value for arg 1 to save_object(): %"PRIdPINT", "
-                  "expected -1..%d\n"
-                 , sp->u.number, CURRENT_VERSION
-                 );
-            /* NOTREACHED */
-            return sp;
-        }
-
-        save_version = sp->u.number >= 0 ? sp->u.number
-                                         : CURRENT_VERSION;
-
-        /* The main code wants sp == filename (T_NUMBER svalues need no free.)
-         */
-        sp--;
-        numarg--;
-        break;
-
-    default:
-        fatal("Too many arguments to save_object(): %d, expected 0..2\n"
-             , numarg);
-    } /* switch(numarg) */
-
-    save_object_header[1] = '0' + save_version;
-
-    /* No need in saving destructed objects */
-
-    ob = get_current_object();
-    if (!ob || (ob->flags & O_DESTRUCTED))
-    {
-        if (numarg)
-            sp = pop_n_elems(numarg, sp);
-        sp++;
-        put_number(sp, 0);
-        return sp;
+#ifdef USE_PYTHON
+        cleanup_python_save_data();
+#endif
+        free_save_object_buffers();
+        strbuf_free(&save_string_buffer);
+        save_object_descriptor = -1;
+        save_object_bufstart = buf_pnt = NULL;
+#ifdef USE_ASYNC_IO
+        save_async_request = NULL;
+#endif
+        save_active = MY_FALSE;
     }
+    if (cleanup->descriptor >= 0)
+        close(cleanup->descriptor);
+    if (cleanup->temporary)
+        unlink(cleanup->temporary);
+    if (cleanup->names)
+        xfree(cleanup->names);
+    xfree(cleanup);
+} /* save_cleanup() */
 
-    /* If saving to a file, get the proper name and open it
-     * The code assumes that sp is the filename argument.
-     */
-    if (file)
-    {
-        string_t *sfile;
-        char *native;
+static save_cleanup_t *
+save_owner (void)
+{
+    save_cleanup_t *cleanup = xalloc(sizeof(*cleanup));
 
-        /* Get a valid filename */
+    if (!cleanup)
+        errorf("Out of memory for save cleanup.\n");
+    cleanup->active = MY_FALSE;
+    cleanup->descriptor = -1;
+    cleanup->names = cleanup->temporary = NULL;
+    push_error_handler(save_cleanup, &cleanup->head);
+    return cleanup;
+} /* save_owner() */
 
-        sfile = check_valid_path(sp->u.str, svalue_object(ob), STR_SAVE_OBJECT, MY_TRUE);
-        if (sfile == NULL)
-        {
-            errorf("Illegal use of save_object('%s')\n", get_txt(sp->u.str));
-            /* NOTREACHED */
-            return sp;
-        }
+static void
+save_start (save_cleanup_t *cleanup, int version, char *buffer)
+{
+    static const char header[] =
+        { '#', SAVE_OBJECT_VERSION, ':', SAVE_OBJECT_HOST, '\n' };
 
-        /* Remove any trailing '.c' */
-        {
-            string_t *tmp = del_dotc(sfile);
-            if (!tmp)
-                outofmem(mstrsize(sfile), "filename");
-            free_mstring(sfile);
-            sfile = tmp;
-        }
-
-
-        /* Create the final and the temporary filename */
-        native = convert_path_str_to_native_or_throw(sfile);
-        len = (long)strlen(native);
-        inter_sp = sp;
-        name = xalloc_with_error_handler(len + (sizeof save_file_suffix) +
-                                        len + (sizeof save_file_suffix) + 4);
-        if (!name)
-        {
-            errorf("Out of memory (%ld bytes) in save_object('%s')\n", 
-                   2*len+2*sizeof(save_file_suffix)+4, get_txt(sp->u.str));
-            /* NOTREACHED */
-            return sp;
-        }
-        sp = inter_sp;
-
-        tmp_name = name + len + sizeof save_file_suffix;
-
-        memcpy(name, native, len);
-        memcpy(name + len, save_file_suffix, sizeof save_file_suffix);
-
-        memcpy(tmp_name, name, len + sizeof save_file_suffix);
-        memcpy(tmp_name + len + sizeof save_file_suffix - 1, ".tmp", 5);
-
-        /* Open the file */
-
-        /* Always write savefiles in 'binary mode'. (O_BINARY is 0 on all platforms
-         * except of Cygwin and therefore ignored. Cygwin may need it, if the
-         * volume with the mudlib is mounted in textmode. */
-        f = ixopen3(tmp_name, O_CREAT|O_TRUNC|O_WRONLY|O_BINARY, 0640);
-
-        if (f < 0) {
-            char * emsg, * buf;
-
-            emsg = strerror(errno);
-            buf = alloca(strlen(emsg)+1);
-            if (buf)
-            {
-                strcpy(buf, emsg);
-                errorf("Could not open %s for a save: %s.\n", tmp_name, buf);
-            }
-            else
-            {
-                perror("save object");
-                errorf("Could not open %s for a save: errno %d.\n"
-                     , tmp_name, errno);
-            }
-            /* NOTREACHED */
-            return sp;
-        }
-        FCOUNT_SAVE(tmp_name);
-    } /* if (file) */
-
-    /* Publish where we are going to save the data (-1 means using
-     * the string buffer.
-     */
-    save_object_descriptor = f;
-
-    /* First pass through the variables to identify arrays/mappings
-     * that are used more than once.
-     */
-
-    if (ptable)
-    {
-        debug_message("%s (save_object) Freeing lost pointertable\n", time_stamp());
-        free_pointer_table(ptable);
-    }
-
-    ptable = new_pointer_table();
-    if (!ptable)
-    {
-        if (file)
-        {
-            close(f);
-            unlink(tmp_name);
-        }
-        errorf("(save_object) Out of memory for pointer table.\n");
-        /* NOTREACHED */
-        return sp;
-    }
-
-    v = ob->variables;
-    names = ob->prog->variables;
-    for (i = ob->prog->num_variables; --i >= 0; v++, names++)
-    {
-        if (names->type.t_flags & TYPE_MOD_STATIC)
-            continue;
-
-        register_svalue(v);
-    }
-
-    /* Prepare the actual save */
-
+    if (save_active)
+        errorf("Nested save serialization is not supported.\n");
+    cleanup->active = save_active = MY_TRUE;
+    free_save_object_buffers();
+    strbuf_zero(&save_string_buffer);
+    save_version = version;
+    save_object_descriptor = cleanup->descriptor;
     failed = MY_FALSE;
     current_sv_id_number = 0;
     bytes_written = 0;
-    save_object_bufstart = save_buffer;
-    memcpy(save_buffer, save_object_header, sizeof(save_object_header));
-    buf_left = SAVE_OBJECT_BUFSIZE - sizeof(save_object_header);
-    buf_pnt = save_buffer + sizeof(save_object_header);
+    save_object_bufstart = buffer;
+    memcpy(buffer, header, sizeof(header));
+    buffer[1] = '0' + version;
+    buf_left = SAVE_OBJECT_BUFSIZE - sizeof(header);
+    buf_pnt = buffer + sizeof(header);
+    ptable = new_pointer_table();
+    if (!ptable)
+        errorf("Out of memory for save pointer table.\n");
+} /* save_start() */
 
-    /* Second pass through the variables, actually saving them */
+static void
+save_object_variables (object_t *ob)
+
+/* The shared two-pass object serializer. All sinks use exactly the same
+ * variable order, nosave filtering, reference table and value formats.
+ */
+
+{
+    svalue_t *v;
+    variable_t *names;
+    int i;
 
     v = ob->variables;
     names = ob->prog->variables;
@@ -7686,281 +7524,326 @@ v_save_object (svalue_t *sp, int numarg)
     {
         if (names->type.t_flags & TYPE_MOD_STATIC)
             continue;
+        register_svalue(v);
+        if (ob->flags & O_DESTRUCTED)
+            errorf("Object destructed during save serialization.\n");
+    }
 
-        /* Write the variable name */
+    v = ob->variables;
+    names = ob->prog->variables;
+    for (i = ob->prog->num_variables; --i >= 0; v++, names++)
+    {
+        if (names->type.t_flags & TYPE_MOD_STATIC)
+            continue;
         {
             char *var_name, c;
             L_PUTC_PROLOG
 
             var_name = get_txt(names->name);
             c = *var_name++;
-            do {
+            do
+            {
                 L_PUTC(c)
-            } while ( '\0' != (c = *var_name++) );
+            } while ('\0' != (c = *var_name++));
             L_PUTC(' ')
             L_PUTC_EPILOG
         }
         save_svalue(v, '\n', MY_FALSE);
     }
+} /* save_object_variables() */
 
-#ifdef USE_PYTHON
-    cleanup_python_save_data();
-#endif
-    free_pointer_table(ptable);
-    ptable = NULL;
+static void
+save_store_string (svalue_t *result)
 
-    if (file)
+/* Preserve legacy string-save limits, including its short-output fast path.
+ * Async capture does not use a strbuf or allocate an intermediate LPC string.
+ */
+
+{
+    if (failed)
+        put_number(result, 0);
+    else if (buf_left != SAVE_OBJECT_BUFSIZE && !bytes_written)
     {
-        /* Finish up the file */
-
-        len =  write( save_object_descriptor
-                    , save_object_bufstart
-                    , (size_t)(SAVE_OBJECT_BUFSIZE-buf_left));
-        if (len != SAVE_OBJECT_BUFSIZE-buf_left )
-            failed = MY_TRUE;
-
-
-        /* On failure, delete the temporary file and return */
-
-        if (failed)
-        {
-            close(f);
-            unlink(tmp_name);
-            add_message("Failed to save to file '%s'. Disk could be full.\n", file);
-            /* free the error handler and the arguments (numarg + 1  from sp).
-             */
-            sp = pop_n_elems(numarg + 1, sp);
-            sp++;
-            put_number(sp, 1);
-            return sp;
-        }
-
-        /* Delete any existing savefile, then rename the temporary
-         * file to the real name.
-         */
-
-        i = 0; /* Result from efun */
-
-        unlink(name);
-        if (link(tmp_name, name) == -1)
-        {
-            perror(name);
-            printf("%s Failed to link %s to %s\n"
-                  , time_stamp(), tmp_name, name);
-            add_message("Failed to save object !\n");
-            i = 1;
-        }
-        close(f);
-        unlink(tmp_name);
-
-        /* free the error handler and the arguments (numarg + 1  from sp) and
-         * push result on the stack.
-         */
-        sp = pop_n_elems(numarg + 1, sp);
-        sp++;
-        put_number(sp, i);
-    } /* if (file) */
+        size_t length = SAVE_OBJECT_BUFSIZE - buf_left;
+        save_object_bufstart[length] = '\0';
+        put_c_string(result, save_object_bufstart);
+    }
     else
     {
-        /* Finish up the operation. Note that there propably is some
-         * data pending in the save_buffer.
-         */
+        if (buf_left != SAVE_OBJECT_BUFSIZE)
+            strbuf_addn(&save_string_buffer, save_object_bufstart,
+                        SAVE_OBJECT_BUFSIZE - buf_left);
+        strbuf_store(&save_string_buffer, result);
+    }
+} /* save_store_string() */
 
-        /* free the arguments (numarg from sp).
-         */
+static svalue_t *
+save_return (svalue_t *owner, int numarg)
+
+/* The result above the owner stays rooted while arguments and cleanup are
+ * released. Move it into the efun's return slot only after cleanup finishes.
+ */
+
+{
+    svalue_t *result = owner + 1;
+    svalue_t *target = owner - numarg;
+    svalue_t *p;
+
+    for (p = target; p <= owner; p++)
+        free_svalue(p);
+    transfer_svalue_no_free(target, result);
+    inter_sp = target;
+    return target;
+} /* save_return() */
+
+/*-------------------------------------------------------------------------*/
+svalue_t *
+v_save_object (svalue_t *sp, int numarg)
+
+/* EFUN save_object()
+ *
+ *   int    save_object(string file [, int version])
+ *   string save_object([int version])
+ *
+ * Save the current object's ordinary variables, excluding nosave variables.
+ * The file form checks its path, strips .c, appends .o, and returns 0 on
+ * success or nonzero on an I/O failure. The string form returns the same
+ * serialization directly. Version -1 selects CURRENT_VERSION.
+ *
+ * Preserve legacy streaming file output and its .o.tmp then unlink/link
+ * replacement behavior; the async worker owns the atomic replacement path.
+ */
+
+{
+    svalue_t *args = sp - numarg + 1;
+    object_t *ob;
+    save_cleanup_t *cleanup;
+    char save_buffer[SAVE_OBJECT_BUFSIZE];
+    char *file = NULL;
+    p_int version = CURRENT_VERSION;
+    int result = 0;
+
+    if (save_active)
+        errorf("Nested save serialization is not supported.\n");
+    if (numarg == 1 && args->type == T_STRING)
+        file = get_txt(args->u.str);
+    else if (numarg == 1 && args->type == T_NUMBER)
+        version = args->u.number;
+    else if (numarg == 2)
+    {
+        if (args->type != T_STRING)
+            vefun_arg_error(1, T_STRING, args, sp);
+        if (sp->type != T_NUMBER)
+            vefun_arg_error(2, T_NUMBER, sp, sp);
+        file = get_txt(args->u.str);
+        version = sp->u.number;
+    }
+    else if (numarg != 0)
+        vefun_gen_arg_error(1, args, sp);
+    if (version < -1 || version > CURRENT_VERSION)
+        errorf("Illegal save_object() format %"PRIdPINT", expected -1..%d.\n",
+               version, CURRENT_VERSION);
+    if (version < 0)
+        version = CURRENT_VERSION;
+
+    ob = get_current_object();
+    if (!ob || (ob->flags & O_DESTRUCTED))
+    {
         sp = pop_n_elems(numarg, sp);
-      
-        sp++; /* for the result */
-        if (failed)
-            put_number(sp, 0); /* Shouldn't happen */
-        else if (buf_left != SAVE_OBJECT_BUFSIZE)
+        put_number(++sp, 0);
+        return sp;
+    }
+
+    inter_sp = sp;
+    cleanup = save_owner();
+    if (file)
+    {
+        string_t *sfile, *trimmed;
+        char *native;
+        size_t length;
+
+        sfile = check_valid_path(args->u.str, svalue_object(ob), STR_SAVE_OBJECT, MY_TRUE);
+        if (!sfile)
+            errorf("Illegal use of save_object('%s')\n", file);
+        push_string(inter_sp, sfile);
+        trimmed = del_dotc(sfile);
+        if (!trimmed)
+            outofmem(mstrsize(sfile), "filename");
+        free_svalue(inter_sp);
+        put_string(inter_sp, trimmed);
+        native = convert_path_str_to_native_or_throw(ref_mstring(trimmed));
+        length = strlen(native);
+        cleanup->names = xalloc(2 * length + 2 * sizeof(save_file_suffix) + 4);
+        if (!cleanup->names)
+            outofmem(2 * length + 2 * sizeof(save_file_suffix) + 4, "save filename");
+        cleanup->temporary = cleanup->names + length + sizeof(save_file_suffix);
+        memcpy(cleanup->names, native, length);
+        memcpy(cleanup->names + length, save_file_suffix, sizeof(save_file_suffix));
+        memcpy(cleanup->temporary, cleanup->names, length + sizeof(save_file_suffix));
+        memcpy(cleanup->temporary + length + sizeof(save_file_suffix) - 1, ".tmp", 5);
+        free_svalue(inter_sp--);
+
+        cleanup->descriptor = ixopen3(cleanup->temporary,
+                                      O_CREAT|O_TRUNC|O_WRONLY|O_BINARY, 0640);
+        if (cleanup->descriptor < 0)
         {
-            /* Data pending in the save_buffer. */
-            if (!bytes_written)
-            {
-                /* Less than SAVE_OBJECT_BUFSIZE bytes generated
-                 * we bypass the strbuf for speed.
-                 */
-                len = SAVE_OBJECT_BUFSIZE-buf_left;
-                save_object_bufstart[len] = '\0';
-                put_c_string(sp, save_object_bufstart);
-                strbuf_free(&save_string_buffer);
-            }
-            else
-            {
-                /* More than SAVE_OBJECT_BUFSIZE of data generated
-                 * Fill up the stringbuffer and create the result.
-                 */
-                strbuf_addn(&save_string_buffer, save_object_bufstart
-                       , SAVE_OBJECT_BUFSIZE-buf_left);
-                strbuf_store(&save_string_buffer, sp);
-            }
+            /* We did not create this path; an error must not unlink it. */
+            cleanup->temporary = NULL;
+            errorf("Could not open save file: %s.\n", strerror(errno));
+        }
+        FCOUNT_SAVE(cleanup->temporary);
+    }
+    if (ob->flags & O_DESTRUCTED)
+        errorf("Object destructed during save preparation.\n");
+
+    save_start(cleanup, (int)version, save_buffer);
+    save_object_variables(ob);
+    sp = inter_sp;
+    put_number(++inter_sp, 0);
+    if (file)
+    {
+        ssize_t length = write(cleanup->descriptor, save_object_bufstart,
+                               (size_t)(SAVE_OBJECT_BUFSIZE - buf_left));
+        if (length != SAVE_OBJECT_BUFSIZE - buf_left)
+            failed = MY_TRUE;
+        if (failed)
+        {
+            add_message("Failed to save to file '%s'. Disk could be full.\n", file);
+            result = 1;
         }
         else
-            /* The save_buffer[] is empty, what means
-             * that at least one buffer full was written into
-             * the strbuf.
-             */
-            strbuf_store(&save_string_buffer, sp);
-    } /* if (file or not file) */
-
-    return sp;
+        {
+            unlink(cleanup->names);
+            if (link(cleanup->temporary, cleanup->names) == -1)
+            {
+                perror(cleanup->names);
+                add_message("Failed to save object !\n");
+                result = 1;
+            }
+        }
+        put_number(inter_sp, result);
+    }
+    else
+        save_store_string(inter_sp);
+    return save_return(sp, numarg);
 } /* v_save_object() */
 
 /*-------------------------------------------------------------------------*/
 svalue_t *
 v_save_value (svalue_t *sp, int numarg)
 
-/* EFUN save_value()
+/* EFUN save_value(mixed value [, int version])
  *
- *   string save_value(mixed value, [int version])
- *
- * Encode the <value> into a string suitable for restoration with
- * restore_value() and return it.
- *
- * The created string consists of two lines, each terminated with a newline
- * character: the first line describes the format used to save the value in
- * the '#x:y' notation; the second line is the representation of the value
- * itself.
- *
- * The optional argument <version> determines the format
- * of the save file. A value of '-1' creates the format native to the
- * driver. Currently the formats 0 and 1 are supported.
+ * Serialize one value with the legacy string sink. Version -1 selects the
+ * native format; restore_value() accepts the returned string.
  */
 
 {
-    static char save_value_header[]
-      = { '#', SAVE_OBJECT_VERSION, ':', SAVE_OBJECT_HOST, '\n'
-        };
-      /* The version string to write
-       */
-
+    svalue_t *value = sp - numarg + 1;
+    save_cleanup_t *cleanup;
     char save_buffer[SAVE_OBJECT_BUFSIZE];
-      /* The write buffer.
-       */
+    int version = CURRENT_VERSION;
 
-    /* Set up the globals */
-    if (ptable)
+    if (save_active)
+        errorf("Nested save serialization is not supported.\n");
+    if (numarg == 2)
     {
-        debug_message("%s (save_value) Freeing lost pointer table.\n", time_stamp());
-        free_pointer_table(ptable);
-    }
-    ptable = new_pointer_table();
-    if (!ptable)
-    {
-        errorf("(save_value) Out of memory for pointer table.\n");
-        return sp; /* flow control hint */
-    }
-
-    strbuf_zero(&save_string_buffer);
-    save_object_descriptor = -1;
-    save_version = CURRENT_VERSION;
-
-    /* Evaluate the arguments */
-    switch (numarg)
-    {
-    case 1:
-        /* Ok */
-        break;
-
-    case 2:
-        if (sp->type == T_NUMBER)
-        {
-            if (sp->u.number < -1 || sp->u.number > CURRENT_VERSION)
-            {
-                errorf("Illegal value for arg 1 to save_object(): %"PRIdPINT", "
-                      "expected -1..%d\n"
-                     , sp->u.number, CURRENT_VERSION
-                     );
-                /* NOTREACHED */
-                return sp;
-            }
-
-            save_version = sp->u.number >= 0 ? sp->u.number
-                                                    : CURRENT_VERSION;
-
-            sp--;
-        }
-        else
-        {
+        if (sp->type != T_NUMBER)
             vefun_gen_arg_error(2, sp, sp);
-            /* NOTREACHED */
-            return sp;
-        }
-        break;
-
-    default:
-        fatal("Illegal number of arguments to save_value(): %d, expected 1..2\n"
-             , numarg);
-    } /* switch(numarg) */
-
-    save_value_header[1] = '0' + save_version;
-
-    /* First look at the value for arrays and mappings
-     */
-    register_svalue(sp);
-
-    /* Prepare the actual save */
-
-    failed = MY_FALSE;
-    current_sv_id_number = 0;
-    bytes_written = 0;
-    save_object_bufstart = save_buffer;
-    memcpy(save_buffer, save_value_header, sizeof(save_value_header));
-    buf_left = SAVE_OBJECT_BUFSIZE - sizeof(save_value_header);
-    buf_pnt = save_buffer + sizeof(save_value_header);
-
-    /* Save the value */
-    save_svalue(sp, '\n', MY_FALSE);
-
-    /* Finish up the operation. Note that there propably is some
-     * data pending in the save_buffer.
-     */
-
-    free_svalue(sp);  /* No longer needed */
-
-    if (failed)
-        put_number(sp, 0); /* Shouldn't happen */
-    else if (buf_left != SAVE_OBJECT_BUFSIZE)
-    {
-        /* Data pending in the save_buffer. */
-        if (!bytes_written)
-        {
-            /* Less than SAVE_OBJECT_BUFSIZE bytes generated
-             * we bypass the strbuf for speed.
-             */
-            size_t len = SAVE_OBJECT_BUFSIZE-buf_left;
-
-            save_object_bufstart[len] = '\0';
-            put_c_string(sp, save_object_bufstart);
-            strbuf_free(&save_string_buffer);
-        }
-        else
-        {
-            /* More than SAVE_OBJECT_BUFSIZE of data generated
-             * Fill up the stringbuffer and create the result.
-             */
-            strbuf_addn(&save_string_buffer, save_object_bufstart
-                       , SAVE_OBJECT_BUFSIZE-buf_left);
-            strbuf_store(&save_string_buffer, sp);
-        }
+        if (sp->u.number < -1 || sp->u.number > CURRENT_VERSION)
+            errorf("Illegal save_value() format %"PRIdPINT", expected -1..%d.\n",
+                   sp->u.number, CURRENT_VERSION);
+        version = sp->u.number >= 0 ? sp->u.number : CURRENT_VERSION;
     }
-    else
-        /* The save_buffer[] is empty, what means
-         * that at least one buffer full was written into
-         * the strbuf.
-         */
-        strbuf_store(&save_string_buffer, sp);
+    else if (numarg != 1)
+        fatal("Illegal number of arguments to save_value(): %d\n", numarg);
 
-    /* Clean up */
-#ifdef USE_PYTHON
-    cleanup_python_save_data();
-#endif
-    free_pointer_table(ptable);
-    ptable = NULL;
-
-    return sp;
+    inter_sp = sp;
+    cleanup = save_owner();
+    save_start(cleanup, version, save_buffer);
+    register_svalue(value);
+    save_svalue(value, '\n', MY_FALSE);
+    sp = inter_sp;
+    put_number(++inter_sp, 0);
+    save_store_string(inter_sp);
+    return save_return(sp, numarg);
 } /* v_save_value() */
+
+#ifdef USE_ASYNC_IO
+/*-------------------------------------------------------------------------*/
+svalue_t *
+v_async_save_object (svalue_t *sp, int numarg)
+
+/* EFUN async_save_object(string file, closure callback [, int format]).
+ * Capture synchronously through the shared serializer into the bounded
+ * request sink; only the immutable bytes and native path reach the worker.
+ */
+
+{
+    svalue_t *args = sp - numarg + 1;
+    object_t *ob = get_current_object();
+    async_request_t *request;
+    save_cleanup_t *cleanup;
+    string_t *sfile, *trimmed;
+    char *native;
+    char path[AIO_MAX_PATH + 1];
+    char save_buffer[SAVE_OBJECT_BUFSIZE];
+    size_t length;
+    int version = CURRENT_VERSION;
+
+    if (save_active)
+        errorf("Nested save serialization is not supported.\n");
+    if (!ob || (ob->flags & O_DESTRUCTED))
+        errorf("async_save_object() requires a live ordinary object.\n");
+    if (numarg == 3)
+    {
+        if (sp->type != T_NUMBER)
+            vefun_arg_error(3, T_NUMBER, sp, sp);
+        if (sp->u.number < -1 || sp->u.number > CURRENT_VERSION)
+            errorf("Illegal async_save_object() format %"PRIdPINT", expected -1..%d.\n",
+                   sp->u.number, CURRENT_VERSION);
+        version = sp->u.number >= 0 ? sp->u.number : CURRENT_VERSION;
+    }
+    if (args->type != T_STRING)
+        vefun_arg_error(1, T_STRING, args, sp);
+    if (args[1].type != T_CLOSURE)
+        vefun_arg_error(2, T_CLOSURE, args + 1, sp);
+
+    inter_sp = sp;
+    request = async_io_begin(args + 1);
+    sfile = check_valid_path(args->u.str, svalue_object(ob), STR_SAVE_OBJECT, MY_TRUE);
+    if (!sfile)
+        errorf("Illegal use of async_save_object().\n");
+    push_string(inter_sp, sfile);
+    if (memchr(get_txt(sfile), '\0', mstrsize(sfile)))
+        errorf("NUL in async_save_object() filename.\n");
+    trimmed = del_dotc(sfile);
+    if (!trimmed)
+        outofmem(mstrsize(sfile), "filename");
+    free_svalue(inter_sp);
+    put_string(inter_sp, trimmed);
+    native = convert_path_str_to_native_or_throw(ref_mstring(trimmed));
+    length = strlen(native);
+    if (length > AIO_MAX_PATH - (sizeof(save_file_suffix) - 1))
+        errorf("async_save_object() filename is too long.\n");
+    memcpy(path, native, length);
+    memcpy(path + length, save_file_suffix, sizeof(save_file_suffix));
+    async_io_set_path(request, path);
+    free_svalue(inter_sp--);
+    if (ob->flags & O_DESTRUCTED)
+        errorf("Object destructed during async save preparation.\n");
+    async_io_validate(request);
+
+    cleanup = save_owner();
+    save_start(cleanup, version, save_buffer);
+    save_async_request = request;
+    save_object_variables(ob);
+    async_io_append(request, save_object_bufstart, SAVE_OBJECT_BUFSIZE - buf_left);
+    free_svalue(inter_sp--);
+    async_io_publish(request, AIO_OP_SAVE);
+    return pop_n_elems(numarg, inter_sp);
+} /* v_async_save_object() */
+#endif /* USE_ASYNC_IO */
 
 /*-------------------------------------------------------------------------*/
 /* Structure used by restore_mapping() and restore_map_size()
@@ -10822,4 +10705,3 @@ f_restore_value (svalue_t *sp)
 } /* f_restore_value() */
 
 /***************************************************************************/
-

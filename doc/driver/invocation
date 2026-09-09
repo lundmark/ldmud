@@ -35,6 +35,28 @@ DESCRIPTION
         only available if a certain compile-time option was enabled (typically
         in the source file config.h). The following options are recognized:
 
+          --async-io-helper <absolute-path>
+            Select the standalone writer used by async_write() and
+            async_save_object(). Available only with --enable-use-async-io.
+            The default is ldmud-async-io in the configured binary install
+            directory. The executable must exist and complete its startup
+            handshake; failure prevents driver startup. make and
+            make install-driver build and install this companion together
+            with an enabled driver.
+            The driver also needs /proc/self/fd or /dev/fd to inventory open
+            descriptors before starting the helper; this prevents inherited
+            sockets from escaping even after descriptor limits are lowered.
+
+            Configure queue limits with --with-async-io-max-requests=1024,
+            --with-async-io-max-bytes=67108864, and
+            --with-async-io-max-request-bytes=16777216. Values must be positive
+            decimal integers without leading zeroes, at most 2147483647;
+            the per-request bound cannot exceed the total byte bound.
+            --with-async-io-shutdown-timeout=30 sets the I/O drain deadline
+            in seconds after notify_shutdown() returns. During the drain,
+            accepted callbacks run but new requests are rejected. Failure
+            to finish makes an otherwise successful exit nonzero.
+
           -P|--inherit <fd-number>
             Inherit filedescriptor <fd-number> from the parent process
             as socket to listen for connections.

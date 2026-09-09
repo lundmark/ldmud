@@ -94,7 +94,7 @@ LDFLAGS=$(PROFIL) @LDFLAGS@
 #smalloc/slaballoc; this combination is bound to cause crashes.
 MFLAGS = "BINDIR=$(BINDIR)" "MUD_LIB=$(MUD_LIB)"
 #
-SRC = access_check.c actions.c applied_decl.c array.c arraylist.c \
+SRC = access_check.c actions.c applied_decl.c array.c arraylist.c async_io.c \
       backend.c bitstrings.c call_out.c closure.c comm.c coroutine.c \
       dumpstat.c ed.c efuns.c files.c gcollect.c hash.c heartbeat.c \
       interpret.c lex.c lwobject.c \
@@ -107,7 +107,7 @@ SRC = access_check.c actions.c applied_decl.c array.c arraylist.c \
       random.c regexp.c sha1.c simulate.c simul_efun.c stdstrings.c \
       stdstructs.c strfuns.c structs.c sprintf.c swap.c types.c \
       unidata.c wiz_list.c xalloc.c 
-OBJ = access_check.o actions.o applied_decl.o array.o arraylist.o \
+OBJ = access_check.o actions.o applied_decl.o array.o arraylist.o async_io.o \
       backend.o bitstrings.o call_out.o closure.o comm.o coroutine.o \
       dumpstat.o ed.o efuns.o files.o gcollect.o hash.o heartbeat.o \
       interpret.o lex.o lwobject.o \
@@ -121,7 +121,21 @@ OBJ = access_check.o actions.o applied_decl.o array.o arraylist.o \
       stdstructs.o strfuns.o structs.o sprintf.o swap.o types.o \
       unidata.o wiz_list.o xalloc.o @ALLOCA@ 
 
-all: make-patchlevel ldmud@EXEEXT@
+ASYNC_IO_HELPER = @ASYNC_IO_HELPER_TARGET@
+
+all: make-patchlevel ldmud@EXEEXT@ $(ASYNC_IO_HELPER)
+
+async_io.o: async_io.c driver.h config.h port.h machine.h async_io.h \
+            typedefs.h async_io_protocol.h actions.h sent.h simulate.h bytecode.h \
+            bytecode_gen.h strfuns.h iconv_opt.h svalue.h backend.h main.h comm.h \
+            pkg-tls.h gcollect.h interpret.h exec.h types.h object.h mstrings.h \
+            hash.h xalloc.h i-current_object.h lwobject.h i-eval_cost.h
+backend.o comm.o files.o gcollect.o interpret.o main.o object.o: async_io.h
+files.o object.o: async_io_protocol.h
+
+# The helper has its own process and uses libc, never the driver allocator.
+ldmud-async-io@EXEEXT@: async_io_worker.c async_io_protocol.h driver.h port.h config.h machine.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ async_io_worker.c
 
 ldmud@EXEEXT@: $(OBJ)
 	$(CC) @OPTIMIZE_LINKING@ $(LDFLAGS) $(OBJ) -o $@ $(LIBS)
@@ -136,9 +150,10 @@ install: install-driver
 	@echo "To install utility programs (incl. erq), use 'make install-utils'."
 	@echo "To install everything in one go, use 'make install-all'."
 
-install-driver: ldmud@EXEEXT@ docs
+install-driver: ldmud@EXEEXT@ $(ASYNC_IO_HELPER) docs
 	$(mkinstalldirs) $(BINDIR) $(MANDIR)/man1
 	$(INSTALL) -c ldmud@EXEEXT@ $(BINDIR)/ldmud@EXEEXT@
+	if test -n "$(ASYNC_IO_HELPER)"; then $(INSTALL) -c $(ASYNC_IO_HELPER) $(BINDIR)/$(ASYNC_IO_HELPER); fi
 	$(INSTALL) -c ../doc/man/ldmud.1 $(MANDIR)/man1/ldmud.1
 
 install-headers: 
@@ -160,6 +175,7 @@ clean:
 	$(RM) efun_defs.c instrs.h lang.y lang.h lang.c y.output tags TAGS
 	$(RM) applied_decl.c
 	$(RM) ldmud@EXEEXT@ core mudlib/core mudlib/debug.log lpmud.log
+	$(RM) ldmud-async-io@EXEEXT@
 	(cd util ; echo "Cleaning in util." ; $(MAKE) clean)
 
 distclean: clean

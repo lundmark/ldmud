@@ -216,6 +216,11 @@ AC_MY_ARG_ENABLE(share-variables,no,,[Enable clone initialization from blueprint
 AC_MY_ARG_ENABLE(keyword-in,no,,[Enable 'in' as a keyword])
 AC_MY_ARG_ENABLE(use-ipv6,no,,[Enables support for IPv6])
 AC_MY_ARG_ENABLE(use-anl,no,,[Enable asynchronous name lookup using C-Ares])
+AC_MY_ARG_ENABLE(use-async-io,no,,[Enable asynchronous file writes and object saves])
+AC_MY_ARG_WITH(async-io-max-requests,1024,,[Maximum outstanding asynchronous file requests])
+AC_MY_ARG_WITH(async-io-max-bytes,67108864,,[Maximum outstanding asynchronous file payload bytes])
+AC_MY_ARG_WITH(async-io-max-request-bytes,16777216,,[Maximum bytes in one asynchronous file request])
+AC_MY_ARG_WITH(async-io-shutdown-timeout,30,,[Seconds to drain asynchronous file requests at shutdown])
 AC_MY_ARG_ENABLE(use-mccp,no,,[Enables MCCP support])
 AC_MY_ARG_ENABLE(use-mysql,no,,[Enables mySQL support])
 AC_MY_ARG_ENABLE(use-pgsql,no,,[Enables PostgreSQL support])
@@ -518,6 +523,7 @@ AC_CDEF_FROM_ENABLE(keyword_in)
 AC_CDEF_FROM_ENABLE(use_mccp)
 AC_CDEF_FROM_ENABLE(use_ipv6)
 AC_CDEF_FROM_ENABLE(use_anl)
+AC_CDEF_FROM_ENABLE(use_async_io)
 AC_CDEF_FROM_ENABLE(use_deprecated)
 AC_CDEF_FROM_ENABLE(use_parse_command)
 AC_CDEF_FROM_ENABLE(use_process_string)
@@ -626,6 +632,32 @@ AC_INT_VAL_FROM_WITH(pcre_recursion_limit)
 AC_INT_VAL_FROM_WITH(max_net_connects)
 AC_INT_VAL_FROM_WITH(random_period_length)
 AC_INT_VAL_FROM_WITH(valgrind_redzone)
+
+dnl Unlike historical numeric settings, async limits reject malformed input
+dnl instead of silently truncating it. Keep all limits representable on i386.
+AC_UPDATE_VAR(with_async_io_max_requests)
+AC_UPDATE_VAR(with_async_io_max_bytes)
+AC_UPDATE_VAR(with_async_io_max_request_bytes)
+AC_UPDATE_VAR(with_async_io_shutdown_timeout)
+for async_io_setting in max_requests max_bytes max_request_bytes shutdown_timeout; do
+    eval "async_io_value=\$with_async_io_$async_io_setting"
+    case "$async_io_value" in
+        ""|0*|*[[!0-9]]*) AC_MSG_ERROR([async-io limits must be positive decimal integers without leading zeroes]) ;;
+    esac
+    if test "${#async_io_value}" -gt 10; then
+        AC_MSG_ERROR([async-io limits must be at most 2147483647])
+    fi
+    if test "$async_io_value" -lt 1 || test "$async_io_value" -gt 2147483647; then
+        AC_MSG_ERROR([async-io limits must be between 1 and 2147483647])
+    fi
+done
+if test "$with_async_io_max_request_bytes" -gt "$with_async_io_max_bytes"; then
+    AC_MSG_ERROR([async-io per-request bytes must not exceed total outstanding bytes])
+fi
+val_async_io_max_requests=$with_async_io_max_requests
+val_async_io_max_bytes=$with_async_io_max_bytes
+val_async_io_max_request_bytes=$with_async_io_max_request_bytes
+val_async_io_shutdown_timeout=$with_async_io_shutdown_timeout
 
 if test "x$cdef_access_control" = "x#undef"; then
   cdef_access_log="#undef"
@@ -876,6 +908,28 @@ AC_CHECK_FUNCS(mmap getpagesize)
 AC_CHECK_LIB(m,main)
 AC_CHECK_LIB(socket,main)
 AC_CHECK_LIB(nsl,main)
+
+ASYNC_IO_HELPER_TARGET=""
+if test "$enable_use_async_io" = yes; then
+    AC_CHECK_FUNCS([fork socketpair execv waitpid clock_gettime mkstemp])
+    if test "$ac_cv_func_fork" != yes || test "$ac_cv_func_socketpair" != yes \
+        || test "$ac_cv_func_execv" != yes || test "$ac_cv_func_waitpid" != yes \
+        || test "$ac_cv_func_clock_gettime" != yes || test "$ac_cv_func_mkstemp" != yes; then
+        AC_MSG_ERROR([async-io requires POSIX processes, local sockets and a monotonic clock])
+    fi
+    AC_CHECK_HEADERS([sys/un.h sys/select.h])
+    AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <time.h>
+#if !defined(MSG_NOSIGNAL) && !defined(SO_NOSIGPIPE)
+#error async sockets require a per-socket SIGPIPE suppression facility
+#endif
+    ]], [[int family = AF_UNIX; clockid_t clock = CLOCK_MONOTONIC; return family == (int)clock;]])],
+    [], [AC_MSG_ERROR([async-io requires AF_UNIX, CLOCK_MONOTONIC and MSG_NOSIGNAL or SO_NOSIGPIPE])])
+    ASYNC_IO_HELPER_TARGET="ldmud-async-io$EXEEXT"
+fi
+AC_SUBST(ASYNC_IO_HELPER_TARGET)
 
 ERQ_LIBS="$LIBS"
 
@@ -2569,6 +2623,11 @@ AC_SUBST(cdef_share_variables)
 AC_SUBST(cdef_keyword_in)
 AC_SUBST(cdef_use_ipv6)
 AC_SUBST(cdef_use_anl)
+AC_SUBST(cdef_use_async_io)
+AC_SUBST(val_async_io_max_requests)
+AC_SUBST(val_async_io_max_bytes)
+AC_SUBST(val_async_io_max_request_bytes)
+AC_SUBST(val_async_io_shutdown_timeout)
 AC_SUBST(cdef_use_mysql)
 AC_SUBST(cdef_use_pgsql)
 AC_SUBST(cdef_use_sqlite)

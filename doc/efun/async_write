@@ -1,0 +1,62 @@
+SYNOPSIS
+        void async_write(string file, string text, int flag, closure callback)
+
+DESCRIPTION
+        Queue text for background file writing. This efun is available only
+        when the driver is configured with --enable-use-async-io.
+
+        flag 0 appends; flag 1 truncates and overwrites. Other flags are an
+        error. The master valid_write() operation is "write_file" and the
+        H_FILE_ENCODING hook supplies the encoding, as for write_file().
+        Conversion, including its final shift sequence, happens during the
+        call. Embedded NUL characters in text are preserved.
+
+        callback receives one integer: 0 on success, -1 on an I/O or helper
+        failure. It runs later from the backend, never inside async_write().
+        Its command giver is captured at submission. A destroyed callback
+        target is skipped; the accepted write still happens. Errors raised
+        by a callback do not prevent later completions.
+
+        Permission, argument, conversion, allocation and queue-limit errors
+        are raised synchronously. Such a request is not accepted, touches no
+        destination, and has no callback. Calls also fail synchronously if
+        the helper is unavailable or orderly shutdown is draining the queue.
+
+        async_write() and async_save_object() share one FIFO. Accepted file
+        operations and callbacks are ordered by publication, including writes
+        to different paths. A request submitted recursively by a permission
+        or encoding hook is published before its outer request. Existing
+        synchronous efuns and external writers do not participate in this
+        ordering. Wait for completion before rotating a log or synchronously
+        replacing or reading an asynchronously written file.
+
+        Preparation and an immutable byte copy remain on the driver thread.
+        A separate helper performs the open, write and close operations.
+        The default limits are 1024 outstanding requests, 64 MiB outstanding
+        payload capacity, and 16 MiB in one request. In-flight requests count
+        against those limits. Buffer capacity is counted conservatively.
+
+        Append and overwrite failures may leave a partially written file.
+        Requests are never automatically replayed. A lost helper reply can
+        mean that a mutation completed but its result is unknown. The helper
+        remains unavailable until the driver is restarted.
+
+        Success requires a complete write and successful close. It does not
+        imply fsync or survival of power loss. On orderly shutdown, the
+        master notify_shutdown() hook can queue final writes; admission then
+        closes and pending operations drain with a configurable deadline
+        (30 seconds by default). A drain failure makes an otherwise successful
+        exit nonzero. Callback evaluation time is additional to the I/O wait
+        deadline and is subject to the normal evaluation limit.
+
+EXAMPLES
+        void logged(int result)
+        {
+            if (result) debug_message("Log write failed.\n");
+        }
+
+        async_write("log/events", "Player connected.\n", 0, #'logged);
+
+SEE ALSO
+        async_save_object(E), write_file(E), write_bytes(E),
+        valid_write(M), notify_shutdown(M), hook/file_encoding
