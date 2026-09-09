@@ -1,0 +1,89 @@
+SYNOPSIS
+        mapping update_blueprint_result(int id)
+
+DESCRIPTION
+        Read a fresh, non-consuming report for update_blueprint(). Only the
+        requesting object or the master may read it. Unknown, cancelled,
+        expired, evicted, and unauthorized identifiers raise an error.
+        Polling does not execute or advance a request.
+
+        The mapping contains:
+
+          id                    Monotonic request identifier.
+          origin                Canonical source load name.
+          selection             "all" or "explicit".
+          status                "pending" or "failed" in this implementation.
+          candidate_generation  Exact candidate's diagnostic generation label.
+          matched               Surviving selected clones, including current ones.
+          updated               Always zero: migration is not implemented.
+          already_current       Clones with the exact candidate program identity.
+          destroyed             Destroyed identities from the saved explicit set.
+          blueprint_updated     Always zero: migration is not implemented.
+          variable_changes      Generation-specific schema and default evidence.
+          errors                Terminal reason, compiler diagnostics, and schema blockers.
+          completed_at          Completion time in seconds, zero while pending.
+
+        Pending unknowns are zero or empty arrays, including during compiler
+        callbacks. Clone counts exclude the blueprint. All-mode discovery
+        has no admission snapshot from which to count earlier destruction.
+        Strict survivor failures retain the complete discovered counts. If
+        the discovery scan itself exceeds its bound, counts remain zero and
+        its error explicitly states that selection counts are unavailable.
+
+        Each variable_changes entry identifies old_generation and
+        candidate_generation, with matched/added/removed declarations,
+        function slot mappings, and concrete compatibility blockers.
+        Added declarations contain a "default" decision: literal, implicit,
+        shared, or an unsupported/unavailable decision with its reason.
+        A shared decision describes copying a blueprint value without
+        exposing or retaining that live value. Retained initializers are
+        never executed. Literal values are private native preparations.
+
+        Source mode adds one entry for the implicit blueprint generation,
+        even without clones. It has "blueprint": 1 and "blueprint_defaults",
+        containing added-declaration records with the blueprint's own default
+        decisions. The ordinary "added" decisions describe clone defaults
+        when that generation has selected clones, otherwise blueprint defaults;
+        blueprint_defaults distinguishes literal blueprint preparation from
+        clone sharing when both roles have the same old generation. Each
+        actual old generation appears only once in the outer array. The
+        blueprint_blockers array retains source-default preparation blockers.
+
+        The first error has "code" and "message". Compatible preparation
+        ends with IMPLEMENTATION_INCOMPLETE. SCHEMA_INCOMPATIBLE retains
+        generation/layout/default blockers in variable_changes and errors.
+        Each schema error includes old_generation, candidate_generation, and
+        role ("generation" or "blueprint"). Source, target, replacement,
+        compilation, and resource failures give their specific reason.
+        REPORT_SIZE_LIMIT, COMPILE_DIAGNOSTIC_LIMIT, and
+        SCHEMA_DIAGNOSTIC_LIMIT explicitly mean that
+        evidence is incomplete; a bounded minimal explanation remains even
+        when richer report construction fails. Exceptional allocation or
+        callback unwinds may leave only that minimal explanation, including
+        REPORT_ALLOCATION_FAILED or PREPARATION_FAILED.
+
+        Compiler rows have code COMPILE_ERROR or COMPILE_WARNING, file, line,
+        warning (zero or one), and message. Successful compilation warnings
+        are retained too. Collection is bounded to 128 diagnostic rows and
+        65536 diagnostic text bytes and shares the request storage allowance.
+        Each generation/role retains at most 128 concrete schema blockers;
+        overflow adds one SCHEMA_DIAGNOSTIC_LIMIT row and an explicit terminal
+        reason while preserving the bounded declaration evidence.
+        No terminal report holds source/target objects or program pointers.
+
+        Each read returns independent nested arrays and mappings, preserving
+        sharing within the returned value. Mutation or an allocation/evaluation
+        failure while copying cannot consume or change the cached report.
+        Copying is bounded and obeys the caller's normal array/mapping and
+        evaluation limits; it raises instead of returning a partial report.
+        Its byte allowance covers the fixed report fields, outer arrays,
+        copied values, and conservative native identity-table bookkeeping.
+
+        Terminal reports expire exactly 300 seconds after completion. Reads
+        do not renew this time. At most 256 terminal reports are cached;
+        eviction removes the oldest completion, breaking equal-time ties by
+        the lower ID. This cache is separate from pending-request capacity.
+        Requester destruction removes its reports immediately.
+
+SEE ALSO
+        update_blueprint(E)

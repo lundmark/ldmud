@@ -1,0 +1,60 @@
+SYNOPSIS
+        int update_blueprint(string|object source)
+        int update_blueprint(string|object source, int|object* targets)
+
+DESCRIPTION
+        Queue one deferred blueprint update preparation. This experimental
+        implementation requires USE_BLUEPRINT_UPDATE. It does not migrate
+        objects: requests finish with status "failed", and a compatible
+        preparation reports IMPLEMENTATION_INCOMPLETE.
+
+        A string source must name an already loaded ordinary blueprint.
+        The request captures that object and its exact program, then privately
+        compiles the file at execution against its captured parent programs.
+        The source blueprint participates implicitly, even with targets ({}).
+        The candidate is never registered or published as a live program.
+
+        An object source must be the actual loaded ordinary blueprint. Its
+        exact program is the candidate; this mode does not compile a file or
+        implicitly select the source blueprint for an update.
+
+        Omitted targets, or integer zero, select all matching ordinary clones
+        found at execution, after compiler/master callbacks. Other integers
+        are invalid. An array selects only its copied, deduplicated identities.
+        Every input element must be a live same-family clone or the source
+        blueprint. A listed blueprint is excluded from clone counts and is
+        never processed twice. An empty array selects no clones. Changes to
+        the caller's array, including changes during privilege_violation(),
+        do not change the captured selection. Destroyed selected clones are
+        skipped at execution; unsupported surviving members fail the request.
+
+        The master must authorize privilege_violation("update_blueprint",
+        caller, source, targets). Arguments and admission are revalidated
+        after this callback. Invalid arguments, denied privilege, exhausted
+        identifiers, and admission limits raise before assigning an ID.
+        Lightweight callers and special, virtual, replaced, shadowing or
+        shadowed objects are unsupported. Pending replace_program() work in
+        the same family also blocks admission or execution.
+
+        The positive ID increases monotonically for the lifetime of the
+        driver. Submission performs no compilation or migration. A request
+        gets one attempt at the next periodic backend tick after the current
+        stack returns, before heartbeat dispatch. Nested submissions wait
+        for the following tick. Processing also runs without object heartbeats.
+        Destruction of the requester cancels its pending/in-flight requests
+        and removes its cached reports. Source destruction or reloading cannot
+        substitute a new identity for the captured source.
+
+        Configurable defaults are 64 pending/in-flight requests globally,
+        8 per owner, 10000 selected clones, 1000000 examined objects/raw array
+        entries, 1000000 processed variable slots, 64 MiB per request for
+        retained preparation/report storage, and literal nesting depth 64.
+        Only one pending/in-flight request may reserve a canonical family,
+        including disjoint explicit selections. Clone quotas apply after
+        deduplication; raw input examination has its own bound. Schema work
+        and storage are shared across generations and initializer decisions.
+        The byte allowance is per request, not a global byte reservation.
+        Temporary compilation and LPC values also obey normal driver limits.
+
+SEE ALSO
+        update_blueprint_result(E), replace_program(E), clones(E)

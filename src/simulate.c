@@ -1867,6 +1867,7 @@ typedef struct compile_check_context_s
     compile_check_diag_t *diag;
     size_t num_diag;
     size_t max_diag;
+    size_t diagnostic_bytes;
     compile_check_program_t *programs;
     size_t num_programs;
     size_t max_programs;
@@ -2197,6 +2198,20 @@ compile_check_add_diag (compile_check_context_t *ctx, const char *file
     file_text = file != NULL ? file : "";
     message_text = message != NULL ? message : "";
 
+#ifdef USE_BLUEPRINT_UPDATE
+    if (ctx->expected)
+    {
+        size_t bytes = strlen(file_text) + strlen(message_text);
+        if (ctx->num_diag == BLUEPRINT_UPDATE_MAX_DIAGNOSTICS
+         || bytes > BLUEPRINT_UPDATE_MAX_DIAGNOSTIC_BYTES - ctx->diagnostic_bytes)
+        {
+            program_update_compile_failure("COMPILE_DIAGNOSTIC_LIMIT",
+                "Compiler diagnostic limit exceeded; evidence is incomplete.");
+            goto resource_failure;
+        }
+        ctx->diagnostic_bytes += bytes;
+    }
+#endif
     if (ctx->num_diag == ctx->max_diag)
     {
         size_t new_max;
@@ -2540,6 +2555,7 @@ push_compile_check_cleanup (void)
     cleanup->ctx.diag = NULL;
     cleanup->ctx.num_diag = 0;
     cleanup->ctx.max_diag = 0;
+    cleanup->ctx.diagnostic_bytes = 0;
     cleanup->ctx.programs = NULL;
     cleanup->ctx.num_programs = 0;
     cleanup->ctx.max_programs = 0;
@@ -2913,6 +2929,15 @@ compile_update_candidate (string_t *origin, program_t *expected, program_t **res
     {
         *result = cleanup->ctx.programs[0].prog;
         cleanup->ctx.programs[0].prog = NULL;
+    }
+    if (cleanup->ctx.resource_failed || cleanup->ctx.types.failed)
+        program_update_compile_failure("COMPILE_RESOURCE_FAILED", "Insufficient resources compiling the candidate.");
+    else if (cleanup->ctx.callback_failed)
+        program_update_compile_failure("COMPILE_CALLBACK_FAILED", "Compiler callback failed or invalidated the request.");
+    for (size_t i = 0; i < cleanup->ctx.num_diag; i++)
+    {
+        compile_check_diag_t *diag = &cleanup->ctx.diag[i];
+        program_update_compile_diagnostic(diag->file, diag->line, diag->warning, diag->message);
     }
     pop_stack(); /* Compiler context, including private type scratch. */
 } /* compile_update_candidate() */

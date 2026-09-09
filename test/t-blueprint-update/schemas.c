@@ -30,7 +30,10 @@ void inspect()
         require(result["status"] == "failed" && result["updated"] == 0, "diagnostics do not migrate");
         if (spec[0] == "budget boundary")
         {
-            require(sizeof(changes) == 2
+            require((!sizeof(changes) && result["errors"][0]["code"] == "REPORT_SIZE_LIMIT"
+                      && result["matched"] == 2
+                      && strstr(result["errors"][0]["message"], "incomplete") >= 0)
+                    || sizeof(changes) == 2
                     || (sizeof(changes) == 1
                         && member(map(changes[0]["blockers"], (: $1["code"] :)),
                                   "SCHEMA_MEMORY_LIMIT") >= 0),

@@ -124,8 +124,14 @@ void inspect()
         }
         require(result["status"] == "failed" && result["updated"] == 0,
                 spec[0] + ": preparation never migrates");
-        require(result["errors"][0]["code"] == spec[3], spec[0] + ": terminal outcome");
-        if (spec[3] == "IMPLEMENTATION_INCOMPLETE")
+        if (spec[3] == "VALIDATION_FAILED")
+            require(member(({"COMPILE_FAILED", "COMPILE_RESOURCE_FAILED", "COMPILE_CALLBACK_FAILED",
+                            "SOURCE_INVALIDATED", "RESOURCE_FAILED", "PREPARATION_FAILED", "REPORT_ALLOCATION_FAILED"}),
+                           result["errors"][0]["code"]) >= 0
+                    && sizeof(result["errors"][0]["message"]), spec[0] + ": precise terminal failure");
+        else
+            require(result["errors"][0]["code"] == spec[3], spec[0] + ": terminal outcome");
+        if (spec[3] == "IMPLEMENTATION_INCOMPLETE" || spec[3] == "SCHEMA_INCOMPATIBLE")
         {
             require(result["candidate_generation"] > 0, spec[0] + ": candidate retained for schema comparison");
             require(sizeof(result["variable_changes"]) == 1, spec[0] + ": old generation described");
@@ -345,17 +351,17 @@ void run(closure callback)
         ({"ambiguous parent", "inherit \"staging_left\"; inherit \"staging_right\";\n" + simple,
             "inherit \"staging_parent\";\n" + simple, "VALIDATION_FAILED"}),
         ({"equivalent struct", structure, structure + "#include \"staging_hook.h\"\n", "IMPLEMENTATION_INCOMPLETE"}),
-        ({"struct prototype", structure, changed_structure, "IMPLEMENTATION_INCOMPLETE"}),
+        ({"struct prototype", structure, changed_structure, "SCHEMA_INCOMPATIBLE"}),
         ({"failed prototype", structure, changed_structure + "struct never_defined;\n", "VALIDATION_FAILED"}),
         ({"hidden parent struct", "inherit \"staging_parent\";\n" + structure,
-            "inherit \"staging_parent\";\n" + changed_structure, "IMPLEMENTATION_INCOMPLETE"}),
+            "inherit \"staging_parent\";\n" + changed_structure, "SCHEMA_INCOMPATIBLE"}),
         ({"private struct", structure,
             "#pragma strong_types, rtt_checks\n"
             "struct data { int first; string second; }; struct data value;\n"
             "#include \"staging_hook.h\"\n"
             "int version() { return 2; }\n"
             "string candidate_member(struct data arg) { return arg.second; }\n",
-            "IMPLEMENTATION_INCOMPLETE"}),
+            "SCHEMA_INCOMPATIBLE"}),
         ({"destroy source", simple,
             "#include \"staging_hook.h\"\n#include \"staging_hook.h\"\nint version() { return 2; }\n",
             "VALIDATION_FAILED"}),

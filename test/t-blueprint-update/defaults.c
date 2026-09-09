@@ -196,21 +196,28 @@ void inspect_shared()
                 "source default preparation leaves loaded blueprint unchanged");
         if (shared_case < 2)
         {
-            mixed *added = report["variable_changes"][0]["added"];
+            mixed *generations = filter(report["variable_changes"],
+                (: sizeof(filter($1["added"], (: $1["name"] == "shared_value" :))) :));
+            require(sizeof(generations) == 1, "clone generation with shared addition is unique");
+            mixed *added = generations[0]["added"];
             mixed *entries = filter(added, (: $1["name"] == "shared_value" :));
             require(sizeof(entries) == 1 && entries[0]["default"]["kind"] == "shared",
                     sprintf("shared case %d unsupported initializer uses loaded blueprint decision: %O", shared_case, entries));
             require(!member(entries[0]["default"], "value"),
                     "shared live value does not enter terminal report");
-            require(!sizeof(report["variable_changes"][0]["blockers"]),
+            require(!sizeof(generations[0]["blockers"]),
                     "retained blueprint initializer is not demanded");
             require(previous.version() == 1, "old clone remains executable");
         }
         else
         {
-            require(!sizeof(report["variable_changes"]), "empty target set has no clone generation");
+            require(sizeof(report["variable_changes"]) == 1
+                    && report["variable_changes"][0]["blueprint"] && !report["matched"],
+                    "empty target set retains complete implicit blueprint evidence");
+            require(sizeof(report["variable_changes"][0]["blueprint_defaults"]) == 1,
+                    "required blueprint addition is described even without clones");
             require(report["errors"][0]["code"] == (shared_case == 2
-                        ? "IMPLEMENTATION_INCOMPLETE" : "VALIDATION_FAILED"),
+                        ? "IMPLEMENTATION_INCOMPLETE" : "SCHEMA_INCOMPATIBLE"),
                     "empty target set still validates needed blueprint defaults");
         }
         clean();

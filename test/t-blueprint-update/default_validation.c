@@ -32,7 +32,7 @@ void inspect()
         if (sizeof(cases[current]) > 5)
         {
             require(report["errors"][0]["code"] == (cases[current][5] == 1
-                        ? "VALIDATION_FAILED" : "IMPLEMENTATION_INCOMPLETE"),
+                        ? "SCHEMA_INCOMPATIBLE" : "IMPLEMENTATION_INCOMPLETE"),
                     cases[current][0] + ": selective nonfinite default demand");
             require(previous.version() == 1 && blueprint.version() == 1,
                     "nonfinite candidate initialization never executes");

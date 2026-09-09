@@ -42,8 +42,11 @@ void inspect()
         string label = sprintf("point %d countdown %d mode %d recovery %d",
                                cases[current][0], cases[current][1], cases[current][2], recovering);
         require(report["status"] == "failed" && !report["updated"], label + ": no migration");
-        require(report["errors"][0]["code"] == (recovering || cases[current][0] == 99
-                   ? "IMPLEMENTATION_INCOMPLETE" : "VALIDATION_FAILED"), label + ": expected failure boundary");
+        require(recovering || cases[current][0] == 99
+                ? report["errors"][0]["code"] == "IMPLEMENTATION_INCOMPLETE"
+                : member(({"PREPARATION_FAILED", "COMPILE_FAILED", "COMPILE_RESOURCE_FAILED",
+                           "RESOURCE_FAILED", "REPORT_ALLOCATION_FAILED"}), report["errors"][0]["code"]) >= 0,
+                label + ": expected precise failure boundary");
         if (!recovering && cases[current][0] != 99)
             require(!sizeof(report["variable_changes"]), label + ": no partial terminal report");
         require(previous.retained_value() == 41 && blueprint.retained_value() == 41,

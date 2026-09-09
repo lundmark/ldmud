@@ -15,9 +15,13 @@ mixed include_file(string path, string from, int system)
 #ifdef __BLUEPRINT_UPDATE__
     if (path == "staging_hook.h" && find_object("staging"))
         find_object("staging").compiler_hook();
+    if (path == "requests_hook.h" && find_object("requests"))
+        find_object("requests").compiler_hook();
 #endif
     return 0;
 }
+
+int query_allow_shadow(object ob) { return 1; }
 
 string *get_simul_efun()
 {
@@ -30,6 +34,9 @@ int privilege_violation(string operation, mixed who, mixed source, mixed targets
 {
     if (operation != "update_blueprint")
         return 1;
+#ifdef __BLUEPRINT_UPDATE__
+    if (find_object("request_cache")) find_object("request_cache").authorize(source);
+#endif
     if (deny_update == 2)
         targets[0] = this_object();
     else if (deny_update == 3)
@@ -94,7 +101,11 @@ void terminal_gc_done(int failed)
             else load_object("schemas").run(function void(int failed)
             {
                 if (failed) finish(failed);
-                else load_object("defaults").run(#'finish);
+                else load_object("defaults").run(function void(int failed)
+                {
+                    if (failed) finish(failed);
+                    else load_object("requests").run(#'finish);
+                });
             });
         });
     }
@@ -108,7 +119,7 @@ void check_invalidated_source(int from_path)
             mapping report = update_blueprint_result(pending_id);
             require(report["status"] == "failed" && report["updated"] == 0
                     && sizeof(report["errors"])
-                    && report["errors"][0]["code"] == "VALIDATION_FAILED",
+                    && report["errors"][0]["code"] == "SOURCE_INVALIDATED",
                     from_path ? "deferred string source invalidation"
                               : "deferred object source invalidation");
             require(replacement.behavior_version() == 2
@@ -235,8 +246,28 @@ void run_test()
     object blueprint;
 
     msg("\nRunning blueprint update lifecycle tests:\n");
-    call_out(#'finish, 180 * __ALARM_TIME__, 1);
+    call_out(#'finish, 240 * __ALARM_TIME__, 1);
 #ifdef __BLUEPRINT_UPDATE__
+    if (file_size("request-diagnostics-only") >= 0)
+    {
+        load_object("request_diagnostics").run(#'finish);
+        return;
+    }
+    if (file_size("request-faults-only") >= 0)
+    {
+        load_object("request_faults").run(#'finish);
+        return;
+    }
+    if (file_size("request-cache-only") >= 0)
+    {
+        load_object("request_cache").run(#'finish);
+        return;
+    }
+    if (file_size("requests-only") >= 0)
+    {
+        load_object("requests").run(#'finish);
+        return;
+    }
     if (file_size("defaults-faults-only") >= 0)
     {
         remove_call_out(#'finish);

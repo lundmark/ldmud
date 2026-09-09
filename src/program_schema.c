@@ -56,6 +56,7 @@ typedef struct schema_compare_s
     schema_budget_t *budget;
     vector_t *prepared;       /* Request-rooted literal source additions only. */
     Bool preparing_blueprint;
+    vector_t *source_defaults; /* Borrowed, rooted source-only descriptions. */
 } schema_compare_t;
 
 /*-------------------------------------------------------------------------*/
@@ -124,13 +125,21 @@ static void
 blocker (schema_compare_t *ctx, const char *code,
          const schema_identity_t *identity)
 
-/* Keep bounded explanatory evidence. Exceeding the cap remains a blocker;
- * compatibility is never inferred from a truncated diagnostic list.
+/* Keep bounded explanatory evidence plus one reserved overflow row.
+ * An explicit marker distinguishes complete evidence at the cap from an
+ * incomplete prefix; subsequent blockers never overwrite that marker.
  */
 {
     mapping_t *record;
-    if (ctx->num_blockers == SCHEMA_MAX_BLOCKERS)
+    if (ctx->num_blockers > SCHEMA_MAX_BLOCKERS)
         return;
+    if (ctx->num_blockers == SCHEMA_MAX_BLOCKERS)
+    {
+        record = new_record(&ctx->blockers->item[ctx->num_blockers++]);
+        put_c_string(field(record, "code"), "SCHEMA_DIAGNOSTIC_LIMIT");
+        put_c_string(field(record, "message"), "Schema diagnostic limit exceeded; evidence is incomplete.");
+        return;
+    }
     record = new_record(&ctx->blockers->item[ctx->num_blockers++]);
     put_c_string(field(record, "code"), code);
     if (identity)
@@ -861,7 +870,25 @@ compare_variables (schema_compare_t *ctx, program_t *old, program_t *next)
                 {
                     svalue_t *entry = &added->u.vec->item[additions++];
                     declaration(entry, &id, -1, i);
-                    if (!describe_default(ctx, next, i, &id, entry))
+                    if (ctx->source_defaults)
+                    {
+                        /* This is the same pinned old/candidate pair as the
+                         * source prepass, whose additions are in slot order.
+                         * Reuse its immutable decision without demanding a
+                         * hypothetical clone initializer or another literal.
+                         */
+                        if ((size_t)additions <= VEC_SIZE(ctx->source_defaults)
+                         && field(ctx->source_defaults->item[additions - 1].u.map,
+                                  "new_slot")->u.number == i)
+                            assign_svalue_no_free(field(entry->u.map, "default"),
+                                field(ctx->source_defaults->item[additions - 1].u.map, "default"));
+                        else
+                        {
+                            blocker(ctx, "UNAVAILABLE_BLUEPRINT_DEFAULT", &id);
+                            defaults_ready = MY_FALSE;
+                        }
+                    }
+                    else if (!describe_default(ctx, next, i, &id, entry))
                         defaults_ready = MY_FALSE;
                     if (ctx->preparing_blueprint)
                     {
@@ -979,9 +1006,10 @@ finish:
     trim(functions, count);
 } /* compare_functions() */
 
-Bool
-program_schema_compare (program_t *old, program_t *candidate, svalue_t *result,
-                        schema_budget_t *budget, vector_t *prepared, Bool preparing_blueprint)
+static Bool
+compare_schema (program_t *old, program_t *candidate, svalue_t *result,
+                schema_budget_t *budget, vector_t *prepared, Bool preparing_blueprint,
+                vector_t *source_defaults)
 
 /* Build a nonmutating map and blockers for one actual old generation.
  * The caller owns both program pins and the rooted zero result. No program
@@ -992,7 +1020,7 @@ program_schema_compare (program_t *old, program_t *candidate, svalue_t *result,
     svalue_t *blocks;
     Bool defaults_ready = MY_FALSE;
     size_t records = (size_t)old->num_variables + candidate->num_variables
-                     + old->num_functions + SCHEMA_MAX_BLOCKERS + 1;
+                     + old->num_functions + SCHEMA_MAX_BLOCKERS + 2;
     /* Keep one record unit in reserve. Zero is exclusively the explicit
      * memory-limit sentinel used by the request to stop further generation
      * discovery; successful exact exhaustion must never silently truncate it.
@@ -1013,10 +1041,11 @@ program_schema_compare (program_t *old, program_t *candidate, svalue_t *result,
     ctx.budget = budget;
     ctx.prepared = prepared;
     ctx.preparing_blueprint = preparing_blueprint;
+    ctx.source_defaults = source_defaults;
     put_number(field(ctx.report, "old_generation"), old->schema_generation);
     put_number(field(ctx.report, "candidate_generation"), candidate->schema_generation);
     blocks = field(ctx.report, "blockers");
-    put_array(blocks, allocate_array_unlimited(SCHEMA_MAX_BLOCKERS));
+    put_array(blocks, allocate_array_unlimited(SCHEMA_MAX_BLOCKERS + 1));
     ctx.blockers = blocks->u.vec;
     if (!within_budget)
         blocker(&ctx, "SCHEMA_MEMORY_LIMIT", NULL);
@@ -1057,7 +1086,30 @@ program_schema_compare (program_t *old, program_t *candidate, svalue_t *result,
 finish:
     trim(blocks, ctx.num_blockers);
     return preparing_blueprint ? defaults_ready : ctx.num_blockers == 0;
-} /* program_schema_compare() */
+} /* compare_schema() */
+
+Bool
+program_schema_compare (program_t *old, program_t *candidate, svalue_t *result,
+                        schema_budget_t *budget, vector_t *prepared, Bool preparing_blueprint)
+{
+    return compare_schema(old, candidate, result, budget, prepared,
+                          preparing_blueprint, NULL);
+}
+
+Bool
+program_schema_compare_blueprint(program_t *old, program_t *candidate,
+                                svalue_t *result, schema_budget_t *budget,
+                                svalue_t *preparation)
+/* Complete source-only compatibility without preparing clone defaults.
+ * Both rooted reports use the same pinned pair. The prepass remains the
+ * authority for literal/default decisions, including its failure evidence.
+ */
+{
+    vector_t *defaults = field(preparation->u.map, "added")->u.vec;
+    Bool compatible = compare_schema(old, candidate, result, budget, NULL,
+                                     MY_FALSE, defaults);
+    return compatible && !VEC_SIZE(field(preparation->u.map, "blockers")->u.vec);
+}
 
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
 #include "object.h"

@@ -28,6 +28,13 @@ extern void program_update_default_test_pressure(int point);
 
 #ifdef USE_BLUEPRINT_UPDATE
 
+#define BLUEPRINT_UPDATE_MAX_DIAGNOSTICS 128
+#define BLUEPRINT_UPDATE_MAX_DIAGNOSTIC_BYTES 65536
+
+extern void program_update_compile_failure(const char *code, const char *message);
+extern void program_update_compile_diagnostic(string_t *file, int line, Bool warning,
+                                              string_t *message);
+
 /* --- LPC request and report interface --- */
 
 extern svalue_t *v_update_blueprint(svalue_t *sp, int num_arg);
