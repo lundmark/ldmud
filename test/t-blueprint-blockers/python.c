@@ -30,7 +30,11 @@ void inspect()
     mixed err = catch(
         require(blueprint_outcome(report) == expected,
                 sprintf("case %d expected %s, got %O", phase, expected, report["errors"])),
-        require(report["matched"] == 1 && report["updated"] == (expected == "completed" ? 1 : 0), "selection count and no migration"); publish);
+        require(report["matched"] == 1 && report["updated"] == (expected == "completed" ? 1 : 0), "selection count and atomic migration"),
+        require(target.read_value() == 41, "target retains its value"),
+        require(phase % 2 || member(({6,7,15,16}), phase / 2) < 0
+             || blocker_check_native(target, phase / 2),
+                "retained native wrapper and transient indexed conversion resolve shifted slots"); publish);
     if (err) { clean(); funcall(done, 1); return; }
     msg("PYTHON_BLOCKER_CASE %d: %s\n", phase, expected);
     phase++;
@@ -73,11 +77,19 @@ void next()
     if (catch(funcall(function void()
     {
         int kind = phase / 2;
-        write_file("python_target.c", "#include \"target.inc\"\n");
+        write_file("python_target.c", "#pragma save_types\n#include \"target.inc\"\n");
         blueprint = load_object("python_target");
         target = clone_object(blueprint);
         blocker_hold(target, kind);
-        expected = phase % 2 || kind == 11 || kind == 12 ? "completed"
+        /* Both native closure indices move. The unrelated leading slots
+         * return distinct values so stale dispatch cannot pass by accident.
+         */
+        rm("python_target.c");
+        write_file("python_target.c", "#pragma save_types\n"
+                   "int shifted_variable = 912;\n"
+                   "int shifted_function() { return -123; }\n"
+                   "#include \"target.inc\"\n");
+        expected = phase % 2 || member(({6,7,11,12,15,16}), kind) >= 0 ? "completed"
                  : kind < 6 || kind == 13 || kind == 14 ? "PYTHON_HANDLE"
                  : kind == 10 ? "LIVE_COROUTINE" : "LIVE_CLOSURE";
         start_gc(#'collected);

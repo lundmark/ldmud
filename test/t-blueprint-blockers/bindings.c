@@ -141,6 +141,7 @@ void next()
                 expected = "completed";
                 break;
         }
+        if (member(({0,1,2,10,14}),phase) >= 0) expected = "completed";
         request = phase >= 12 && phase <= 15 ? update_blueprint(blueprint, ({target}))
                               : update_blueprint("bindings_target", ({target}));
         call_out(#'inspect, __ALARM_TIME__ + 1);

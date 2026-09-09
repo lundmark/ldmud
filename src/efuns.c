@@ -6199,9 +6199,9 @@ f_to_int (svalue_t *sp)
 
     case T_CLOSURE:
         if (sp->x.closure_type == CLOSURE_IDENTIFIER)
-            n = sp->u.identifier_closure->var_index;
+            n = closure_identifier_index(sp->u.identifier_closure);
         else if (sp->x.closure_type == CLOSURE_LFUN)
-            n = sp->u.lfun_closure->fun_index;
+            n = closure_lfun_index(sp->u.lfun_closure);
         else
             errorf("Bad arg 1 to to_int(): not a lfun or variable closure.\n");
         free_closure(sp);
@@ -8014,12 +8014,12 @@ convert_to_type (svalue_t *dest, svalue_t *src, lpctype_t *type, struct_t *opts,
             {
                 if (rvalue->x.closure_type == CLOSURE_IDENTIFIER)
                 {
-                    put_number(dest, rvalue->u.identifier_closure->var_index);
+                    put_number(dest, closure_identifier_index(rvalue->u.identifier_closure));
                     return;
                 }
                 else if (rvalue->x.closure_type == CLOSURE_LFUN)
                 {
-                    put_number(dest, rvalue->u.lfun_closure->fun_index);
+                    put_number(dest, closure_lfun_index(rvalue->u.lfun_closure));
                     return;
                 }
             }

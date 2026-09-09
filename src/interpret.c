@@ -21658,17 +21658,17 @@ int_call_lambda (svalue_t *lsvp, int num_arg, bool external, svalue_t *bind_ob)
             current_prog = get_current_object_program();
 
 #ifdef DEBUG
-            if (l->fun_index >= current_prog->num_functions)
+            if (closure_lfun_index(l) >= current_prog->num_functions)
                 fatal("Calling non-existing lfun closure #%hu in program '%s' "
                       "with %hu functions.\n"
-                     , l->fun_index
+                     , closure_lfun_index(l)
                      , get_txt(current_prog->name)
                      , current_prog->num_functions
                     );
 #endif
 
             /* inter_sp == sp */
-            setup_new_frame(l->fun_index, l->inhProg);
+            setup_new_frame(closure_lfun_index(l), l->inhProg);
 
             /* Check arguments. */
             check_function_args(current_prog->function_headers[FUNCTION_HEADER_INDEX(csp->funstart)].offset.fx, current_prog, csp->funstart);
@@ -21725,7 +21725,7 @@ int_call_lambda (svalue_t *lsvp, int num_arg, bool external, svalue_t *bind_ob)
             }
 
             /* Do we have the variable? */
-            if ( cl->var_index == VANISHED_VARCLOSURE_INDEX)
+            if ( closure_identifier_index(cl) == VANISHED_VARCLOSURE_INDEX)
             {
                 errorf("Variable not inherited\n");
                 /* NOTREACHED */
@@ -21741,7 +21741,7 @@ int_call_lambda (svalue_t *lsvp, int num_arg, bool external, svalue_t *bind_ob)
                     fatal("%s Fatal: call_lambda on variable for object %p '%s' "
                           "w/o variables, index %d\n"
                          , time_stamp(), cl->base.ob.u.ob
-                         , get_txt(cl->base.ob.u.ob->name), cl->var_index);
+                         , get_txt(cl->base.ob.u.ob->name), closure_identifier_index(cl));
 #endif
             }
             else
@@ -21752,11 +21752,11 @@ int_call_lambda (svalue_t *lsvp, int num_arg, bool external, svalue_t *bind_ob)
                     fatal("%s Fatal: call_lambda on variable for lightweight object %p '/%s' "
                           "w/o variables, index %d\n"
                          , time_stamp(), cl->base.ob.u.lwob
-                         , get_txt(cl->base.ob.u.lwob->prog->name), cl->var_index);
+                         , get_txt(cl->base.ob.u.lwob->prog->name), closure_identifier_index(cl));
 #endif
             }
 
-            assign_svalue_no_free(++sp, vars+cl->var_index);
+            assign_svalue_no_free(++sp, vars+closure_identifier_index(cl));
             inter_sp = sp;
             return;
         }
@@ -24083,6 +24083,9 @@ count_extra_ref_in_object (object_t *ob)
     }
 
     ob->extra_ref = 1;
+#ifdef USE_BLUEPRINT_UPDATE
+    closure_check_object_bindings(ob);
+#endif
     if ( !O_PROG_SWAPPED(ob) )
     {
         ob->prog->extra_ref++;

@@ -56,6 +56,7 @@ typedef struct schema_compare_s
     schema_budget_t *budget;
     vector_t *prepared;       /* Request-rooted literal source additions only. */
     Bool preparing_blueprint;
+    Bool identity_only;        /* Nonallocating closure-construction query. */
     vector_t *source_defaults; /* Borrowed, rooted source-only descriptions. */
 } schema_compare_t;
 
@@ -131,6 +132,8 @@ blocker (schema_compare_t *ctx, const char *code,
  */
 {
     mapping_t *record;
+    if (ctx->identity_only)
+        return;
     if (!ctx->blockers)
         errorf("update_blueprint(): variable preparation failed (%s).\n", code);
     if (ctx->num_blockers > SCHEMA_MAX_BLOCKERS)
@@ -309,6 +312,86 @@ same_identity (const schema_identity_t *left, const schema_identity_t *right)
     return mstreq(left->program->name, right->program->name)
         && mstreq(left->name, right->name) && !strcmp(left->path, right->path);
 } /* same_identity() */
+
+size_t
+program_schema_named_key (const program_t *prog, int slot,
+                          const program_t *inherited, Bool variable,
+                          char *key, schema_budget_t *budget)
+
+/* Use the same declaration resolver as migration. Explicit inherited
+ * dispatch follows the physical inherit blocks before resolving overrides,
+ * exactly as closure dispatch does. The occurrence remains rooted at the
+ * execution object's program, even when the declaring parent is shared.
+ */
+{
+    schema_identity_t id = { .path = "$" };
+    schema_compare_t ctx = { .budget = budget, .identity_only = MY_TRUE };
+    function_t *head;
+    size_t length, used;
+    int depth = 0;
+    Bool cross_defined = MY_FALSE;
+    char dispatch[SCHEMA_PATH_SIZE] = "$";
+
+    if (slot < 0 || slot >= (variable ? prog->num_variables : prog->num_functions))
+        return 0;
+    if (inherited)
+    {
+        while (prog != inherited)
+        {
+            const inherit_t *edge;
+            int ordinal = 0;
+            if (!spend_work(&ctx) || ++depth >= SCHEMA_MAX_DEPTH)
+                return 0;
+            edge = search_function_inherit(prog, slot);
+            if (edge == prog->inherit + prog->num_inherited)
+                return 0;
+            /* Explicit closures preserve the function-table entry route,
+             * even when several virtual entries reach one shared declaring
+             * program. The graph fixes these edge ordinals; root offsets
+             * can move. Do not apply edge_path's virtual canonicalization
+             * to this separate dispatch identity.
+             */
+            used = strlen(dispatch);
+            int written = snprintf(dispatch + used, sizeof(dispatch) - used,
+                                   "/%d", (int)(edge - prog->inherit));
+            if (written < 0 || (size_t)written >= sizeof(dispatch) - used)
+                return 0;
+            for (const inherit_t *p = prog->inherit; p < edge; p++)
+            {
+                if (!spend_work(&ctx)) return 0;
+                if (p->inherit_depth == 1) ordinal++;
+            }
+            if (!edge_path(&id, edge, ordinal)) return 0;
+            slot -= edge->function_index_offset;
+            prog = edge->prog;
+        }
+    }
+    if (!variable)
+        cross_defined = !!(prog->functions[slot] & NAME_CROSS_DEFINED);
+    if (!(variable ? variable_identity(&ctx, prog, slot, &id, depth)
+                   : function_identity(&ctx, prog, slot, &id, depth, &head))
+     || !id.declared)
+        return 0;
+    length = strlen(id.path) + 1;
+    used = strlen(dispatch) + 2;
+    if (length + used + mstrsize(id.program->name) + mstrsize(id.name) + 2 > SCHEMA_NAMED_KEY_SIZE)
+        return 0;
+    /* Literal closures normalize cross-defined aliases before construction.
+     * Do not translate their real slot back onto a lower alias: fresh literal
+     * closures must find the same binding. Keep any explicitly constructed
+     * alias distinct, matching the existing physical-index comparison.
+     */
+    key[0] = cross_defined ? 'C' : 'D';
+    memcpy(key + 1, dispatch, used - 1);
+    memcpy(key + used, id.path, length);
+    used += length;
+    length = mstrsize(id.program->name) + 1;
+    memcpy(key + used, get_txt(id.program->name), length);
+    used += length;
+    length = mstrsize(id.name) + 1;
+    memcpy(key + used, get_txt(id.name), length);
+    return used + length;
+} /* program_schema_named_key() */
 
 static void
 declaration (svalue_t *root, const schema_identity_t *identity, int old, int next)
@@ -1101,7 +1184,7 @@ compare_schema (program_t *old, program_t *candidate, svalue_t *result,
  * pointers escape: cached reports survive program retirement independently.
  */
 {
-    schema_compare_t ctx;
+    schema_compare_t ctx = {0};
     svalue_t *blocks;
     Bool defaults_ready = MY_FALSE;
     size_t records = (size_t)old->num_variables + candidate->num_variables

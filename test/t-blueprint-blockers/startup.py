@@ -5,6 +5,7 @@ held = None
 finalizations = 0
 releasing_binding = False
 coherent_finalizations = 0
+native_slot = None
 
 
 class ReferenceChurn:
@@ -22,7 +23,7 @@ class ReferenceChurn:
 
 
 def blocker_hold(ob: ldmud.Object, kind: int) -> None:
-    global held
+    global held, native_slot
     if kind == 0:
         held = ob.functions.read_value
     elif kind == 1:
@@ -68,6 +69,31 @@ def blocker_hold(ob: ldmud.Object, kind: int) -> None:
         remote.functions.keep(ReferenceChurn(ob))
         held = ldmud.LfunClosure(ob, "read_value", remote)
         del remote
+    if kind in (6, 7, 15, 16):
+        native_slot = ldmud.efuns.to_int(held)
+
+
+def blocker_check_native(ob: ldmud.Object, kind: int) -> int:
+    assert held.object == ob
+    assert held() == 41
+    assert ldmud.efuns.to_int(held) != native_slot
+    if kind == 7:
+        fresh = ldmud.IdentifierClosure(ob, "value")
+        assert held == fresh
+        indexed = held.variable
+        assert indexed.name == "value"
+        assert indexed.value == 41
+    else:
+        assert held.bound_object == ldmud.get_master()
+        fresh = ldmud.LfunClosure(ob, "read_value", ldmud.get_master())
+        assert held == fresh
+        indexed = held.lfun
+        assert indexed.name == "read_value"
+        assert indexed() == 41
+    # Indexed Python handles remain blockers. These conversions
+    # are deliberately temporary and unwind before the next publication.
+    del indexed, fresh
+    return 1
 
 
 def blocker_rebind() -> None:
@@ -91,6 +117,7 @@ def blocker_drop() -> None:
 
 
 ldmud.register_efun("blocker_hold", blocker_hold)
+ldmud.register_efun("blocker_check_native", blocker_check_native)
 ldmud.register_efun("blocker_drop", blocker_drop)
 ldmud.register_efun("blocker_rebind", blocker_rebind)
 ldmud.register_efun("blocker_binding_references", blocker_binding_references)

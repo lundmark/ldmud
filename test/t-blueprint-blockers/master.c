@@ -71,7 +71,8 @@ void next()
             int kind = step / 2;
             label = sprintf("closure %d %s", kind, step % 2 ? "released after admission" : "retained");
             held = target.handle(kind);
-            if (!(step % 2) && kind < 13) expected = "LIVE_CLOSURE";
+            if (!(step % 2) && kind < 13
+             && member(({0,1,6,7,8,10}),kind) < 0) expected = "LIVE_CLOSURE";
         }
         else if (step < 39)
         {
@@ -96,8 +97,7 @@ void next()
         }
         else
         {
-            label = "closure created after admission";
-            expected = "LIVE_CLOSURE";
+            label = "named closure created after admission";
         }
         request = update_blueprint("target", ({target}));
         if (step == 39) held = target.handle(0);

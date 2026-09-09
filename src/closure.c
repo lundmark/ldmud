@@ -101,6 +101,7 @@
 #include "array.h"
 #include "backend.h"
 #include "exec.h"
+#include "gcollect.h"
 #include "instrs.h"
 #include "interpret.h"
 #include "lex.h"
@@ -109,6 +110,7 @@
 #include "mstrings.h"
 #include "object.h"
 #include "prolang.h"
+#include "program_schema.h"
 #include "simulate.h"
 #include "simul_efun.h"
 #include "stdstrings.h"
@@ -397,6 +399,31 @@ find_function (const string_t *name, const program_t *prog)
 } /* find_function() */
 
 /*-------------------------------------------------------------------------*/
+static p_uint
+closure_comparison_rank (const closure_base_t *cl, unsigned short index)
+{
+#ifdef USE_BLUEPRINT_UPDATE
+    if (cl->named) return cl->named->rank;
+#endif
+    return index;
+}
+
+static int
+closure_index_cmp (const closure_base_t *left, unsigned short li,
+                   const closure_base_t *right, unsigned short ri)
+{
+    p_uint lrank = closure_comparison_rank(left, li);
+    p_uint rrank = closure_comparison_rank(right, ri);
+    if (lrank != rrank) return lrank < rrank ? -1 : 1;
+#ifdef USE_BLUEPRINT_UPDATE
+    /* A generated closure created after an update can occupy a retained
+     * declaration's original slot number. It is never that declaration.
+     */
+    if (!!left->named != !!right->named) return left->named ? 1 : -1;
+#endif
+    return 0;
+}
+
 Bool
 closure_eq (svalue_t * left, svalue_t * right)
 
@@ -417,7 +444,8 @@ closure_eq (svalue_t * left, svalue_t * right)
 
             if (!object_svalue_eq(left->u.lfun_closure->base.ob, right->u.lfun_closure->base.ob)
              || !object_svalue_eq(left->u.lfun_closure->fun_ob, right->u.lfun_closure->fun_ob)
-             || left->u.lfun_closure->fun_index != right->u.lfun_closure->fun_index
+             || closure_index_cmp(&left->u.lfun_closure->base, left->u.lfun_closure->fun_index,
+                                  &right->u.lfun_closure->base, right->u.lfun_closure->fun_index) != 0
              || left->u.lfun_closure->inhProg != right->u.lfun_closure->inhProg
              || left->u.lfun_closure->context_size != right->u.lfun_closure->context_size)
                 return false;
@@ -449,7 +477,8 @@ closure_eq (svalue_t * left, svalue_t * right)
 
         case CLOSURE_IDENTIFIER:
             return object_svalue_eq(left->u.identifier_closure->base.ob, right->u.identifier_closure->base.ob)
-                && left->u.identifier_closure->var_index == right->u.identifier_closure->var_index;
+                && closure_index_cmp(&left->u.identifier_closure->base, left->u.identifier_closure->var_index,
+                                     &right->u.identifier_closure->base, right->u.identifier_closure->var_index) == 0;
 
         case CLOSURE_BOUND_LAMBDA:
             return left->u.bound_lambda == right->u.bound_lambda;
@@ -493,7 +522,8 @@ closure_cmp (svalue_t * left, svalue_t * right)
 
             if ((d = object_svalue_cmp(left->u.lfun_closure->base.ob, right->u.lfun_closure->base.ob)) != 0
              || (d = object_svalue_cmp(left->u.lfun_closure->fun_ob, right->u.lfun_closure->fun_ob)) != 0
-             || (d = int_cmp(left->u.lfun_closure->fun_index, right->u.lfun_closure->fun_index)) != 0
+             || (d = closure_index_cmp(&left->u.lfun_closure->base, left->u.lfun_closure->fun_index,
+                                       &right->u.lfun_closure->base, right->u.lfun_closure->fun_index)) != 0
              || (d = ptr_cmp(left->u.lfun_closure->inhProg, right->u.lfun_closure->inhProg)) != 0
              || (d = int_cmp(left->u.lfun_closure->context_size, right->u.lfun_closure->context_size)) != 0)
                 return d;
@@ -527,7 +557,8 @@ closure_cmp (svalue_t * left, svalue_t * right)
             if (d)
                 return d;
             else
-                return int_cmp(left->u.identifier_closure->var_index, right->u.identifier_closure->var_index);
+                return closure_index_cmp(&left->u.identifier_closure->base, left->u.identifier_closure->var_index,
+                                         &right->u.identifier_closure->base, right->u.identifier_closure->var_index);
         }
 
         case CLOSURE_BOUND_LAMBDA:
@@ -910,6 +941,9 @@ replace_program_lfun_closure_adjust (replace_ob_t *r_ob)
                  * changes.
                  */
 
+                #ifdef USE_BLUEPRINT_UPDATE
+                assert(!l->base.named);
+#endif
                 int newidx = replace_program_function_adjust(r_ob, l->fun_index);
                 if (newidx < 0)
                 {
@@ -983,6 +1017,9 @@ replace_program_lfun_closure_adjust (replace_ob_t *r_ob)
             else /* CLOSURE_IDENTIFIER */
             {
                 identifier_closure_t *cl = lrpp->l.u.identifier_closure;
+                #ifdef USE_BLUEPRINT_UPDATE
+                assert(!cl->base.named);
+#endif
                 int newidx = replace_program_variable_adjust(r_ob, cl->var_index);
                 if (newidx < 0)
                 {
@@ -1147,12 +1184,98 @@ replace_program_lambda_adjust (replace_ob_t *r_ob)
 
 /*-------------------------------------------------------------------------*/
 #ifdef USE_BLUEPRINT_UPDATE
+static Bool
+closure_attach_named (closure_base_t *cl, object_t *ob, program_t *inherited,
+                      int index, Bool variable)
+
+/* Leaf bindings belong to the execution object, not the weak dependency
+ * inventory. They own their key bytes and no LPC references. Keeping an
+ * inactive key never pins an old program. The object's lifetime already
+ * dominates every closure referring to one of its bindings.
+ *
+ * Closures born during pending replacement deliberately retain the existing
+ * protector representation; ordinary closure creation still sets
+ * O_LAMBDA_REFERENCED and prevents subsequently scheduling replacement.
+ */
+{
+    char key[SCHEMA_NAMED_KEY_SIZE];
+    schema_budget_t budget = { .work = SCHEMA_MAX_WORK };
+    named_binding_t *binding;
+    size_t size;
+
+    if (ob->flags & (O_REPLACED | O_DESTRUCTED)
+     || ob->prog->flags & P_REPLACE_ACTIVE || inherited == ob->prog)
+        return MY_TRUE;
+    for (binding = ob->named_bindings; binding; binding = binding->next)
+        if (binding->index == index && binding->variable == variable
+         && binding->inherited == inherited)
+        {
+            cl->named = binding;
+            return MY_TRUE;
+        }
+    size = program_schema_named_key(ob->prog, index, inherited, variable, key, &budget);
+    if (!size) return MY_TRUE;
+    if (ob->next_named_rank == PUINT_MAX)
+        return MY_FALSE;
+    binding = BINDING_TEST_FAIL() ? NULL : xalloc(sizeof(*binding) + size);
+    if (!binding) return MY_FALSE;
+    *binding = (named_binding_t){ .next = ob->named_bindings,
+        .inherited = inherited, .rank = ob->next_named_rank ? ob->next_named_rank++ : (p_uint)index,
+        .index = index, .variable = variable, .key_size = size };
+    memcpy(binding->key, key, size);
+    ob->named_bindings = binding;
+    cl->named = binding;
+    return MY_TRUE;
+} /* closure_attach_named() */
+
+void
+closure_free_object_bindings (object_t *ob)
+{
+    named_binding_t *binding;
+    while ((binding = ob->named_bindings))
+    {
+        ob->named_bindings = binding->next;
+        xfree(binding);
+    }
+}
+
+#ifdef GC_SUPPORT
+void
+closure_count_object_bindings (object_t *ob)
+
+/* These allocations are leaves owned by the already reachable object.
+ * Never traverse the weak closure dependency inventory as a GC root.
+ */
+{
+    for (named_binding_t *binding = ob->named_bindings; binding; binding = binding->next)
+        note_malloced_block_ref(binding);
+}
+#endif
+
+#ifdef DEBUG
+void
+closure_check_object_bindings (object_t *ob)
+{
+    for (named_binding_t *binding = ob->named_bindings; binding; binding = binding->next)
+    {
+        assert(binding->key_size && binding->key_size <= SCHEMA_NAMED_KEY_SIZE);
+        assert(binding->key[binding->key_size - 1] == '\0');
+        assert(binding->index >= -1);
+        assert(!ob->next_named_rank || binding->rank < ob->next_named_rank);
+        if (!O_PROG_SWAPPED(ob))
+            assert(binding->index < (binding->variable ? ob->prog->num_variables
+                                                       : ob->prog->num_functions));
+    }
+}
+#endif
+
 void
 closure_init_dependencies (closure_base_t *cl)
 
 /* Also used after copying a context lambda: copied links are never owned. */
 
 {
+    cl->named = NULL;
     program_dependency_init(&cl->binding_dependency, cl, PROGRAM_DEPENDENCY_BINDING);
     program_dependency_init(&cl->target_dependency, cl, PROGRAM_DEPENDENCY_LFUN);
     cl->binding_dependency.peer = &cl->target_dependency;
@@ -1267,6 +1390,15 @@ closure_identifier (svalue_t *dest, svalue_t obj, int ix, Bool raise_error)
     dest->type = T_CLOSURE;
     dest->x.closure_type = CLOSURE_IDENTIFIER;
     dest->u.identifier_closure = cl;
+#ifdef USE_BLUEPRINT_UPDATE
+    if (obj.type == T_OBJECT && !closure_attach_named(&cl->base, obj.u.ob, NULL, ix, MY_TRUE))
+    {
+        free_closure(dest);
+        put_number(dest, 0);
+        if (raise_error) outofmemory("named variable binding");
+        return;
+    }
+#endif
 
     /* If the object's program will be replaced, store the closure
      * in lambda protector, otherwise mark the object as referenced by
@@ -1336,6 +1468,16 @@ closure_lfun ( svalue_t *dest, svalue_t obj, program_t *prog, int ix
     dest->x.closure_type = CLOSURE_LFUN;
     dest->u.lfun_closure = l;
     closure_register_dependencies(&l->base, CLOSURE_LFUN);
+#ifdef USE_BLUEPRINT_UPDATE
+    if (!l->context_size && obj.type == T_OBJECT
+     && !closure_attach_named(&l->base, obj.u.ob, prog, ix, MY_FALSE))
+    {
+        free_closure(dest);
+        put_number(dest, 0);
+        if (raise_error) outofmemory("named function binding");
+        return;
+    }
+#endif
 
     /* If the object's program will be replaced, store the closure
      * in lambda protector, otherwise mark the object as referenced by
@@ -4288,10 +4430,10 @@ compile_value (svalue_t *value, enum compile_value_input_flags opt_flags)
                 if (current.code_left < 2)
                     realloc_code();
                 current.code_left -= 2;
-                if ((short)cl->var_index < 0)
+                if ((short)closure_identifier_index(cl) < 0)
                     lambda_error("Variable not inherited\n");
                 STORE_CODE(current.codep, F_IDENTIFIER);
-                STORE_CODE(current.codep, (bytecode_t)cl->var_index);
+                STORE_CODE(current.codep, (bytecode_t)closure_identifier_index(cl));
             }
             break;
           } /* CLOSURE_IDENTIFIER */
@@ -4877,7 +5019,7 @@ compile_closure_call (ph_int type, svalue_t* closure, struct range_iterator *arg
             realloc_code();
 
         STORE_CODE(current.codep, F_CALL_FUNCTION);
-        STORE_SHORT(current.codep, closure->u.lfun_closure->fun_index);
+        STORE_SHORT(current.codep, closure_lfun_index(closure->u.lfun_closure));
         STORE_CODE(current.codep, instrs[F_RESTORE_ARG_FRAME].opcode);
 
         current.code_left -= 4;
@@ -5565,10 +5707,10 @@ compile_lvalue (svalue_t *argp, int flags)
                         if (current.code_left < 4)
                             realloc_code();
                         current.code_left -= 2;
-                        if ((short)cl->var_index < 0)
+                        if ((short)closure_identifier_index(cl) < 0)
                             lambda_error("Variable not inherited\n");
                         STORE_CODE(current.codep, (flags & MAKE_VAR_LVALUE) ? F_PUSH_IDENTIFIER_VLVALUE : F_PUSH_IDENTIFIER_LVALUE);
-                        STORE_CODE(current.codep, (bytecode_t)(cl->var_index));
+                        STORE_CODE(current.codep, (bytecode_t)(closure_identifier_index(cl)));
 
                         if (flags & PROTECT_LVALUE)
                         {
@@ -5931,7 +6073,7 @@ closure_lookup_lfun_prog ( lfun_closure_t * l
 
     is_inherited = MY_FALSE;
 
-    ix = l->fun_index;
+    ix = closure_lfun_index(l);
 
     switch (l->fun_ob.type)
     {
@@ -5963,6 +6105,20 @@ closure_lookup_lfun_prog ( lfun_closure_t * l
             fatal("(closure_lookup_lfun_prog) Invalid closure.\n");
     }
 
+#ifdef USE_BLUEPRINT_UPDATE
+    if (l->base.named && l->base.named->index < 0)
+    {
+        /* A dead security endpoint may have detached this closure before
+         * its execution object's unused declaration was removed. Diagnostic
+         * consumers must not dereference the inactive physical sentinel.
+         */
+        *pProg = prog;
+        *pName = STR_UNDEFINED;
+        *pIsInherited = MY_FALSE;
+        return;
+    }
+#endif
+
     if (l->inhProg)
     {
         while (prog != l->inhProg)
@@ -5976,7 +6132,7 @@ closure_lookup_lfun_prog ( lfun_closure_t * l
                        "Found program '%s' instead.\n"
                      , get_txt(l->inhProg->name)
                      , get_txt(obname)
-                     , (long) l->fun_index
+                     , (long) closure_lfun_index(l)
                      , get_txt(prog->name)
                      );
 #endif
@@ -6190,7 +6346,7 @@ closure_to_string (svalue_t * sp, Bool compact)
                         break;
                     }
 
-                    if (ic->var_index == VANISHED_VARCLOSURE_INDEX)
+                    if (closure_identifier_index(ic) == VANISHED_VARCLOSURE_INDEX)
                     {
                         strcat(buf, compact ? "<repl lvar>"
                                             : "<local variable from replaced program>");
@@ -6207,7 +6363,7 @@ closure_to_string (svalue_t * sp, Bool compact)
 
                     sprintf(buf, "#'%s->%s"
                                , get_txt(ob->name)
-                               , get_txt(ob->prog->variables[ic->var_index].name)
+                               , get_txt(ob->prog->variables[closure_identifier_index(ic)].name)
                           );
                     break;
                 }
@@ -6215,7 +6371,7 @@ closure_to_string (svalue_t * sp, Bool compact)
                 case T_LWOBJECT:
                     sprintf(buf, "#'/%s->%s"
                                , get_txt(cl->ob.u.lwob->prog->name)
-                               , get_txt(cl->ob.u.lwob->prog->variables[ic->var_index].name)
+                               , get_txt(cl->ob.u.lwob->prog->variables[closure_identifier_index(ic)].name)
                           );
                 break;
 

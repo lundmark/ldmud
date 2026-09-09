@@ -1360,6 +1360,9 @@ mark_object_ref (object_t *ob)
 
 {
     MARK_PLAIN_REF(ob); ob->ref++;
+#ifdef USE_BLUEPRINT_UPDATE
+    closure_count_object_bindings(ob);
+#endif
     if (ob->prog) mark_program_ref(ob->prog);
     if (ob->name) MARK_MSTRING_REF(ob->name);
     if (ob->load_name) MARK_MSTRING_REF(ob->load_name);

@@ -11,6 +11,9 @@
 #ifdef __BLUEPRINT_UPDATE__
 object source, first, second;
 mixed *alias;
+closure *named;
+mapping named_keys;
+object binding_probe;
 int request, previous_id, point, phase, checks, admissions, executions;
 
 void require(int ok, string label)
@@ -22,6 +25,8 @@ void require(int ok, string label)
 void clean()
 {
     alias = 0;
+    named = 0; named_keys = 0;
+    if (binding_probe) destruct(binding_probe);
     if (first) destruct(first);
     if (second) destruct(second);
     if (source) destruct(source);
@@ -31,8 +36,34 @@ void clean()
     rm("migration-pipeline-collected");
 }
 
+mixed include_file(string path, string from, int system)
+{
+    if (path == "named_hook.h")
+    {
+        if (binding_probe) destruct(binding_probe);
+        binding_probe = clone_object("binding_probe");
+        // Fresh object each attempt exercises both native binding allocations.
+        closure *handles = binding_probe.handles();
+        require(funcall(handles[0]) == 19 && funcall(handles[1]) == 19,
+                "compiler hook creates coherent named function and variable bindings");
+        destruct(binding_probe); binding_probe = 0;
+    }
+    return 0;
+}
+
+void check_named()
+{
+    require(funcall(named[0]) == 41 && funcall(named[1]) == 41,
+            "retained named handles keep their physical resolutions");
+    closure *fresh = first.handles();
+    require(fresh[0] == named[0] && fresh[1] == named[1], "fresh named handles reuse stable identity");
+    require(named_keys[named[0]] == 1 && named_keys[named[1]] == 2,
+            "stored named keys survive partial-plan GC and commit");
+}
+
 void unchanged()
 {
+    check_named();
     require(first.version() == 1 && second.version() == 1
             && source.version() == (phase == 2 ? 2 : 1),
             "every original program survives failure");
@@ -87,6 +118,7 @@ void inspect()
                 "successful recovery preserves final live values");
         require(first.defaults()[0][0] == 19 && second.defaults()[1]["x"][0] == 23,
                 "successful recovery materializes nested defaults");
+        check_named();
         first.defaults()[0][0] = 99;
         require(second.defaults()[0][0] == 19 && source.defaults()[0][0] == 19,
                 "new literal containers are independently owned");
@@ -146,14 +178,21 @@ void setup()
 {
     string before = "#pragma init_variables\nint retained; int removed; mixed *array;\n"
         "void seed(int n){retained=n;array=({n});} int value(){return retained;} int version(){return 1;}\n"
-        "mixed *aliases(){return ({&retained});}\n";
+        "mixed *aliases(){return ({&retained});}\n"
+        "closure *handles(){return ({#'value,#'retained});}\n";
     string after = "#pragma init_variables\nmixed *array; mixed *fresh=({({19}),([\"x\":({23})])}); int retained;\n"
-        "void seed(int n){retained=n;} int value(){return retained;} int version(){return 2;} mixed *defaults(){return fresh;}\n";
+        "#include \"named_hook.h\"\n"
+        "int version(){return 2;} mixed *defaults(){return fresh;} void seed(int n){retained=n;} int value(){return retained;}\n"
+        "closure *handles(){return ({#'value,#'retained});}\n";
     clean();
+    rm("binding_probe.c"); rm("named_hook.h");
+    write_file("binding_probe.c", "int value=19; int read(){return value;} closure *handles(){return ({#'read,#'value});}\n");
+    write_file("named_hook.h", "\n"); load_object("binding_probe");
     write_file("fault_target.c", before);
     source = load_object("fault_target");
     first = clone_object(source); second = clone_object(source);
     source.seed(7); first.seed(41); second.seed(83); alias = first.aliases();
+    named = first.handles(); named_keys = ([named[0]:1,named[1]:2]);
     rm("fault_target.c"); write_file("fault_target.c", after);
     if (phase == 2)
     {

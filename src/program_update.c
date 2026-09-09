@@ -13,6 +13,7 @@
 #include "ptrtable.h"
 #include "efuns.h"
 #include "array.h"
+#include "closure.h"
 #include "backend.h"
 #include "exec.h"
 #include "gcollect.h"
@@ -120,7 +121,15 @@ typedef struct program_update_variables_s
     svalue_t *values;             /* New slots, then the detached old block. */
     size_t num_values;            /* Initialized prefix still owned by record. */
     Bool snapshot;               /* Loaded-mode blueprint, never installed. */
+    struct named_translation_s *bindings;
+    size_t num_bindings;
 } program_update_variables_t;
+
+typedef struct named_translation_s
+{
+    named_binding_t *binding;    /* Leaf owned by the stage's pinned object. */
+    int index;                   /* Precomputed location; -1 is inactive. */
+} named_translation_t;
 
 typedef struct program_update_request_s
 {
@@ -177,6 +186,11 @@ static svalue_t *report_field(mapping_t *report, const char *name);
 static void migration_test_begin(void);
 static int migration_pipeline_read(void);
 static Bool migration_pipeline_fail(program_update_request_t *request, const char *point);
+Bool
+program_update_binding_test_fail (void)
+{
+    return active && migration_pipeline_fail(active, "named declaration binding allocation");
+}
 static void migration_pipeline_step(program_update_request_t *request, const char *point, Bool collect);
 static Bool migration_swap_fail(program_update_request_t *request, int point);
 static size_t migration_line_hash(program_t *program);
@@ -428,6 +442,9 @@ release_variables (program_update_request_t *request)
     }
     while ((stage = request->variables))
     {
+        if (stage->bindings) xfree(stage->bindings);
+        stage->bindings = NULL;
+        stage->num_bindings = 0;
         free_svalue(&stage->object);
         if (stage->old_program)
         {
@@ -913,9 +930,18 @@ validate_runtime_object (program_update_request_t *request, object_t *ob)
     const char *code = NULL, *reason = NULL;
     char message[2 * MAXPATHLEN + 256];
 
-    link = ob->program_dependencies;
-    if (link)
+    for (link = ob->program_dependencies; link; link = link->next)
     {
+        if (!request->budget.work)
+        {
+            code = "RUNTIME_DEPENDENCY_LIMIT";
+            reason = "live dependency scan limit exceeded.";
+            break;
+        }
+        request->budget.work--;
+        if (link->kind != PROGRAM_DEPENDENCY_COROUTINE
+         && ((closure_base_t *)link->handle)->named)
+            continue;
         if (link->kind == PROGRAM_DEPENDENCY_COROUTINE)
         {
             code = "LIVE_COROUTINE";
@@ -926,6 +952,7 @@ validate_runtime_object (program_update_request_t *request, object_t *ob)
             code = "LIVE_CLOSURE";
             reason = "live closure depends on the current program.";
         }
+        break;
     }
 #ifdef USE_PYTHON
     if (!code && python_program_has_handles(ob))
@@ -1294,6 +1321,77 @@ prepare_variables (program_update_request_t *request)
 } /* prepare_variables() */
 
 static void
+prepare_named_bindings (program_update_request_t *request)
+
+/* Stage all locations while both generations and all objects are pinned.
+ * No binding is changed here. Missing inactive declarations remain inactive;
+ * a later declaration with that spelling receives a fresh ordering rank.
+ * The schema pass already verified callable signatures and modifiers using
+ * the same declaring-program/occurrence identity resolver.
+ */
+{
+    program_t *candidate = request->source_from_path ? request->candidate : request->source_program;
+    char key[SCHEMA_NAMED_KEY_SIZE];
+
+    for (program_update_variables_t *stage = request->variables; stage; stage = stage->next)
+    {
+        object_t *ob = stage->object.u.ob;
+        size_t count = 0;
+        if (stage->snapshot) continue;
+        for (named_binding_t *binding = ob->named_bindings; binding; binding = binding->next)
+        {
+            if (!request->budget.work)
+                errorf("update_blueprint(): named binding scan limit exceeded.\n");
+            request->budget.work--;
+            count++;
+        }
+        if (!count) continue;
+        request_bytes(request, count * sizeof(*stage->bindings));
+        PIPELINE_TEST_STEP(request, "named translation array allocation", MY_TRUE);
+        stage->bindings = xalloc(count * sizeof(*stage->bindings));
+        if (!stage->bindings) outofmemory("named handle translations");
+        PIPELINE_TEST_STEP(request, "rooted named translation array", MY_TRUE);
+        for (named_binding_t *binding = ob->named_bindings; binding; binding = binding->next)
+        {
+            int index = -1;
+            Bool ambiguous = MY_FALSE;
+            int limit = binding->variable ? candidate->num_variables : candidate->num_functions;
+            if (binding->index >= 0)
+                for (int i = 0; i < limit; i++)
+                {
+                    size_t size = program_schema_named_key(candidate, i, binding->inherited,
+                                                          binding->variable, key, &request->budget);
+                    if (!request->budget.work)
+                        errorf("update_blueprint(): named resolution work limit exceeded.\n");
+                    if (size != binding->key_size || memcmp(key, binding->key, size))
+                        continue;
+                    if (index >= 0) ambiguous = MY_TRUE;
+                    else index = i;
+                }
+            if (ambiguous) index = -1;
+            if (index < 0)
+                for (program_dependency_t *link = ob->program_dependencies; link; link = link->next)
+                {
+                    if (!request->budget.work)
+                        errorf("update_blueprint(): named dependency work limit exceeded.\n");
+                    request->budget.work--;
+                    if (link->kind != PROGRAM_DEPENDENCY_COROUTINE
+                     && ((closure_base_t *)link->handle)->named == binding)
+                    {
+                        request_failure(request, ambiguous ? "HANDLE_DECLARATION_AMBIGUOUS"
+                                                           : "HANDLE_DECLARATION_REMOVED",
+                            ambiguous ? "A retained named closure declaration has ambiguous candidate slots."
+                                      : "A retained named closure declaration is missing from the candidate.");
+                        return;
+                    }
+                }
+            stage->bindings[stage->num_bindings++] = (named_translation_t){ binding, index };
+            PIPELINE_TEST_STEP(request, "partial named translations", MY_TRUE);
+        }
+    }
+} /* prepare_named_bindings() */
+
+static void
 prepare_publication (program_update_request_t *request)
 
 /* All allocations and swap IO precede the irreversible stores. The candidate
@@ -1386,6 +1484,9 @@ commit_variables (program_update_request_t *request)
         candidate->ref++;
         ob->prog = candidate;
         ob->variables = stage->values;
+        for (size_t i = 0; i < stage->num_bindings; i++)
+            stage->bindings[i].binding->index = stage->bindings[i].index;
+        if (!ob->next_named_rank) ob->next_named_rank = (p_uint)USHRT_MAX + 1;
         stage->values = old_values;
         stage->num_values = old_count;
 #ifdef DEBUG
@@ -2167,6 +2268,7 @@ program_update_process (void)
 #endif
                 push_error_handler(variables_cleanup, &active->handler);
                 prepare_variables(active);
+                prepare_named_bindings(active);
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
                 active->pipeline_allocations = MY_FALSE;
                 if (active->pipeline_triggered)
@@ -2369,6 +2471,7 @@ program_update_count_refs (void)
         for (program_update_variables_t *stage = request->variables; stage; stage = stage->next)
         {
             note_malloced_block_ref(stage);
+            if (stage->bindings) note_malloced_block_ref(stage->bindings);
             count_ref_in_vector(&stage->object, 1);
             if (stage->old_program) mark_program_ref(stage->old_program);
             if (stage->values)

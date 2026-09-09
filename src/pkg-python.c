@@ -9809,7 +9809,14 @@ ldmud_lfun_closure_get_lfun (ldmud_closure_t *self, void *closure)
         return NULL;
 
     cl = self->lpc_closure.u.lfun_closure;
-    ix = cl->fun_index;
+#ifdef USE_BLUEPRINT_UPDATE
+    if (cl->base.named && cl->base.named->index < 0)
+    {
+        PyErr_SetString(PyExc_ValueError, "named closure declaration is no longer available");
+        return NULL;
+    }
+#endif
+    ix = closure_lfun_index(cl);
     switch (cl->fun_ob.type)
     {
         case T_OBJECT:
@@ -10075,13 +10082,13 @@ ldmud_identifier_closure_get_variable (ldmud_closure_t *self, void *closure)
             fatal("Invalid object type for closure.\n");
     }
 
-    if (cl->var_index == VANISHED_VARCLOSURE_INDEX)
+    if (closure_identifier_index(cl) == VANISHED_VARCLOSURE_INDEX)
     {
         Py_INCREF(Py_None);
         return Py_None;
     }
 
-    return ldmud_program_variable_create(cl->base.ob, prog, cl->var_index);
+    return ldmud_program_variable_create(cl->base.ob, prog, closure_identifier_index(cl));
 } /* ldmud_identifier_closure_get_lfun() */
 
 /*-------------------------------------------------------------------------*/

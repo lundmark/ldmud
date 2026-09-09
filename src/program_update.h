@@ -19,11 +19,14 @@ extern Bool program_update_default_test_fail(int point);
 extern void program_update_default_test_scope(Bool literal);
 extern void program_update_default_test_pressure(int point);
 extern void program_update_migration_test_step(void);
+extern Bool program_update_binding_test_fail(void);
+#define BINDING_TEST_FAIL() program_update_binding_test_fail()
 #define MIGRATION_TEST_STEP() program_update_migration_test_step()
 #define DEFAULT_TEST_NULL(point, allocation) \
     (program_update_default_test_fail(point) ? NULL : (allocation))
 #define DEFAULT_TEST_PRESSURE(point) program_update_default_test_pressure(point)
 #else
+#define BINDING_TEST_FAIL() MY_FALSE
 #define MIGRATION_TEST_STEP() ((void)0)
 #define DEFAULT_TEST_NULL(point, allocation) (allocation)
 #define DEFAULT_TEST_PRESSURE(point) ((void)0)

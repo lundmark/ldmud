@@ -27,7 +27,7 @@ void next();
 void inspect()
 {
     mapping report = update_blueprint_result(request);
-    string expected = stage == 2 || kind == 6 || kind == 7 ? "completed"
+    string expected = stage == 2 || kind == 6 || kind == 7 || kind == 8 ? "completed"
                                 : kind == 3 || kind == 5 ? "LIVE_COROUTINE" : "LIVE_CLOSURE";
     mixed err = catch(
         require(blueprint_outcome(report) == expected,
@@ -106,6 +106,9 @@ void next()
                 funcall(bind_lambda(held, other));
                 destruct(other);
             }
+            /* The unchanged unbound lambda calls its alien named closure
+             * constant through FUNCALL; no target index is embedded.
+             */
             if (kind == 8) held = unbound_lambda(0, ({target.handle(0)}));
         }
         if (stage == 2) held = 0;

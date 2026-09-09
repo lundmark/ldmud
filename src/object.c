@@ -277,6 +277,7 @@ dealloc_object ( object_t *ob, const char * file, int line)
 
 #ifdef USE_BLUEPRINT_UPDATE
     program_dependencies_clear(ob);
+    closure_free_object_bindings(ob);
 #endif
 #ifdef USE_PYTHON
     if (ob->python_dict != NULL)
@@ -6254,7 +6255,7 @@ save_closure (svalue_t *cl, Bool writable)
 
             l = cl->u.lfun_closure;
             ob = l->fun_ob;
-            ix = l->fun_index;
+            ix = closure_lfun_index(l);
             inhProg = l->inhProg;
 
             if (ob.type == T_OBJECT)
@@ -6297,7 +6298,7 @@ save_closure (svalue_t *cl, Bool writable)
             if (inhProg)
             {
                 prog = obprog;
-                ix = l->fun_index;
+                ix = closure_lfun_index(l);
 
                 while(prog != inhProg)
                 {
@@ -6390,7 +6391,7 @@ save_closure (svalue_t *cl, Bool writable)
         if (recall_pointer(ic))
             break;
 
-        if (ic->var_index == VANISHED_VARCLOSURE_INDEX)
+        if (closure_identifier_index(ic) == VANISHED_VARCLOSURE_INDEX)
         {
             rc = MY_FALSE;
             break;
@@ -6424,7 +6425,7 @@ save_closure (svalue_t *cl, Bool writable)
             break;
         }
 
-        source = get_txt(prog->variables[ic->var_index].name);
+        source = get_txt(prog->variables[closure_identifier_index(ic)].name);
 
         {
             L_PUTC_PROLOG

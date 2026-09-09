@@ -6,6 +6,7 @@
 
 #ifdef USE_BLUEPRINT_UPDATE
 #define SCHEMA_MAX_WORK 1000000
+#define SCHEMA_NAMED_KEY_SIZE 4096
 
 typedef struct schema_budget_s
 {
@@ -13,6 +14,14 @@ typedef struct schema_budget_s
     size_t work;
     size_t slots;
 } schema_budget_t;
+
+/* Canonical declaring path, inheritance occurrence, dispatch route and name, separated by
+ * NULs. No program or string ownership escapes this bounded, allocation-free
+ * query. Zero means generated/unsupported metadata, never a bare-name match.
+ */
+extern size_t program_schema_named_key(const program_t *prog, int slot,
+                                      const program_t *inherited, Bool variable,
+                                      char *key, schema_budget_t *budget);
 
 /* Both programs must be loaded and pinned. Result must be a rooted zero
  * svalue; budget holds the shared memory, work, and slot allowances.
