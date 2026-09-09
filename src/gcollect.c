@@ -77,6 +77,7 @@
  */
 
 #include "driver.h"
+#include "async_io.h"
 #include "typedefs.h"
 
 #include <sys/types.h>
@@ -2211,6 +2212,9 @@ garbage_collection(void)
 #endif /* USE_PGSQL */
     remove_stale_player_data();
     remove_stale_call_outs();
+#ifdef USE_ASYNC_IO
+    async_io_remove_stale();
+#endif
     free_defines();
     free_all_local_names();
     remove_unknown_identifier();
@@ -2377,6 +2381,9 @@ garbage_collection(void)
     mstring_clear_refs();
     clear_ref_from_wiz_list();
     clear_ref_from_call_outs();
+#ifdef USE_ASYNC_IO
+    async_io_clear_refs();
+#endif
     clear_ref_from_efuns();
 #if defined(USE_PARSE_COMMAND)
     clear_parse_refs();
@@ -2589,6 +2596,9 @@ garbage_collection(void)
 
     count_ref_from_wiz_list();
     count_ref_from_call_outs();
+#ifdef USE_ASYNC_IO
+    async_io_count_refs();
+#endif
     count_ref_from_efuns();
 
     if (master_ob)
@@ -3449,4 +3459,3 @@ void setup_print_block_dispatcher (void) { NOOP }
 #endif
 
 /***************************************************************************/
-

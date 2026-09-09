@@ -10,6 +10,7 @@ src/lang.c
 src/lang.h
 src/lang.y
 src/ldmud
+src/ldmud-async-io
 src/machine.h
 src/machine.h.in
 src/make_func.c

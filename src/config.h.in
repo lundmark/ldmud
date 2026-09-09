@@ -213,6 +213,13 @@
  */
 @cdef_use_anl@ USE_ANL
 
+/* Background file writer, with bounded main-process payload ownership. */
+@cdef_use_async_io@ USE_ASYNC_IO
+#define ASYNC_IO_MAX_REQUESTS @val_async_io_max_requests@
+#define ASYNC_IO_MAX_BYTES @val_async_io_max_bytes@
+#define ASYNC_IO_MAX_REQUEST_BYTES @val_async_io_max_request_bytes@
+#define ASYNC_IO_SHUTDOWN_TIMEOUT @val_async_io_shutdown_timeout@
+
 /* maximum number of concurrent outgoing connection attempts by net_connect()
  * (that is connections that are in progress but not fully established yet).
  */

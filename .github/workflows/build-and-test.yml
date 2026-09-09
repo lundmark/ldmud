@@ -8,6 +8,7 @@ jobs:
                 cc: [gcc, clang]
                 coverage: [false, true]
                 machine: [i386, amd64]
+                async_io: [false, true]
                 exclude:
                     - machine: i386
                       coverage: true
@@ -32,6 +33,7 @@ jobs:
                                --enable-use-xml --enable-use-tls  --enable-use-gcrypt
                                --enable-malloc-trace --enable-malloc-lpc-trace  --enable-dynamic-costs
                                --enable-eval-cost-trace --enable-trace-code --enable-swap-efun
+                               ${{ matrix.async_io && '--enable-use-async-io' || '--disable-use-async-io' }}
                                ${{ matrix.machine == 'amd64' && '--enable-use-python' || '' }}
                                ${{ matrix.machine == 'i386' && '--target=i686-pc-linux-gnu' || '' }}
                                ${{ matrix.coverage && '--with-optimize=no' || ''}}
@@ -45,6 +47,17 @@ jobs:
               working-directory: test
               shell: sh
               run: ./run.sh
+            - name: Test async writer protocol and lifecycle
+              if: matrix.async_io && !matrix.coverage
+              working-directory: test
+              env:
+                CC: ${{ matrix.cc }}
+                CFLAGS: -O2 -g -Wall -Wextra -Werror ${{ matrix.machine == 'i386' && '-m32' || '' }}
+                LDFLAGS: ${{ matrix.machine == 'i386' && '-m32' || '' }}
+              run: |
+                ./run_async_io_worker_test.sh
+                ./run_async_io_lifecycle_test.sh
+                ./run_async_io_allocation_test.sh
             - name: Generate coverage reports (gcc)
               if: matrix.cc == 'gcc' && matrix.coverage
               shell: bash
@@ -65,5 +78,5 @@ jobs:
               if: matrix.coverage
               uses: actions/upload-artifact@v4
               with:
-                name: coverage ${{ matrix.cc }}
+                name: coverage ${{ matrix.cc }} async-${{ matrix.async_io }}
                 path: test/html

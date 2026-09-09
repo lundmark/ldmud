@@ -185,6 +185,7 @@
 /*-------------------------------------------------------------------------*/
 
 #include "driver.h"
+#include "async_io.h"
 #include "typedefs.h"
 
 #include "my-alloca.h"
@@ -24356,6 +24357,9 @@ check_a_lot_ref_counts (program_t *search_prog)
     /* Other variables and lists.
      */
     count_extra_ref_from_call_outs();
+#ifdef USE_ASYNC_IO
+    async_io_count_extra_refs();
+#endif
     count_extra_ref_from_wiz_list();
     count_simul_efun_extra_refs(ptable);
     count_comm_extra_refs();

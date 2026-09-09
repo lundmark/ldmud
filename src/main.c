@@ -24,6 +24,11 @@
  */
 
 #include "driver.h"
+#include "async_io.h"
+
+#ifdef USE_ASYNC_IO
+static char *async_io_helper;
+#endif
 #include "typedefs.h"
 
 #include "my-alloca.h"
@@ -633,6 +638,14 @@ main (int argc, char **argv)
         initialize_host_access();
         
         install_signal_handlers();
+#ifdef USE_ASYNC_IO
+        if (!async_io_start(async_io_helper ? async_io_helper
+                                           : BINDIR "/ldmud-async-io"))
+        {
+            rc = 1;
+            break;
+        }
+#endif
         
         (void)signal(SIGFPE, SIG_IGN);
         set_current_object(&dummy_current_object_for_loads);
@@ -684,6 +697,10 @@ main (int argc, char **argv)
             check_a_lot_ref_counts_flag = MY_TRUE;
 #endif
 
+#ifdef USE_ASYNC_IO
+        if (game_is_being_shut_down)
+            goto orderly_shutdown;
+#endif
         if (!assert_simul_efun_object())
         {
             rc = 1;
@@ -692,8 +709,12 @@ main (int argc, char **argv)
 
         if (game_is_being_shut_down)
         {
+#ifdef USE_ASYNC_IO
+            goto orderly_shutdown;
+#else
             rc = 1;
             break;
+#endif
         }
 
         load_wiz_file();
@@ -707,10 +728,19 @@ main (int argc, char **argv)
         /* Shutdown the game.
          */
 
+#ifdef USE_ASYNC_IO
+orderly_shutdown:
+#endif
         rc = exit_code;
         printf("%s LDMud shutting down.\n", time_stamp());
 
         callback_master(STR_NOTIFY_SHUTDOWN, 0);
+#ifdef USE_ASYNC_IO
+        if (!async_io_shutdown() && rc == 0)
+            rc = 1;
+        if (rc == 0)
+            rc = exit_code;
+#endif
         ipc_remove();
         remove_all_players();
         handle_newly_destructed_objects();
@@ -726,6 +756,10 @@ main (int argc, char **argv)
     } while(0);
 
     /* Mandatory cleanups - see also simulate::fatal() */
+#ifdef USE_ASYNC_IO
+    async_io_cleanup();
+    free(async_io_helper);
+#endif
 #ifdef USE_TLS
     tls_global_deinit();
 #endif
@@ -1220,6 +1254,9 @@ typedef enum OptNumber {
 #endif
 #ifdef USE_PYTHON
  , cPythonScript    /* --python-script      */
+#endif
+#ifdef USE_ASYNC_IO
+ , cAsyncIOHelper   /* --async-io-helper    */
 #endif
 #ifdef DEBUG
  , cCheckRefs       /* --check-refcounts    */
@@ -1719,6 +1756,13 @@ static Option aOptions[]
       }
 #endif /* USE_PYTHON */
 
+#ifdef USE_ASYNC_IO
+    , { 0,   "async-io-helper", cAsyncIOHelper, MY_TRUE
+      , "  --async-io-helper <absolute-path>\n"
+      , "  --async-io-helper <absolute-path>\n"
+        "    Companion file writer (default: " BINDIR "/ldmud-async-io).\n"
+      }
+#endif
     , { 0,   "wizlist-file",       cWizlistFile,    MY_TRUE
       , "  --wizlist-file <filename>\n"
       , "  --wizlist-file <filename>\n"
@@ -2049,6 +2093,9 @@ options (void)
 #endif
 #ifdef USE_SQLITE
                               , "SQLite3 supported\n"
+#endif
+#ifdef USE_ASYNC_IO
+                              , "Async file I/O supported\n"
 #endif
 #ifdef USE_JSON
                               , "JSON supported\n"
@@ -2986,6 +3033,19 @@ eval_arg (int eOption, const char * pValue)
         break;
 #endif
 
+#ifdef USE_ASYNC_IO
+    case cAsyncIOHelper:
+        if (pValue[0] != '/')
+        {
+            fprintf(stderr, "--async-io-helper requires an absolute path.\n");
+            return hrError;
+        }
+        free(async_io_helper);
+        async_io_helper = strdup(pValue);
+        if (!async_io_helper)
+            return hrError;
+        break;
+#endif
 #ifdef GC_SUPPORT
     case cGcollectFD:
         if (isdigit((unsigned char)*pValue)) {

@@ -604,6 +604,10 @@ int     rm(string);
 int     rmdir(string);
 int     write_bytes(string, int, bytes);
 int     write_file(string, string, void|int, void|string);
+#ifdef USE_ASYNC_IO
+void    async_write(string, string, int, closure);
+void    async_save_object(string, closure, void|int) no_lightweight;
+#endif
 
 
         /* Driver and System functions */

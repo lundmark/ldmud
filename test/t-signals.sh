@@ -7,13 +7,17 @@ echo "---------------------------------" >&2
 set -e
 ulimit -c 0
 OPTIONS=""
+set --
+if [ -n "${ASYNC_IO_HELPER:-}" ]; then
+    set -- --async-io-helper "$ASYNC_IO_HELPER"
+fi
 
 rm -f ${TEST_LOGFILE}.fail ${TEST_OUTPUTFILE}
 
 for s in HUP INT USR1 USR2 TERM; do
     for action in DCS_DEFAULT DCS_SHUTDOWN Python; do
         echo "Testing SIG$s with $action" >&2
-        ( ${DRIVER} ${DRIVER_DEFAULTS} -msignals -Mmaster.c -DSIGNAL=SIG$s -D"SIGNAL_NAME=\"SIG$s\"" -DSIGNAL_CONF=DC_SIGACTION_SIG$s -D"SIGNAL_TEST=\"$action\"" ${PORT}\
+        ( ${DRIVER} ${DRIVER_DEFAULTS} "$@" -msignals -Mmaster.c -DSIGNAL=SIG$s -D"SIGNAL_NAME=\"SIG$s\"" -DSIGNAL_CONF=DC_SIGACTION_SIG$s -D"SIGNAL_TEST=\"$action\"" ${PORT}\
             --debug-file .${TEST_LOGFILE} --pidfile .${TEST_LOGFILE}.pid || touch  ${TEST_LOGFILE}.fail ) | while read line; do
                 echo $line >> "${TEST_OUTPUTFILE}"
 

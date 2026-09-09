@@ -70,6 +70,7 @@
 #define SIMULATE_CHARMODE /* TODO: Even linemode clients stay in charmode */
 
 #include "driver.h"
+#include "async_io.h"
 #include "typedefs.h"
 
 #include "my-alloca.h"
@@ -2407,6 +2408,11 @@ get_message (char *buff, size_t *bufflength)
 #ifdef USE_PGSQL
             pg_setfds(&readfds, &writefds, &nfds);
 #endif
+#ifdef USE_ASYNC_IO
+            async_io_set_fds(&readfds, &writefds, &nfds);
+            if (async_io_pending())
+                twait = 0;
+#endif
 #ifdef USE_PYTHON
             python_set_fds(&readfds, &writefds, &pexceptfds, &nfds);
 #endif
@@ -2495,6 +2501,9 @@ get_message (char *buff, size_t *bufflength)
 
 #ifdef USE_PGSQL
             pg_process_all();
+#endif
+#ifdef USE_ASYNC_IO
+            async_io_process_fds(&readfds, &writefds);
 #endif
 #ifdef USE_PYTHON
             python_handle_fds(&readfds, &writefds, &pexceptfds, nfds);
