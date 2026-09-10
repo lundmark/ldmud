@@ -1,0 +1,131 @@
+Blueprint update validation
+===========================
+
+The feature is opt-in (--enable-blueprint-update). See
+../concepts/blueprint_updates for the supported ordinary-object scope,
+initializer restrictions, request limits and operator workflow. Interactive
+objects remain rejected; these tests do not establish player-session support.
+
+Reproduction
+------------
+
+Run the ordinary DEBUG suite from a clean configured build:
+
+    cd src
+    ./configure --enable-debug --enable-blueprint-update --enable-swap-efun
+    make clean
+    make
+    cd ../test
+    ./run.sh
+    ./run.sh -v t-blueprint-update
+
+Enable optional packages, including Python, when testing their integration.
+Run the exhaustive allocation controls in a separate DEBUG build configured
+with EXTRA_CFLAGS=-DBLUEPRINT_UPDATE_TESTING. Then run:
+
+    ./run.sh t-blueprint-failures.sh t-blueprint-swap.sh t-blueprint-python \
+        t-blueprint-retirement t-blueprint-workflow t-blueprint-classification
+
+The ordinary build must report BLUEPRINT_PIPELINE_CONFIG: ordinary. The
+instrumented build must report testing and positive failure/recovery counts
+for all three pipeline modes. Disabled-feature skips are not enabled coverage.
+The CI workflow retains required gcc/clang, i386/amd64 and enabled/disabled
+jobs, with a separate required instrumented Python allocation job. Coverage
+reporting jobs remain optional. Hosted CI results are a separate delivery gate.
+
+For bounded pause and memory observations, run test/blueprint_stress.py with
+its supplied cases.json. See test/blueprint_stress/README for exact commands,
+optional Python requirements, metric definitions and evidence checks. These
+scenarios are explicit and are not discovered by the ordinary t-* runner.
+The native observer exists only in DEBUG/BLUEPRINT_UPDATE_TESTING builds.
+
+Local release checks (2026-09-10)
+--------------------------------
+
+The final implementation passed the full 94-suite ordinary DEBUG run with
+GCC 13 and PCRE, without Python. Five clean clang configurations passed 58
+focused suite invocations: disabled, i386, Python, system allocator and
+nonDEBUG. Four builds were warning-free; system malloc retained its fourteen
+existing allocator warnings and does not provide native garbage collection.
+A separate clean clang DEBUG/Python/PCRE instrumented build was warning-free.
+
+The instrumented native pipeline covers all 419 path/explicit, 412 path/all
+and 279 loaded/explicit failed allocation points, followed by successful
+recovery. It also passes 222 swap checks, 346 retirement checks, the complete
+workflow and 2604 Python handle checks. The Python sweep covers ten admission
+and 299 execution failures, including both binding MemoryErrors. Ordinary
+nonDEBUG workflows exercise actual updates without the private test controls.
+
+The disposable NPC family passes 193 checks with the default two-second
+alarm on ordinary GCC, native and all four enabled cross configurations.
+It covers mixed historical generations, retained values/references/aliases,
+inventory, heartbeats, queued callouts, successive updates, atomic rejection
+and recovery, and absence of constructor/reset/initializer replay.
+
+Memcheck qualification
+----------------------
+
+The final workflow and NPC-family runs have zero Memcheck errors and zero
+definite/indirect loss. They retain 1080 and 896 possibly-lost bytes respectively.
+The broader update run completes its LPC assertions but exits unsuccessfully
+under Memcheck: 22 uninitialized write-buffer errors in three swap-writer
+contexts, zero definite/indirect loss and 552 possibly-lost bytes. Earlier
+broad-update evidence has the same diagnostic class in two contexts; the
+third current context flushes through a different stdio path and is retained
+as a distinct observation. The unchanged ordinary swap test reproduces four
+write-buffer errors both with the feature enabled and with it disabled in a
+matching GCC/Valgrind build, without any blueprint-update call. This is a
+qualified existing swap-serialization issue, not a zero-error memory claim.
+No custom suppression was added. Legacy blocker reference-count diagnostics
+also match the previously recorded ordinary baseline exactly.
+
+Bounded measurements
+--------------------
+
+All twelve supplied scenarios passed on an AMD Ryzen 7 8845HS, x86_64,
+clang 18.1.3, DEBUG, Python, PCRE, Valgrind allocator redzones of four words,
+and BLUEPRINT_UPDATE_TESTING. The benchmark itself ran without Memcheck,
+with the normal two-second alarm and no concurrent validation jobs.
+The measured binary SHA256 is:
+  e9ae1df3209303a990c60695a5807f22befd8f68312d330cf845da3d19c126f3
+
+These are individual local observations, not latency guarantees. Request
+pause includes compilation through retirement; queue wait and result polling
+are excluded. Batch pause also includes the surrounding request loop and
+report expiry. Driver-accounted memory is sampled, not a transient compiler
+peak or whole-process RSS. The README documents the wall-clock limitations.
+
+  Clones  Retained vars  Handles  Request ms  Outcome
+       1              8  none          0.395  completed
+     100              8  none          0.693  completed
+    1000              8  none          4.442  completed
+   10000              8  none         48.214  completed
+    1000             64  none         18.697  completed
+     100            512  none         40.559  completed
+     950            512  none         65.083  schema/work rejection
+     100              8  Python        2.383  completed (first update)
+     500              8  Python        5.928  runtime-work rejection
+
+For 10000 clones, the batch took 48.229 ms; candidate total_size was 1688
+bytes. At fully prepared storage, xalloc_used exceeded request entry by
+2829552 bytes and xalloc_allocated by 3888384 bytes. A clone added after
+admission raised the count to 10001 and was rejected before publication.
+A four-request batch with 1000 native-handle clones took at most 27.174 ms
+across two updates. Every rejected main cohort retained its original values
+and programs; the independent source-only requests still completed.
+
+Two native handles per clone plus their arrays/bindings added 687768
+xalloc_used bytes for 1000 clones. For 100 Python-held clone pairs, driver
+allocation increased by 20000 bytes; shallow wrappers totalled 16000 bytes,
+and Python tracemalloc's current delta was 40568 bytes. These quantities
+cover different allocation domains and are not interchangeable. Releasing
+two newly named handles in each of ten generations retained 19984-20024
+additional driver-accounted bytes per 100-clone cohort each time, measured
+within a single LPC evaluation. Inactive declaration keys remain until
+object disposal; this does not imply retention of the old programs.
+
+Clone count alone is not an operating limit. Variable width, handle inventory,
+prior generations, diagnostic work and memory can exhaust a different bound
+first. Keep the documented limits and measure representative local families
+before choosing an operational cohort size. No live MUD deployment or hosted
+CI acceptance is inferred from this local validation.
