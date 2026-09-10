@@ -1,0 +1,260 @@
+CONCEPT
+        State-preserving blueprint updates
+
+DESCRIPTION
+        update_blueprint() changes programs and variable layouts of existing
+        ordinary LPC objects. It preserves object identity, retained live
+        values, inventory/environment links, heartbeats, and callouts. The
+        complete selected cohort is prepared before any program is installed.
+        A precommit incompatibility leaves that cohort unchanged.
+
+        This differs from destructing and reloading objects. There is no
+        constructor, reset, __INIT, or migration callback during installation.
+        Variable addition, removal, and reordering are supported in the first
+        implementation. Matching uses declaring program, inheritance occurrence,
+        and declaration name; a physical slot number is not an identity.
+        Retained values follow those identities even when their slots move.
+        Removed values are released only after every selected object's new
+        program and variable block have been installed. External references to
+        values and protected aliases retain their ordinary LPC semantics.
+
+        Existing-variable initializers are never replayed. New independently
+        initialized variables require supported captured literal/implicit
+        defaults: integers, floats, strings/bytes, arrays, and mappings whose
+        components are representable within the bounds. Arbitrary initializer
+        code is not evaluated to obtain a default. Under blueprint sharing,
+        clone additions copy the prepared/current blueprint value instead;
+        reports describe that decision without exposing the live value.
+        Missing metadata, unsupported expressions, incompatible RTT defaults,
+        changed variable types/modifiers, incompatible callable signatures,
+        changed inheritance, and incompatible struct layouts block migration.
+        Function argument schema metadata is separate from saved argument types;
+        there is no blanket requirement to add pragma save_types.
+
+        Supported named native lfun/variable closures retain identity through
+        migration. Supported Python Function/Variable wrappers for ordinary
+        objects share those named bindings. Existing and freshly obtained
+        equivalent wrappers retain hash/equality and dictionary/set behavior,
+        while calls, variable access, metadata, and namespace views use the
+        current program. A retained declaration that is removed or resolves
+        ambiguously blocks the whole cohort. Native and Python owners are
+        both checked. Unsupported generated/raw closures, unfinished coroutines,
+        and Python function/variable iterators (even exhausted ones) remain
+        blockers. Lightweight objects and their handles are not migrated.
+
+        Only ordinary blueprints and same-family ordinary clones qualify.
+        Interactive, shadowing, shadowed, replaced, virtual, master, primary
+        and backup simul-efun objects are excluded. Pending replace_program()
+        work anywhere in the family conflicts with the request. These checks
+        apply again at execution; creating an unsupported dependency after
+        submission can make the deferred attempt fail.
+
+SOURCE AND SELECTION
+        A string source names an already loaded blueprint. The driver pins
+        that identity and its exact old program, then privately compiles the
+        source file during execution against the captured inherited programs.
+        The new candidate becomes public only on successful installation.
+        The source blueprint always participates in this mode, including
+        update_blueprint(path, ({})), which selects no clones.
+
+        An object source uses that loaded blueprint's exact current program
+        as its candidate. It does not compile another program or implicitly
+        update the blueprint. This mode can migrate clones from older
+        generations to the currently loaded generation. Already-current clones
+        count as matched/already_current and are left unchanged; dependencies
+        on their unchanged program do not block the update.
+
+        Omitted targets and integer 0 select all matching clones discovered
+        at execution after compiler/master callbacks. An array selects its
+        copied, deduplicated object identities; ({}) means no clones. Passing
+        the source blueprint in the array does not count it as a clone or
+        duplicate its implicit participation. Destroyed explicit targets are
+        skipped after admission; unrelated or unsupported surviving targets
+        reject the request. Discovery counts are completed before survivor
+        rejection, or explicitly reported as unavailable on a scan limit.
+
+        clones(path, 0), clones(path, 1), and clones(path, 2) still select by
+        creation/load history, not current installed program. Migration does
+        not alter that history. blueprint(ob) follows ob's currently installed
+        program and returns its blueprint object, if still available. Neither
+        efun substitutes for the report's actual migration cohort counts.
+
+REQUEST LIFETIME AND AUTHORITY
+        There are exactly two driver efuns: update_blueprint(source[,targets])
+        returns a positive ID, and update_blueprint_result(id) observes it.
+        There is no public prepare, queue, commit, cancel, or discard operation.
+        Invalid admission raises before an ID exists. The driver calls
+        privilege_violation("update_blueprint", caller, source, targets) and
+        revalidates identities and limits after that hook. The requesting
+        object owns the ID; only it or the master may read the driver report.
+        A wizard who initiated a mudlib command is not automatically that owner.
+
+        Execution is one deferred attempt on the driver thread after the
+        current stack unwinds, at the periodic backend boundary before
+        heartbeat/callout dispatch. It is not background worker-thread work.
+        Requests submitted by callbacks after the batch was detached wait for
+        the following tick. Polling never advances the operation.
+
+        Pending reports contain only zero/empty unknowns. Completed means the
+        cohort was installed; failed means it was rejected before installation.
+        Once installation finishes, the completed outcome is immutable, even
+        if retiring old values invokes a finalizer that fails or destroys the
+        owner. Compiler/master-hook external side effects are outside rollback.
+        The family remains reserved until retirement completes.
+
+        Owner destruction cancels its uncommitted work and removes its failed
+        reports. Committed reports remain readable by the master. Terminal
+        driver reports expire after 300 seconds, without renewal on reads;
+        the cache retains at most 256, evicting oldest completion then lowest
+        ID. All cleanup is automatic. A mudlib polling timeout has no effect
+        on the request's driver state.
+
+DIAGNOSTICS
+        update_blueprint_result(E) defines every public field, conditional
+        declaration/default shape, and error category. Reports have thirteen
+        top-level fields. Nested arrays/mappings are fresh independent copies;
+        mutating a result cannot change another result or the driver's cache.
+        Terminal evidence contains only copied native data, never object,
+        program, closure, or Python references.
+
+        The first error preserves the primary failure. Later rows include
+        compiler evidence, shared generation/schema blockers, and per-instance
+        rows with exact object_name() strings and clone/blueprint roles.
+        Named blockers identify declaration kind, program, name, occurrence,
+        and explicit dispatch when needed. Removed-variable evidence remains
+        available on completed and ordinarily failed requests. A completed
+        schema pass also survives a later diagnostic allocation failure.
+
+        Independent safe reasons are collected after ordinary incompatibility.
+        Diagnostics are bounded, not an unqualified exhaustive scan after an
+        invalid source or resource failure. An incomplete marker explicitly
+        distinguishes limited evidence. Later byte/work limits preserve the
+        primary code/message and add incomplete_code/incomplete_message.
+        No omitted count is guessed. There is no 128-instance cohort cap.
+
+LIMITS
+        The feature is off by default; enable --enable-blueprint-update.
+        Configurable defaults are:
+          --with-blueprint-update-inflight=64
+          --with-blueprint-update-owner=8
+          --with-blueprint-update-targets=10000
+          --with-blueprint-update-scan-objects=1000000
+          --with-blueprint-update-variable-slots=1000000
+          --with-blueprint-update-bytes=67108864
+          --with-blueprint-update-literal-depth=64
+
+        A canonical family may have only one in-flight request, even with
+        disjoint explicit selections. Target limits count unique clones;
+        raw array input and all-mode traversal have a separate scan bound.
+        Variable limits include new staging and old retirement slots. The
+        byte allowance covers retained preparation, report data, checked
+        diagnostic scratch, and conservative bookkeeping; it is per request,
+        not a global reservation. Temporary compilation and LPC values also
+        obey ordinary driver limits.
+
+        The shared schema/runtime/identity budget is 1000000 work steps.
+        Schema inheritance traversal has depth bound 64 and occurrence-path
+        storage of 2048 bytes. Named identity has a 4096-byte internal
+        representability bound; its private encoding is not a public field.
+        Literal compiler scratch and frozen evidence each use the configured
+        byte bound; offsets/counts must fit 32 bits, captured literal arrays
+        have at most 65535 elements, and nesting uses the configured depth.
+        Exceeding optional capture bounds does not make ordinary LPC syntax
+        invalid, but unavailable evidence can block a later update.
+
+        Compiler diagnostics have caps of 128 rows and 65536 text bytes.
+        Each generation/role has 128 schema blockers plus an overflow marker.
+        Runtime count/reservation/fill passes and final validation share the
+        byte/work budgets; weak registry traversal and commit do not allocate,
+        release references, or invoke callbacks. Each result copy has fresh
+        byte/work bounds and obeys normal caller array/mapping/evaluation limits.
+
+REUSABLE COORDINATOR
+        mudlib/blueprint_update.c supplies two public operations:
+          int submit(mixed source [, mixed targets])
+          mapping result(int id)
+
+        Inherit it in a long-lived local coordinator and implement these
+        protected hooks, all of which deny by default:
+          object blueprint_update_initiator(object caller)
+          int blueprint_update_allow_submit(object caller, object initiator,
+                                            mixed source, mixed targets)
+          int blueprint_update_allow_result(object caller, object initiator,
+                                            int id)
+
+        Resolve the wizard through trusted mudlib command/session ownership.
+        The actual immediate caller is captured separately and must not be
+        replaced with a user-supplied wizard or this_player() guess. The submit
+        hook receives a separate copy of explicit selection evidence; mutating
+        it cannot alter the submitted array. The driver's master privilege
+        hook independently authorizes the coordinator, which invokes both efuns
+        and therefore owns every underlying ID.
+
+        Public result callers must be the stored caller or initiating wizard
+        and pass current result policy. Internal polling passes the stored
+        caller and initiator to that policy, rather than inventing a
+        previous_object() context. Revocation prevents automatic report
+        delivery. Notifications go to the initiating wizard with tell_object().
+        The command's caller can read the returned mapping and display its
+        detailed errors/variable_changes in the mudlib's normal operator UI.
+
+        The default local bounds are 64 preallocated bookkeeping slots, one
+        housekeeping callout every 2 seconds, at most 15 automatic polls per
+        ID, and 600 seconds maximum local retention measured from submission.
+        Slots are reserved before policy/admission callbacks, so reentry cannot
+        steal an unpublished record. Full reports and submitted source/target
+        references are not cached. Stored caller/initiator references are
+        authorization metadata. Only terminal, unlocked slots may be evicted
+        to admit a new ID; active slots are not evicted for capacity.
+
+        Accepted, pending, completed, failed, and unknown-expired messages
+        include the ID. Completion includes updated/current counts and blueprint
+        participation; failure includes the primary code. Exhausting the poll
+        allowance announces that automatic polling stopped while the outcome
+        remains unconfirmed. result(id) can still observe later completion.
+        Scheduling failure after admission returns the valid ID with a manual
+        polling notice. A subsequent authorized result read can schedule
+        housekeeping again. Neither event cancels or fails the driver request.
+
+        On a successful read, result() returns the driver's fresh report.
+        If local metadata is absent/expired, or the driver returns its specific
+        unknown/expired-ID error, it instead returns a small mapping with id,
+        status "unknown-expired", and message. Other driver read errors return
+        id, status "report-unavailable", and message while retaining the local
+        ID for a later read. Authorization or admission errors raise. These
+        wrapper observations are not additional driver request states.
+
+        Local terminal eviction or the 600-second local lifetime can erase
+        authorization metadata before the driver report expires. Such an ID
+        is no longer accessible through this coordinator even if the master
+        can still read it. Local expiry also does not cancel pending work.
+        Reads do not extend local retention. Destroying the coordinator has
+        the driver's owner-destruction consequences described above; use a
+        long-lived coordinator rather than a disposable command object.
+
+OPERATOR WORKFLOW
+        After deploying a locally adapted coordinator and master policy:
+          id = coordinator.submit("/npc/guard");
+          report = coordinator.result(id);
+
+        Keep the returned ID. Pending means wait for a later backend turn.
+        Inspect failed reports by exact instance/declaration fields, remove
+        the reported incompatible dependency or correct the source, then
+        submit a new request. Inspect incomplete markers before treating a
+        failure report as complete evidence. For an explicit subset use an
+        object array; use ({}) deliberately when only a path-source blueprint
+        should change. Use a loaded object source when its existing program
+        is the intended candidate. Do not substitute clones() historical
+        selections for all-mode execution discovery without intending that
+        narrower selection.
+
+        Verify retained values and actual cohort counts after completion.
+        There is no constructor/reset replay and no automatic live-mudlib
+        deployment, source-control checkout, or remote publication in this
+        coordinator. The test/t-blueprint-workflow fixture compiles the shipped
+        coordinator and exercises its driver ownership, policy, bounded polling,
+        source modes, state preservation, report copying, and diagnostics.
+
+SEE ALSO
+        update_blueprint(E), update_blueprint_result(E), blueprint(E), clones(E),
+        replace_program(E), python(C)

@@ -106,7 +106,8 @@ program_dependencies_clear (object_t *ob)
 
 enum update_root
 {
-    UPDATE_ORIGIN, UPDATE_SCHEMAS, UPDATE_DIAGNOSTICS, UPDATE_SOURCE, UPDATE_TARGETS,
+    UPDATE_ORIGIN, UPDATE_SCHEMAS, UPDATE_DIAGNOSTICS, UPDATE_RUNTIME_DIAGNOSTICS,
+    UPDATE_SOURCE, UPDATE_TARGETS,
     UPDATE_BLUEPRINT_SCHEMA, UPDATE_BLUEPRINT_DEFAULTS,
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
     UPDATE_TEST_VALUES,
@@ -131,6 +132,25 @@ typedef struct named_translation_s
     int index;                   /* Precomputed location; -1 is inactive. */
 } named_translation_t;
 
+/* Primitive snapshots only: no object, program, binding or Python ownership.
+ * Count and fill passes never allocate or release references. The bounded
+ * byte reservation also covers the later LPC mappings and copied strings.
+ */
+typedef struct update_diagnostic_s
+{
+    const char *code;             /* Static code and explanation literals. */
+    const char *message;
+    p_int old_generation;
+    p_int candidate_generation;
+    Bool blueprint;
+    Bool variable;
+    size_t key_size;
+    char object[MAXPATHLEN + 2];
+    char key[SCHEMA_NAMED_KEY_SIZE];
+} update_diagnostic_t;
+
+#define UPDATE_DIAGNOSTIC_BYTES (sizeof(update_diagnostic_t) + 8192)
+
 typedef struct program_update_request_s
 {
     error_handler_t handler;
@@ -145,7 +165,13 @@ typedef struct program_update_request_s
     p_int id;
     p_int candidate_generation;
     p_int matched, already_current, destroyed, updated;
-    size_t num_diagnostics, num_blockers;
+    size_t num_diagnostics, num_blockers, num_runtime;
+    update_diagnostic_t *diagnostics;
+    size_t diagnostic_capacity;
+    const char *incomplete_code;
+    const char *incomplete_message;
+    Bool primary_latched;
+    Bool schemas_complete;
     size_t target_limit, scan_limit;
     schema_budget_t budget;
     const char *failure_code;
@@ -545,6 +571,8 @@ free_request (program_update_request_t *request)
     free_svalue(&request->roots[UPDATE_ORIGIN]);
     free_svalue(&request->roots[UPDATE_SCHEMAS]);
     free_svalue(&request->roots[UPDATE_DIAGNOSTICS]);
+    free_svalue(&request->roots[UPDATE_RUNTIME_DIAGNOSTICS]);
+    if (request->diagnostics) xfree(request->diagnostics);
     link = &requests;
     while (*link != request)
         link = &(*link)->next;
@@ -610,8 +638,31 @@ static void
 request_failure(program_update_request_t *request, const char *code,
                 const char *message)
 {
+    if (request->primary_latched) return;
     request->failure_code = code;
     snprintf(request->failure_message, sizeof(request->failure_message), "%s", message);
+}
+
+static void
+remember_failure(program_update_request_t *request, const char *code,
+                 const char *message)
+{
+    request_failure(request, code, message);
+    request->primary_latched = MY_TRUE;
+}
+
+static void
+incomplete_evidence(program_update_request_t *request, const char *code,
+                    const char *message)
+{
+    if (strcmp(request->failure_code, "PREPARATION_PENDING"))
+        request->primary_latched = MY_TRUE;
+    remember_failure(request, code, message);
+    if (!request->incomplete_code)
+    {
+        request->incomplete_code = code;
+        request->incomplete_message = message;
+    }
 }
 
 static void
@@ -642,20 +693,13 @@ same_family (object_t *object, string_t *origin)
     return object->load_name && mstreq(object->load_name, origin);
 } /* same_family() */
 
-static void
-validate_object (object_t *object, string_t *origin, Bool source,
-                 Bool check_family, program_update_request_t *request)
+static const char *
+object_problem(object_t *object, string_t *origin, Bool source,
+               Bool check_family, const char **reason,
+               program_update_request_t *request)
 
-/* Require <object> to be a supported, live member of canonical family
- * <origin>. With <source> true it must be the actual ordinary blueprint;
- * otherwise a same-family clone is also accepted. Reject special roles,
- * virtual/replaced objects, and, with <check_family>, pending replace_program
- * conflicts. Initial source-path execution checks only the captured source;
- * its family is checked after compiler callbacks and complete count discovery.
- *
- * May unswap an existing object but never loads a missing blueprint.
- * Return normally on success; raise an LPC error on invalidity or failure.
- */
+/* Nonallocating classification, also usable at the final publication check.
+ * Unswapping belongs to the rooted preflight wrapper below. */
 
 {
     const char *name, *program_name;
@@ -663,7 +707,10 @@ validate_object (object_t *object, string_t *origin, Bool source,
     replace_ob_t *replacement;
     if (!object || object->flags & (O_DESTRUCTED | O_REPLACED | O_SHADOW)
      || object == master_ob || object == simul_efun_object)
-        object_error(request, object, "UNSUPPORTED_OBJECT", "unsupported object.");
+    {
+        *reason = "unsupported object.";
+        return "UNSUPPORTED_OBJECT";
+    }
     /* Backup names may include a leading slash or .c suffix. Resolve only
      * an existing identity; admission must never load a sefun implicitly.
      */
@@ -672,17 +719,39 @@ validate_object (object_t *object, string_t *origin, Bool source,
         size_t i;
 
         for (i = 1; i < VEC_SIZE(simul_efun_vector); i++)
+        {
+            if (request)
+            {
+                if (!request->budget.work)
+                {
+                    *reason = "object classification work limit exceeded.";
+                    return "RUNTIME_DEPENDENCY_LIMIT";
+                }
+                request->budget.work--;
+            }
             if (simul_efun_vector->item[i].type == T_STRING
              && find_object(simul_efun_vector->item[i].u.str) == object)
-                object_error(request, object, "SPECIAL_OBJECT", "backup simul-efun object.");
+                {
+                    *reason = "backup simul-efun object.";
+                    return "SPECIAL_OBJECT";
+                }
+        }
     }
     if (source && (object->flags & O_CLONE))
-        object_error(request, object, "SOURCE_UNSUPPORTED", "source must be a blueprint.");
+    {
+        *reason = "source must be a blueprint.";
+        return "SOURCE_UNSUPPORTED";
+    }
     if (!same_family(object, origin))
-        object_error(request, object, "UNRELATED_TARGET", "unrelated target.");
+    {
+        *reason = "unrelated target.";
+        return "UNRELATED_TARGET";
+    }
     if (object->flags & O_SWAPPED)
-        if (SWAP_TEST_FAIL(request, 1) || load_ob_from_swap(object) < 0)
-            object_error(request, object, "SWAP_FAILED", "cannot unswap object.");
+    {
+        *reason = "object program is swapped.";
+        return "SWAP_FAILED";
+    }
     name = get_txt(origin);
     if (*name == '/')
         name++;
@@ -693,12 +762,45 @@ validate_object (object_t *object, string_t *origin, Bool source,
      || strcmp(program_name + length, ".c")
      || (source && (object->prog->blueprint != object
                  || strcmp(get_txt(object->name), name))))
-        object_error(request, object, "UNSUPPORTED_OBJECT", "virtual or replaced object.");
+    {
+        *reason = "virtual or replaced object.";
+        return "UNSUPPORTED_OBJECT";
+    }
     if (check_family)
         for (replacement = obj_list_replace; replacement; replacement = replacement->next)
+        {
+            if (request)
+            {
+                if (!request->budget.work)
+                {
+                    *reason = "replacement classification work limit exceeded.";
+                    return "RUNTIME_DEPENDENCY_LIMIT";
+                }
+                request->budget.work--;
+            }
             if (same_family(replacement->ob, origin))
-                object_error(request, object, "REPLACEMENT_PENDING", "pending replace_program conflict.");
-} /* validate_object() */
+                {
+                    *reason = "pending replace_program conflict.";
+                    return "REPLACEMENT_PENDING";
+                }
+        }
+    return NULL;
+}
+
+static void
+validate_object(object_t *object, string_t *origin, Bool source,
+                Bool check_family, program_update_request_t *request)
+{
+    const char *reason = NULL;
+    const char *code = object_problem(object, origin, source, check_family, &reason, request);
+    if (code && !strcmp(code, "SWAP_FAILED"))
+    {
+        if (SWAP_TEST_FAIL(request, 1) || load_ob_from_swap(object) < 0)
+            object_error(request, object, "SWAP_FAILED", "cannot unswap object.");
+        code = object_problem(object, origin, source, check_family, &reason, request);
+    }
+    if (code) object_error(request, object, code, reason);
+}
 
 static void
 validate_source (program_update_request_t *request, Bool check_family)
@@ -754,7 +856,7 @@ request_bytes(program_update_request_t *request, size_t bytes)
 {
     if (bytes >= request->budget.bytes)
     {
-        request_failure(request, "REPORT_SIZE_LIMIT", "Request/report storage limit exceeded; evidence is incomplete.");
+        incomplete_evidence(request, "REPORT_SIZE_LIMIT", "Request/report storage limit exceeded; evidence is incomplete.");
         errorf("update_blueprint(): request/report storage limit exceeded.\n");
     }
     request->budget.bytes -= bytes;
@@ -906,7 +1008,24 @@ validate_targets (program_update_request_t *request, Bool admission)
         }
         if (!targets && (!(object->flags & O_CLONE) || !same_family(object, origin)))
             continue;
-        validate_object(object, origin, MY_FALSE, MY_TRUE, request);
+        if (admission)
+            validate_object(object, origin, MY_FALSE, MY_TRUE, request);
+        else
+        {
+            const char *reason = NULL;
+            const char *code = object_problem(object, origin, MY_FALSE, MY_TRUE, &reason, request);
+            if (code && !strcmp(code, "SWAP_FAILED"))
+            {
+                if (SWAP_TEST_FAIL(request, 1) || load_ob_from_swap(object) < 0)
+                    object_error(request, object, "SWAP_FAILED", "cannot unswap object.");
+                code = object_problem(object, origin, MY_FALSE, MY_TRUE, &reason, request);
+            }
+            if (code)
+            {
+                remember_failure(request, code, reason);
+                continue;
+            }
+        }
         if (!(object->flags & O_CLONE))
             continue;
         if (++count > request->target_limit)
@@ -917,105 +1036,6 @@ validate_targets (program_update_request_t *request, Bool admission)
             request_error(request, "VARIABLE_STORAGE_LIMIT", "variable storage limit exceeded.");
     }
 } /* validate_targets() */
-
-static Bool
-validate_runtime_object (program_update_request_t *request, object_t *ob)
-
-/* Called at the final compatibility boundary, after schema diagnostics.
- * No callbacks or allocation occur while consulting the weak inventories.
- */
-
-{
-    program_dependency_t *link;
-    const char *code = NULL, *reason = NULL;
-    char message[2 * MAXPATHLEN + 256];
-
-    for (link = ob->program_dependencies; link; link = link->next)
-    {
-        if (!request->budget.work)
-        {
-            code = "RUNTIME_DEPENDENCY_LIMIT";
-            reason = "live dependency scan limit exceeded.";
-            break;
-        }
-        request->budget.work--;
-        if (link->kind != PROGRAM_DEPENDENCY_COROUTINE
-         && ((closure_base_t *)link->handle)->named)
-            continue;
-        if (link->kind == PROGRAM_DEPENDENCY_COROUTINE)
-        {
-            code = "LIVE_COROUTINE";
-            reason = "unfinished coroutine depends on the current program.";
-        }
-        else
-        {
-            code = "LIVE_CLOSURE";
-            reason = "live closure depends on the current program.";
-        }
-        break;
-    }
-#ifdef USE_PYTHON
-    if (!code)
-    {
-        Bool python_handles = python_program_has_handles(ob, &request->budget.work);
-        if (!request->budget.work)
-        {
-            code = "RUNTIME_DEPENDENCY_LIMIT";
-            reason = "live Python dependency scan limit exceeded.";
-        }
-        else if (python_handles)
-        {
-            code = "PYTHON_HANDLE";
-            reason = "live Python handle depends on the current program.";
-        }
-    }
-#endif
-    if (!code)
-        return MY_TRUE;
-    snprintf(message, sizeof(message), "%s: %s", get_txt(ob->name), reason);
-    /* The schema pass completed. Do not unwind through the preparation
-     * error handler, which correctly discards incomplete schema evidence.
-     */
-    request_failure(request, code, message);
-    return MY_FALSE;
-}
-
-static void
-validate_runtime_dependencies (program_update_request_t *request)
-
-/* Only programs that would change need compatibility checks. Object-source
- * mode leaves its blueprint and already-current clones unchanged. Selection
- * validity and complete counts have already been established after hooks.
- */
-
-{
-    object_t *ob;
-    program_t *candidate = request->source_from_path ? request->candidate
-                                                    : request->source_program;
-    vector_t *targets = request->explicit_selection
-                       ? request->roots[UPDATE_TARGETS].u.vec : NULL;
-    size_t index = 0;
-
-    if (request->source_from_path)
-        if (!validate_runtime_object(request, request->roots[UPDATE_SOURCE].u.ob))
-            return;
-    for (ob = targets ? NULL : obj_list; targets || ob;
-         ob = targets ? NULL : ob->next_all)
-    {
-        if (targets)
-        {
-            if (index == VEC_SIZE(targets)) break;
-            svalue_t *value = &targets->item[index++];
-            ob = value->type == T_OBJECT ? value->u.ob : NULL;
-        }
-        if (!ob || ob->flags & O_DESTRUCTED || !(ob->flags & O_CLONE)
-         || ob->prog == candidate
-         || (!targets && !same_family(ob, request->roots[UPDATE_ORIGIN].u.str)))
-            continue;
-        if (!validate_runtime_object(request, ob))
-            return;
-    }
-}
 
 static void
 describe_schemas (program_update_request_t *request)
@@ -1121,6 +1141,9 @@ describe_schemas (program_update_request_t *request)
             continue;
         if (!(object->flags & O_CLONE) || object->prog == candidate)
             continue;
+        const char *reason;
+        if (object_problem(object, request->roots[UPDATE_ORIGIN].u.str,
+                           MY_FALSE, MY_TRUE, &reason, request)) continue;
         for (previous = 0; previous < count; previous++)
         {
             svalue_t *generation;
@@ -1165,8 +1188,14 @@ describe_schemas (program_update_request_t *request)
             {
                 mapping_t *block = blocks->item[j].u.map;
                 if (!strcmp(get_txt(report_field(block, "code")->u.str), "SCHEMA_DIAGNOSTIC_LIMIT"))
+                {
+                    /* This was the schema pass's primary code before
+                     * instance diagnostics were added; retain that order. */
                     request_failure(request, "SCHEMA_DIAGNOSTIC_LIMIT",
                                     "Schema diagnostic limit exceeded; evidence is incomplete.");
+                    incomplete_evidence(request, "SCHEMA_DIAGNOSTIC_LIMIT",
+                                    "Schema diagnostic limit exceeded; evidence is incomplete.");
+                }
                 put_number(report_field(block, "old_generation"), old_generation);
                 put_number(report_field(block, "candidate_generation"), candidate->schema_generation);
                 put_c_string(report_field(block, "role"), role ? "blueprint" : "generation");
@@ -1174,6 +1203,8 @@ describe_schemas (program_update_request_t *request)
             }
         }
     }
+    if (!compatible) request->primary_latched = MY_TRUE;
+    request->schemas_complete = MY_TRUE;
 } /* describe_schemas() */
 
 static mapping_t *
@@ -1191,6 +1222,312 @@ variable_schema (program_update_request_t *request, program_t *old)
     }
     errorf("update_blueprint(): variable generation plan unavailable.\n");
     return NULL;
+}
+
+typedef struct diagnostic_capture_s
+{
+    program_update_request_t *request;
+    size_t count;
+    Bool fill;
+    const char *code;
+    const char *message;
+    const char *limit;
+} diagnostic_capture_t;
+
+static Bool
+diagnostic_work(diagnostic_capture_t *capture)
+{
+    if (capture->limit) return MY_FALSE;
+    if (!capture->request->budget.work)
+    {
+        capture->limit = "RUNTIME_DEPENDENCY_LIMIT";
+        return MY_FALSE;
+    }
+    capture->request->budget.work--;
+    return MY_TRUE;
+}
+
+static void
+capture_diagnostic(diagnostic_capture_t *capture, object_t *ob,
+                   const char *code, const char *message, named_binding_t *binding)
+
+/* Called with a live owner and stable weak inventory. Copy bytes only. */
+
+{
+    update_diagnostic_t *row;
+    program_update_request_t *request = capture->request;
+    size_t length = mstrsize(ob->name);
+    size_t slash = compat_mode ? 0 : 1;
+    if (!capture->code)
+    {
+        capture->code = code;
+        capture->message = message;
+    }
+    if (capture->limit) return;
+    if (length + slash >= sizeof(row->object)
+     || (binding && binding->key_size > sizeof(row->key))
+     || capture->count >= SIZE_MAX / UPDATE_DIAGNOSTIC_BYTES)
+    {
+        capture->limit = "REPORT_SIZE_LIMIT";
+        return;
+    }
+    if (!capture->fill)
+    {
+        capture->count++;
+        return;
+    }
+    if (capture->count == request->diagnostic_capacity)
+    {
+        capture->limit = "REPORT_SIZE_LIMIT";
+        return;
+    }
+    row = &request->diagnostics[capture->count++];
+    *row = (update_diagnostic_t){ .code = code, .message = message,
+        .blueprint = !(ob->flags & O_CLONE),
+        .old_generation = ob->flags & O_SWAPPED ? 0 : ob->prog->schema_generation,
+        .candidate_generation = request->candidate_generation };
+    if (slash) row->object[0] = '/';
+    memcpy(row->object + slash, get_txt(ob->name), length + 1);
+    if (binding)
+    {
+        row->variable = binding->variable;
+        row->key_size = binding->key_size;
+        memcpy(row->key, binding->key, binding->key_size);
+    }
+}
+
+static int
+resolve_named_binding(program_update_request_t *request, program_t *candidate,
+                      named_binding_t *binding, Bool *ambiguous)
+{
+    char key[SCHEMA_NAMED_KEY_SIZE];
+    int index = -1;
+    int limit = binding->variable ? candidate->num_variables : candidate->num_functions;
+    *ambiguous = MY_FALSE;
+    if (binding->index < 0) return -1;
+    for (int i = 0; i < limit; i++)
+    {
+        size_t size = program_schema_named_key(candidate, i, binding->inherited,
+                                              binding->variable, key, &request->budget);
+        if (!request->budget.work) return -1;
+        if (size != binding->key_size || memcmp(key, binding->key, size)) continue;
+        if (index >= 0) *ambiguous = MY_TRUE;
+        else index = i;
+    }
+    return *ambiguous ? -1 : index;
+}
+
+static svalue_t *
+existing_report_field(mapping_t *map, const char *name)
+
+/* Every queried field was installed by the schema pass. No key allocation. */
+
+{
+    svalue_t key;
+    string_t *string = find_tabled_str(name, STRING_UTF8);
+    if (!string) return &const0;
+    put_string(&key, string);
+    return get_map_value(map, &key);
+}
+
+static void
+capture_object_diagnostics(diagnostic_capture_t *capture, object_t *ob, int phase)
+{
+    program_update_request_t *request = capture->request;
+    program_t *candidate = request->source_from_path ? request->candidate : request->source_program;
+    program_dependency_t *link;
+    const char *reason = NULL;
+    const char *problem = object_problem(ob, request->roots[UPDATE_ORIGIN].u.str,
+                                        !(ob->flags & O_CLONE), MY_TRUE, &reason, request);
+    if (problem)
+    {
+        if (phase == 0) capture_diagnostic(capture, ob, problem, reason, NULL);
+        if (!strcmp(problem, "RUNTIME_DEPENDENCY_LIMIT")) capture->limit = problem;
+        return;
+    }
+    if (ob->prog == candidate) return;
+    if (phase == 0)
+    {
+        vector_t *schemas = request->roots[UPDATE_SCHEMAS].u.vec;
+        for (size_t i = 0; i < VEC_SIZE(schemas); i++)
+        {
+            mapping_t *schema = schemas->item[i].u.map;
+            svalue_t *blocks;
+            if (!diagnostic_work(capture)) return;
+            if (existing_report_field(schema, "old_generation")->u.number != ob->prog->schema_generation)
+                continue;
+            blocks = existing_report_field(schema, ob->flags & O_CLONE ? "blockers" : "blueprint_blockers");
+            if (blocks->type == T_POINTER && VEC_SIZE(blocks->u.vec))
+                capture_diagnostic(capture, ob, "SCHEMA_INCOMPATIBLE",
+                    "This instance has incompatible schema or defaults; see its generation evidence.", NULL);
+            break;
+        }
+    }
+    else if (phase == 1)
+    {
+        Bool closure = MY_FALSE, coroutine = MY_FALSE, first_coroutine = MY_FALSE;
+        for (link = ob->program_dependencies; link; link = link->next)
+        {
+            if (!diagnostic_work(capture)) return;
+            if (link->kind == PROGRAM_DEPENDENCY_COROUTINE)
+            {
+                if (!closure) first_coroutine = MY_TRUE;
+                coroutine = MY_TRUE;
+            }
+            else if (!((closure_base_t *)link->handle)->named) closure = MY_TRUE;
+        }
+        if (coroutine && first_coroutine)
+            capture_diagnostic(capture, ob, "LIVE_COROUTINE",
+                               "Unfinished coroutine depends on the current program.", NULL);
+        if (closure)
+            capture_diagnostic(capture, ob, "LIVE_CLOSURE",
+                               "Live closure depends on the current program.", NULL);
+        if (coroutine && !first_coroutine)
+            capture_diagnostic(capture, ob, "LIVE_COROUTINE",
+                               "Unfinished coroutine depends on the current program.", NULL);
+#ifdef USE_PYTHON
+        if (python_program_has_handles(ob, &request->budget.work))
+            capture_diagnostic(capture, ob, "PYTHON_HANDLE",
+                               "Live Python handle depends on the current program.", NULL);
+        if (!request->budget.work) capture->limit = "RUNTIME_DEPENDENCY_LIMIT";
+#endif
+    }
+    else
+    {
+        for (named_binding_t *binding = ob->named_bindings; binding; binding = binding->next)
+        {
+            Bool ambiguous, native = MY_FALSE;
+            const char *code;
+            if (!diagnostic_work(capture)) return;
+            int index = resolve_named_binding(request, candidate, binding, &ambiguous);
+            if (!request->budget.work)
+            {
+                capture->limit = "RUNTIME_DEPENDENCY_LIMIT";
+                return;
+            }
+            if (index >= 0) continue;
+            code = ambiguous ? "HANDLE_DECLARATION_AMBIGUOUS" : "HANDLE_DECLARATION_REMOVED";
+#ifdef USE_PYTHON
+            if (python_program_has_named_binding(ob, binding, &request->budget.work))
+                capture_diagnostic(capture, ob, code,
+                    ambiguous ? "Retained Python declaration has ambiguous candidate slots."
+                              : "Retained Python declaration is missing from the candidate.", binding);
+            if (!request->budget.work)
+            {
+                capture->limit = "RUNTIME_DEPENDENCY_LIMIT";
+                return;
+            }
+#endif
+            for (link = ob->program_dependencies; link; link = link->next)
+            {
+                if (!diagnostic_work(capture)) return;
+                if (link->kind != PROGRAM_DEPENDENCY_COROUTINE
+                 && ((closure_base_t *)link->handle)->named == binding) native = MY_TRUE;
+            }
+            if (native)
+                capture_diagnostic(capture, ob, code,
+                    ambiguous ? "Retained named closure declaration has ambiguous candidate slots."
+                              : "Retained named closure declaration is missing from the candidate.", binding);
+        }
+    }
+}
+
+static diagnostic_capture_t
+capture_diagnostics(program_update_request_t *request, Bool fill)
+
+/* Ordered schema/runtime/named passes preserve the original primary reason.
+ * There are no allocations, decrefs, callbacks or unowned pointer snapshots.
+ */
+
+{
+    diagnostic_capture_t capture = { .request = request, .fill = fill };
+    vector_t *targets = request->explicit_selection ? request->roots[UPDATE_TARGETS].u.vec : NULL;
+    for (int phase = 0; phase < 3 && !capture.limit; phase++)
+    {
+        object_t *ob;
+        size_t index = 0;
+        if (request->source_from_path)
+            capture_object_diagnostics(&capture, request->roots[UPDATE_SOURCE].u.ob, phase);
+        for (ob = targets ? NULL : obj_list; (targets || ob) && !capture.limit;
+             ob = targets ? NULL : ob->next_all)
+        {
+            if (targets)
+            {
+                if (index == VEC_SIZE(targets)) break;
+                svalue_t *value = &targets->item[index++];
+                ob = value->type == T_OBJECT ? value->u.ob : NULL;
+            }
+            if (!diagnostic_work(&capture)) break;
+            if (!ob || ob->flags & O_DESTRUCTED || !(ob->flags & O_CLONE)
+             || (!targets && !same_family(ob, request->roots[UPDATE_ORIGIN].u.str))) continue;
+            capture_object_diagnostics(&capture, ob, phase);
+        }
+    }
+    return capture;
+}
+
+static void
+finish_capture(program_update_request_t *request, diagnostic_capture_t *capture)
+{
+    if (capture->code) remember_failure(request, capture->code, capture->message);
+    if (capture->limit)
+        incomplete_evidence(request, capture->limit,
+                            "Diagnostic byte or work limit exceeded; evidence is incomplete.");
+}
+
+static void
+describe_runtime(program_update_request_t *request)
+
+/* Count first, reserve checked primitive and LPC storage, then refill. The
+ * request roots both scratch and every partial mapping before allocations.
+ */
+
+{
+    diagnostic_capture_t capture = capture_diagnostics(request, MY_FALSE);
+    svalue_t *root = &request->roots[UPDATE_RUNTIME_DIAGNOSTICS];
+    finish_capture(request, &capture);
+    if (capture.limit || !capture.count) return;
+    if (capture.count > (request->budget.bytes - (request->budget.bytes != 0)) / UPDATE_DIAGNOSTIC_BYTES)
+    {
+        incomplete_evidence(request, "REPORT_SIZE_LIMIT", "Diagnostic storage limit exceeded; evidence is incomplete.");
+        return;
+    }
+    request_bytes(request, capture.count * UPDATE_DIAGNOSTIC_BYTES);
+    request->diagnostic_capacity = capture.count;
+    report_test_begin("requests-runtime-fault");
+    PIPELINE_TEST_STEP(request, "diagnostic scratch allocation", MY_TRUE);
+    request->diagnostics = REPORT_TEST_NULL(xalloc(capture.count * sizeof(*request->diagnostics)));
+    if (!request->diagnostics) outofmemory("blueprint diagnostic scratch");
+    capture = capture_diagnostics(request, MY_TRUE);
+    finish_capture(request, &capture);
+    report_test_step();
+    put_array(root, allocate_array(capture.count));
+    for (size_t i = 0; i < capture.count; i++)
+    {
+        update_diagnostic_t *row = &request->diagnostics[i];
+        mapping_t *map = REPORT_TEST_NULL(allocate_mapping(11, 1));
+        if (!map) outofmemory("blueprint instance diagnostic");
+        put_mapping(&root->u.vec->item[i], map);
+        put_c_string(report_field(map, "code"), row->code);
+        put_c_string(report_field(map, "message"), row->message);
+        put_c_string(report_field(map, "object"), row->object);
+        put_c_string(report_field(map, "role"), row->blueprint ? "blueprint" : "clone");
+        put_number(report_field(map, "old_generation"), row->old_generation);
+        put_number(report_field(map, "candidate_generation"), row->candidate_generation);
+        if (row->key_size)
+        {
+            put_c_string(report_field(map, "kind"), row->variable ? "variable" : "function");
+            program_schema_named_report(map, row->key, row->key_size);
+        }
+        request->num_runtime++;
+        PIPELINE_TEST_STEP(request, "rooted instance diagnostic", MY_TRUE);
+    }
+    xfree(request->diagnostics);
+    request->diagnostics = NULL;
+    request->diagnostic_capacity = 0;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    report_test_countdown = -1;
+#endif
 }
 
 static program_update_variables_t *
@@ -1317,7 +1654,6 @@ prepare_variables (program_update_request_t *request)
     }
     validate_source(request, MY_TRUE);
     validate_targets(request, MY_FALSE);
-    validate_runtime_dependencies(request);
     if (!request->source_from_path)
         for (size_t i = 0; i < blueprint->num_values; i++)
         {
@@ -1340,7 +1676,6 @@ prepare_named_bindings (program_update_request_t *request)
  */
 {
     program_t *candidate = request->source_from_path ? request->candidate : request->source_program;
-    char key[SCHEMA_NAMED_KEY_SIZE];
 
     for (program_update_variables_t *stage = request->variables; stage; stage = stage->next)
     {
@@ -1362,58 +1697,82 @@ prepare_named_bindings (program_update_request_t *request)
         PIPELINE_TEST_STEP(request, "rooted named translation array", MY_TRUE);
         for (named_binding_t *binding = ob->named_bindings; binding; binding = binding->next)
         {
-            int index = -1;
-            Bool ambiguous = MY_FALSE;
-            int limit = binding->variable ? candidate->num_variables : candidate->num_functions;
-            if (binding->index >= 0)
-                for (int i = 0; i < limit; i++)
-                {
-                    size_t size = program_schema_named_key(candidate, i, binding->inherited,
-                                                          binding->variable, key, &request->budget);
-                    if (!request->budget.work)
-                        errorf("update_blueprint(): named resolution work limit exceeded.\n");
-                    if (size != binding->key_size || memcmp(key, binding->key, size))
-                        continue;
-                    if (index >= 0) ambiguous = MY_TRUE;
-                    else index = i;
-                }
-            if (ambiguous) index = -1;
-            if (index < 0)
-            {
-#ifdef USE_PYTHON
-                Bool python_live = python_program_has_named_binding(ob, binding, &request->budget.work);
-                if (!request->budget.work)
-                    errorf("update_blueprint(): named Python dependency work limit exceeded.\n");
-                if (python_live)
-                {
-                    request_failure(request, ambiguous ? "HANDLE_DECLARATION_AMBIGUOUS"
-                                                       : "HANDLE_DECLARATION_REMOVED",
-                        ambiguous ? "A retained Python declaration has ambiguous candidate slots."
-                                  : "A retained Python declaration is missing from the candidate.");
-                    return;
-                }
-#endif
-                for (program_dependency_t *link = ob->program_dependencies; link; link = link->next)
-                {
-                    if (!request->budget.work)
-                        errorf("update_blueprint(): named dependency work limit exceeded.\n");
-                    request->budget.work--;
-                    if (link->kind != PROGRAM_DEPENDENCY_COROUTINE
-                     && ((closure_base_t *)link->handle)->named == binding)
-                    {
-                        request_failure(request, ambiguous ? "HANDLE_DECLARATION_AMBIGUOUS"
-                                                           : "HANDLE_DECLARATION_REMOVED",
-                            ambiguous ? "A retained named closure declaration has ambiguous candidate slots."
-                                      : "A retained named closure declaration is missing from the candidate.");
-                        return;
-                    }
-                }
-            }
+            Bool ambiguous;
+            int index = resolve_named_binding(request, candidate, binding, &ambiguous);
+            if (!request->budget.work)
+                request_error(request, "RUNTIME_DEPENDENCY_LIMIT", "named resolution work limit exceeded.");
+            if (stage->num_bindings == count)
+                request_error(request, "REPORT_SIZE_LIMIT", "named binding population grew beyond reserved storage.");
             stage->bindings[stage->num_bindings++] = (named_translation_t){ binding, index };
             PIPELINE_TEST_STEP(request, "partial named translations", MY_TRUE);
         }
     }
 } /* prepare_named_bindings() */
+
+static diagnostic_capture_t
+validate_final_state(program_update_request_t *request)
+
+/* The last check before store-only publication. No allocation, IO, callback,
+ * formatting or reference release may occur here, including failure paths.
+ * Report materialization is allowed only after this returns a rejection.
+ */
+
+{
+    diagnostic_capture_t capture = { .request = request };
+    svalue_t *source = &request->roots[UPDATE_SOURCE];
+    if (request->canceled || source->type != T_OBJECT
+     || source->u.ob->flags & (O_DESTRUCTED | O_SWAPPED)
+     || source->u.ob->prog != request->source_program)
+    {
+        capture.code = "SOURCE_INVALIDATED";
+        capture.message = "Captured source changed during preparation.";
+        return capture;
+    }
+    for (program_update_variables_t *stage = request->variables; stage; stage = stage->next)
+    {
+        size_t count = 0;
+        object_t *ob = stage->object.u.ob;
+        if (!diagnostic_work(&capture)) return capture;
+        if (stage->object.type != T_OBJECT || ob->flags & (O_DESTRUCTED | O_SWAPPED)
+         || ob->prog != stage->old_program)
+        {
+            capture.code = "PREPARATION_FAILED";
+            capture.message = "A staged object changed during preparation.";
+            return capture;
+        }
+        if (stage->snapshot)
+        {
+            for (size_t i = 0; i < stage->num_values; i++)
+            {
+                if (!diagnostic_work(&capture)) return capture;
+                if (!same_variable_value(stage->values + i, ob->variables + i))
+                {
+                    capture.code = "SOURCE_CHANGED";
+                    capture.message = "Loaded blueprint values changed during preparation.";
+                    return capture;
+                }
+            }
+            continue;
+        }
+        for (named_binding_t *binding = ob->named_bindings; binding; binding = binding->next)
+        {
+            if (!diagnostic_work(&capture)) return capture;
+            if (count == stage->num_bindings || stage->bindings[count++].binding != binding)
+            {
+                capture.code = "PREPARATION_FAILED";
+                capture.message = "Named binding population changed during preparation.";
+                return capture;
+            }
+        }
+        if (count != stage->num_bindings)
+        {
+            capture.code = "PREPARATION_FAILED";
+            capture.message = "Named binding population changed during preparation.";
+            return capture;
+        }
+    }
+    return capture_diagnostics(request, MY_FALSE);
+}
 
 static void
 prepare_publication (program_update_request_t *request)
@@ -1994,19 +2353,27 @@ f_update_blueprint_result (svalue_t *sp)
     report_test_step();
     report_copy_units(&budget, 1, sizeof(vector_t));
     if (request->terminal)
-        report_copy_units(&budget, !request->committed + request->num_diagnostics + request->num_blockers, sizeof(svalue_t));
-    put_array(field, allocate_array(request->terminal ? !request->committed + request->num_diagnostics + request->num_blockers : 0));
+        report_copy_units(&budget, !request->committed + request->num_diagnostics + request->num_blockers + request->num_runtime
+            + (request->incomplete_code && strcmp(request->failure_code, request->incomplete_code)), sizeof(svalue_t));
+    put_array(field, allocate_array(request->terminal ? !request->committed + request->num_diagnostics + request->num_blockers + request->num_runtime
+            + (request->incomplete_code && strcmp(request->failure_code, request->incomplete_code)) : 0));
     if (request->terminal)
     {
         size_t offset = !request->committed;
         if (!request->committed)
         {
-        error = REPORT_TEST_NULL(allocate_mapping(2, 1));
-        if (!error)
-            outofmem(2, "blueprint update failure report");
-        put_mapping(&field->u.vec->item[0], error);
-        put_c_string(report_field(error, "code"), request->failure_code);
-        put_c_string(report_field(error, "message"), request->failure_message);
+            error = REPORT_TEST_NULL(allocate_mapping(2, 1));
+            if (!error)
+                outofmem(2, "blueprint update failure report");
+            put_mapping(&field->u.vec->item[0], error);
+            put_c_string(report_field(error, "code"), request->failure_code);
+            put_c_string(report_field(error, "message"), request->failure_message);
+            if (request->incomplete_code)
+            {
+                put_number(report_field(error, "incomplete"), 1);
+                put_c_string(report_field(error, "incomplete_code"), request->incomplete_code);
+                put_c_string(report_field(error, "incomplete_message"), request->incomplete_message);
+            }
         }
         for (i = 0; i < request->num_diagnostics; i++)
             copy_report_value(&field->u.vec->item[i + offset],
@@ -2025,6 +2392,18 @@ f_update_blueprint_result (svalue_t *sp)
                         copy_report_value(&field->u.vec->item[offset + i++], &blocks->u.vec->item[j], &copy);
                 }
             }
+        for (size_t j = 0; j < request->num_runtime; j++)
+            copy_report_value(&field->u.vec->item[offset + i++],
+                              &request->roots[UPDATE_RUNTIME_DIAGNOSTICS].u.vec->item[j], &copy);
+        if (request->incomplete_code && strcmp(request->failure_code, request->incomplete_code))
+        {
+            error = REPORT_TEST_NULL(allocate_mapping(3, 1));
+            if (!error) outofmemory("blueprint diagnostic limit report");
+            put_mapping(&field->u.vec->item[offset + i], error);
+            put_c_string(report_field(error, "code"), request->incomplete_code);
+            put_c_string(report_field(error, "message"), request->incomplete_message);
+            put_number(report_field(error, "incomplete"), 1);
+        }
     }
     pop_stack(); /* Pointer table handler; report remains at sp. */
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
@@ -2193,11 +2572,20 @@ program_update_process (void)
                 debug_message("BLUEPRINT_PIPELINE_ERROR_GC: partial reports remain rooted, %d collections.\n", collected);
             }
 #endif
-            /* Partial summaries are never exposed as completed evidence. */
-            free_svalue(&active->roots[UPDATE_SCHEMAS]);
-            put_number(&active->roots[UPDATE_SCHEMAS], 0);
-            active->candidate_generation = 0;
-            active->num_blockers = 0;
+            /* A completed schema pass remains useful after later failure;
+             * never describe a partial pass as complete evidence. */
+            incomplete_evidence(active, "PREPARATION_FAILED",
+                                "Preparation failed before complete diagnostic evidence was available.");
+            if (!active->schemas_complete)
+            {
+                free_svalue(&active->roots[UPDATE_SCHEMAS]);
+                put_number(&active->roots[UPDATE_SCHEMAS], 0);
+                active->candidate_generation = 0;
+                active->num_blockers = 0;
+            }
+            if (active->diagnostics) xfree(active->diagnostics);
+            active->diagnostics = NULL;
+            active->diagnostic_capacity = 0;
             if (preparation_guard_active)
             {
                 set_stack_gap_guard(previous_preparation_guard);
@@ -2287,8 +2675,9 @@ program_update_process (void)
             preparation_guard_active = MY_FALSE;
             if (preparation_guard.failed)
                 errorf("update_blueprint(): memory pressure preparing defaults.\n");
-            if (!strcmp(active->failure_code, "PREPARATION_PENDING"))
-                validate_runtime_dependencies(active);
+            set_stack_gap_guard(&preparation_guard);
+            preparation_guard_active = MY_TRUE;
+            describe_runtime(active);
             if (!strcmp(active->failure_code, "PREPARATION_PENDING"))
             {
                 set_stack_gap_guard(&preparation_guard);
@@ -2311,14 +2700,24 @@ program_update_process (void)
                 if (active->pipeline_countdown >= 0)
                     debug_message("BLUEPRINT_PIPELINE_COMPLETE: %d checkpoints.\n", active->pipeline_steps);
 #endif
-                if (!strcmp(active->failure_code, "PREPARATION_PENDING"))
+                /* Last nonallocating inventory validation. A new failure is
+                 * formatted only after publication has been abandoned. */
+                diagnostic_capture_t final = validate_final_state(active);
+                if (!final.code && !final.limit)
                     commit_variables(active);
+                else
+                {
+                    finish_capture(active, &final);
+                    if (final.count) describe_runtime(active);
+                }
                 pop_stack(); /* Rollback unless ownership was committed. */
                 set_stack_gap_guard(previous_preparation_guard);
                 preparation_guard_active = MY_FALSE;
                 if (preparation_guard.failed && !active->committed)
                     errorf("update_blueprint(): memory pressure preparing variables.\n");
             }
+            set_stack_gap_guard(previous_preparation_guard);
+            preparation_guard_active = MY_FALSE;
             clear_current_object();
             mark_end_evaluation();
         }
@@ -2331,11 +2730,14 @@ program_update_process (void)
             free_prog(candidate, MY_TRUE);
             if (preparation_guard.failed && !active->committed)
             {
-                request_failure(active, "RESOURCE_FAILED", "Memory pressure while releasing the private candidate.");
-                free_svalue(&active->roots[UPDATE_SCHEMAS]);
-                put_number(&active->roots[UPDATE_SCHEMAS], 0);
-                active->candidate_generation = 0;
-                active->num_blockers = 0;
+                incomplete_evidence(active, "RESOURCE_FAILED", "Memory pressure while releasing the private candidate.");
+                if (!active->schemas_complete)
+                {
+                    free_svalue(&active->roots[UPDATE_SCHEMAS]);
+                    put_number(&active->roots[UPDATE_SCHEMAS], 0);
+                    active->candidate_generation = 0;
+                    active->num_blockers = 0;
+                }
             }
             set_stack_gap_guard(previous_preparation_guard);
             preparation_guard_active = MY_FALSE;
@@ -2466,6 +2868,7 @@ program_update_clear_refs (void)
     for (request = requests; request; request = request->next)
     {
         clear_memory_reference(request);
+        if (request->diagnostics) clear_memory_reference(request->diagnostics);
         clear_ref_in_vector(request->roots, UPDATE_NUM_ROOTS);
         for (program_update_variables_t *stage = request->variables; stage; stage = stage->next)
         {
@@ -2498,6 +2901,7 @@ program_update_count_refs (void)
     for (request = requests; request; request = request->next)
     {
         note_malloced_block_ref(request);
+        if (request->diagnostics) note_malloced_block_ref(request->diagnostics);
         count_ref_in_vector(request->roots, UPDATE_NUM_ROOTS);
         for (program_update_variables_t *stage = request->variables; stage; stage = stage->next)
         {

@@ -393,6 +393,28 @@ program_schema_named_key (const program_t *prog, int slot,
     return used + length;
 } /* program_schema_named_key() */
 
+void
+program_schema_named_report(mapping_t *report, const char *key, size_t size)
+{
+    const char *parts[4];
+    const char *end = key + size;
+    const char *next = key + 1;
+    for (size_t i = 0; i < 4; i++)
+    {
+        const char *terminator = next < end ? memchr(next, 0, end - next) : NULL;
+        if (!terminator) errorf("update_blueprint(): invalid named declaration evidence.\n");
+        parts[i] = next;
+        next = terminator + 1;
+    }
+    push_c_string(inter_sp, parts[2]);
+    canonical_name(field(report, "program"), inter_sp->u.str);
+    pop_stack();
+    put_c_string(field(report, "name"), parts[3]);
+    put_c_string(field(report, "occurrence"), parts[1]);
+    if (strcmp(parts[0], "$"))
+        put_c_string(field(report, "dispatch"), parts[0]);
+}
+
 static void
 declaration (svalue_t *root, const schema_identity_t *identity, int old, int next)
 

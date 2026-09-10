@@ -1,10 +1,9 @@
-PRELIMINARY
 SYNOPSIS
         object blueprint()
         object blueprint(string|object|lwobject ob)
 
 DESCRIPTION
-        The efuns returns the blueprint for the given object <ob>, or for
+        The efun returns the blueprint for the given object <ob>, or for
         the current object if <ob> is not specified.
 
         If the blueprint is destructed, or its program replaced, the efun
@@ -12,7 +11,11 @@ DESCRIPTION
 
         For objects with replaced programs, the efun returns the blueprint
         for the replacement program.
-        In COMPAT mode the returned blueprint does not start with a "/".
+        The result is an object, not a pathname. It follows the program
+        currently installed on <ob>, including after update_blueprint().
+        It is not a record of the blueprint generation that originally
+        created a clone. clones() retains its historical selection rules.
+        Use object_name() to obtain the result's name in the current mode.
 
 EXAMPLES
         blueprint("/std/thing"))               -> /std/thing
@@ -23,4 +26,5 @@ HISTORY
         Introduced in LDMud 3.2.9.
 
 SEE ALSO
-        clones(E), clone_object(E)
+        clones(E), clone_object(E), object_name(E), update_blueprint(E),
+        blueprint_updates(C)

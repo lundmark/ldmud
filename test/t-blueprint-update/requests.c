@@ -283,7 +283,8 @@ void inspect()
                 if (phase == 19)
                     require(blocks[128]["code"] == "SCHEMA_DIAGNOSTIC_LIMIT"
                             && strstr(blocks[128]["message"], "incomplete") >= 0
-                            && report["errors"][<1]["code"] == "SCHEMA_DIAGNOSTIC_LIMIT",
+                            && sizeof(filter(report["errors"], (: $1["code"] == "SCHEMA_DIAGNOSTIC_LIMIT"
+                                && $1["role"] == "generation" :))) == 1,
                             "schema truncation is explicit in generation and flattened errors");
                 require(report["matched"] == 1 && clones[0].value() == 41
                         && blueprint.value() == 42 && sizeof(changes[0]["matched"]) == (phase == 18 ? 128 : 129),

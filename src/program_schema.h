@@ -23,6 +23,12 @@ extern size_t program_schema_named_key(const program_t *prog, int slot,
                                       const program_t *inherited, Bool variable,
                                       char *key, schema_budget_t *budget);
 
+/* Describe a copied named key as public declaration fields in a rooted map.
+ * Only canonical program/name/occurrence/optional dispatch escape; the private
+ * key encoding is never exposed. Called outside weak inventory traversal.
+ */
+extern void program_schema_named_report(mapping_t *report, const char *key, size_t size);
+
 /* Both programs must be loaded and pinned. Result must be a rooted zero
  * svalue; budget holds the shared memory, work, and slot allowances.
  * Builds only scalar/array/mapping summaries, never changes programs
