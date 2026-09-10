@@ -7,6 +7,9 @@
 #ifdef USE_BLUEPRINT_UPDATE
 #include <assert.h>
 #include <stdio.h>
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+#include <sys/time.h>
+#endif
 #include "program_update.h"
 #include "program_schema.h"
 #include "prolang.h"
@@ -2486,6 +2489,148 @@ candidate_test_checkpoint (program_update_request_t *request, Bool collect)
 } /* candidate_test_checkpoint() */
 #endif
 
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+/* Optional benchmark observations, absent from ordinary driver builds.
+ * Static scalar storage remains defined across backend longjmp recovery.
+ * No metric allocation, reference or output enters the atomic commit. */
+#define UPDATE_MEASURE_MAX_REQUESTS 64
+enum update_measure_point
+{
+    UPDATE_MEASURE_ENTRY, UPDATE_MEASURE_COMPILED,
+    UPDATE_MEASURE_PREPARED, UPDATE_MEASURE_RETIRED,
+    UPDATE_MEASURE_POINTS
+};
+typedef struct update_measure_s
+{
+    struct timeval start;
+    double microseconds;
+    p_int id, matched, updated;
+    p_int used[UPDATE_MEASURE_POINTS];
+    p_int allocated[UPDATE_MEASURE_POINTS];
+    size_t candidate_bytes;
+    unsigned int points;
+    int outcome; /* 0 failed, 1 committed, 2 canceled before publication. */
+} update_measure_t;
+
+static update_measure_t update_measurements[UPDATE_MEASURE_MAX_REQUESTS];
+static struct timeval update_measure_batch_start;
+static unsigned int update_measure_count;
+static Bool update_measure_enabled, update_measure_clock_ok;
+static Bool update_measure_overflow;
+
+static double
+update_measure_elapsed(const struct timeval *start, const struct timeval *end)
+{
+    return (double)(end->tv_sec - start->tv_sec) * 1000000.0
+           + end->tv_usec - start->tv_usec;
+}
+
+static void
+update_measure_begin_batch(void)
+{
+    FILE *selector;
+    update_measure_enabled = MY_FALSE;
+    update_measure_count = 0;
+    update_measure_overflow = MY_FALSE;
+    if (!batch) return;
+    selector = fopen("blueprint-measure", "r");
+    if (!selector) return;
+    fclose(selector);
+    update_measure_enabled = MY_TRUE;
+    update_measure_clock_ok = gettimeofday(&update_measure_batch_start, NULL) == 0;
+}
+
+static void
+update_measure_sample(enum update_measure_point point)
+{
+    update_measure_t *row;
+    if (!update_measure_enabled || update_measure_overflow) return;
+    row = &update_measurements[update_measure_count - 1];
+    row->used[point] = xalloc_used();
+    row->allocated[point] = xalloc_allocated();
+    row->points |= 1u << point;
+    if (point == UPDATE_MEASURE_COMPILED)
+        row->candidate_bytes = active->candidate
+                               ? active->candidate->total_size
+                               : active->source_program->total_size;
+}
+
+static void
+update_measure_begin_request(void)
+{
+    update_measure_t *row;
+    if (!update_measure_enabled) return;
+    if (update_measure_count == UPDATE_MEASURE_MAX_REQUESTS)
+    {
+        update_measure_overflow = MY_TRUE;
+        return;
+    }
+    row = &update_measurements[update_measure_count++];
+    *row = (update_measure_t){ .id = active->id };
+    if (gettimeofday(&row->start, NULL)) update_measure_clock_ok = MY_FALSE;
+    update_measure_sample(UPDATE_MEASURE_ENTRY);
+}
+
+static void
+update_measure_outcome(void)
+{
+    update_measure_t *row;
+    if (!update_measure_enabled || update_measure_overflow) return;
+    row = &update_measurements[update_measure_count - 1];
+    row->matched = active->matched;
+    row->updated = active->updated;
+    row->outcome = active->committed ? 1 : active->canceled ? 2 : 0;
+}
+
+static void
+update_measure_end_request(void)
+{
+    struct timeval end = {0};
+    update_measure_t *row;
+    if (!update_measure_enabled || update_measure_overflow) return;
+    row = &update_measurements[update_measure_count - 1];
+    update_measure_sample(UPDATE_MEASURE_RETIRED);
+    if (gettimeofday(&end, NULL)) update_measure_clock_ok = MY_FALSE;
+    row->microseconds = update_measure_elapsed(&row->start, &end);
+    if (row->microseconds < 0) update_measure_clock_ok = MY_FALSE;
+}
+
+static void
+update_measure_end_batch(void)
+{
+    struct timeval end = {0};
+    double microseconds;
+    if (!update_measure_enabled) return;
+    if (gettimeofday(&end, NULL)) update_measure_clock_ok = MY_FALSE;
+    microseconds = update_measure_elapsed(&update_measure_batch_start, &end);
+    if (microseconds < 0) update_measure_clock_ok = MY_FALSE;
+    /* All formatting/IO follows both timers and the complete backend batch. */
+    for (unsigned int i = 0; i < update_measure_count; i++)
+    {
+        update_measure_t *row = &update_measurements[i];
+        debug_message("BLUEPRINT_MEASURE_REQUEST: id=%"PRIdMPINT
+                      " microseconds=%.0f matched=%"PRIdMPINT
+                      " updated=%"PRIdMPINT" outcome=%d points=%u candidate_bytes=%zu"
+                      " entry_used=%"PRIdMPINT" compiled_used=%"PRIdMPINT
+                      " prepared_used=%"PRIdMPINT" retired_used=%"PRIdMPINT
+                      " entry_allocated=%"PRIdMPINT" compiled_allocated=%"PRIdMPINT
+                      " prepared_allocated=%"PRIdMPINT" retired_allocated=%"PRIdMPINT"\n",
+                      row->id, row->microseconds, row->matched, row->updated,
+                      row->outcome, row->points, row->candidate_bytes,
+                      row->used[0], row->used[1], row->used[2], row->used[3],
+                      row->allocated[0], row->allocated[1],
+                      row->allocated[2], row->allocated[3]);
+    }
+    debug_message("BLUEPRINT_MEASURE_BATCH: requests=%u microseconds=%.0f clock_ok=%d overflow=%d\n",
+                  update_measure_count, microseconds, update_measure_clock_ok,
+                  update_measure_overflow);
+    update_measure_enabled = MY_FALSE;
+}
+#define UPDATE_MEASURE(call) update_measure_##call
+#else
+#define UPDATE_MEASURE(call) ((void)0)
+#endif
+
 void
 program_update_process (void)
 
@@ -2514,6 +2659,7 @@ program_update_process (void)
     const int32 saved_use = use_eval_cost;
     const p_int saved_memory = max_memory;
     const int saved_privilege = malloc_privilege;
+    UPDATE_MEASURE(begin_batch());
     /* A preceding player command can leave these borrowed identities set at
      * the periodic boundary. Candidate authorization belongs to its requester.
      */
@@ -2529,6 +2675,7 @@ program_update_process (void)
         batch = active->work_next;
         active->work_next = NULL;
         active->busy = MY_TRUE;
+        UPDATE_MEASURE(begin_request());
         preparation_guard.failed = MY_FALSE;
         preparation_guard_active = MY_FALSE;
         previous_preparation_guard = get_stack_gap_guard();
@@ -2653,6 +2800,7 @@ program_update_process (void)
             }
             else
                 PIPELINE_TEST_STEP(active, "loaded source and final cohort", MY_TRUE);
+            UPDATE_MEASURE(sample(UPDATE_MEASURE_COMPILED));
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
             if (active->candidate)
                 candidate_test_checkpoint(active, MY_TRUE);
@@ -2696,6 +2844,7 @@ program_update_process (void)
                 migration_test_checkpoint(active);
 #endif
                 prepare_publication(active);
+                UPDATE_MEASURE(sample(UPDATE_MEASURE_PREPARED));
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
                 if (active->pipeline_countdown >= 0)
                     debug_message("BLUEPRINT_PIPELINE_COMPLETE: %d checkpoints.\n", active->pipeline_steps);
@@ -2745,6 +2894,7 @@ program_update_process (void)
             if (!active->committed) candidate_test_checkpoint(active, MY_FALSE);
 #endif
         }
+        UPDATE_MEASURE(outcome());
         if (active->canceled && !active->committed)
             free_request(active);
         else
@@ -2769,9 +2919,11 @@ program_update_process (void)
         use_eval_cost = saved_use;
         malloc_privilege = saved_privilege;
         eval_cost = assigned_eval_cost = 0;
+        UPDATE_MEASURE(end_request());
     }
     rt_context = recovery.rt.last;
     expire_reports();
+    UPDATE_MEASURE(end_batch());
 } /* program_update_process() */
 
 void

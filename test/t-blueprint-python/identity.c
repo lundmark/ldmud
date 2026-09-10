@@ -48,6 +48,7 @@ void run(closure callback)
 {
     done = callback;
     if (catch(
+        rm("identity_target.c"),
         write_file("identity_target.c", "#pragma strong_types, save_types\n"
             "int value = 41;\n"
             "int prefix() { return 11; }\n"

@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -23,7 +24,13 @@ import time
 
 ROOT = Path.cwd()
 KIND = sys.argv[1]
-OUTPUT = Path(os.environ["TEST_LOGFILE"] + ".d").resolve()
+OUTPUT = Path(os.environ["TEST_LOGFILE"] + ".d").absolute()
+# This directory belongs to one invocation. Even disabled or failed probes
+# must not leave coverage or unused shards from an earlier enabled run.
+if OUTPUT.is_symlink():
+    raise RuntimeError("Blueprint test output directory must not be a symbolic link")
+if OUTPUT.exists():
+    shutil.rmtree(OUTPUT)
 OUTPUT.mkdir(parents=True, exist_ok=True)
 DRIVER = shlex.split(os.environ["DRIVER"])
 OPTIONS = shlex.split(os.environ["DRIVER_DEFAULTS"])
