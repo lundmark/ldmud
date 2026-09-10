@@ -89,8 +89,8 @@ void next()
                    "int shifted_variable = 912;\n"
                    "int shifted_function() { return -123; }\n"
                    "#include \"target.inc\"\n");
-        expected = phase % 2 || member(({6,7,11,12,15,16}), kind) >= 0 ? "completed"
-                 : kind < 6 || kind == 13 || kind == 14 ? "PYTHON_HANDLE"
+        expected = phase % 2 || member(({0,1,6,7,11,12,13,14,15,16}), kind) >= 0 ? "completed"
+                 : kind < 6 ? "PYTHON_HANDLE"
                  : kind == 10 ? "LIVE_COROUTINE" : "LIVE_CLOSURE";
         start_gc(#'collected);
     }); publish)) { clean(); funcall(done, 1); }

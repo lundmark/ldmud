@@ -90,8 +90,8 @@ def blocker_check_native(ob: ldmud.Object, kind: int) -> int:
         indexed = held.lfun
         assert indexed.name == "read_value"
         assert indexed() == 41
-    # Indexed Python handles remain blockers. These conversions
-    # are deliberately temporary and unwind before the next publication.
+    # This remains a transient conversion smoke test. Retained indexed keys
+    # across subsequent migrations are exercised by t-blueprint-python.
     del indexed, fresh
     return 1
 

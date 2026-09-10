@@ -1184,9 +1184,9 @@ replace_program_lambda_adjust (replace_ob_t *r_ob)
 
 /*-------------------------------------------------------------------------*/
 #ifdef USE_BLUEPRINT_UPDATE
-static Bool
-closure_attach_named (closure_base_t *cl, object_t *ob, program_t *inherited,
-                      int index, Bool variable)
+Bool
+closure_get_named_binding (named_binding_t **result, object_t *ob,
+                           program_t *inherited, int index, Bool variable)
 
 /* Leaf bindings belong to the execution object, not the weak dependency
  * inventory. They own their key bytes and no LPC references. Keeping an
@@ -1203,6 +1203,7 @@ closure_attach_named (closure_base_t *cl, object_t *ob, program_t *inherited,
     named_binding_t *binding;
     size_t size;
 
+    *result = NULL;
     if (ob->flags & (O_REPLACED | O_DESTRUCTED)
      || ob->prog->flags & P_REPLACE_ACTIVE || inherited == ob->prog)
         return MY_TRUE;
@@ -1210,7 +1211,7 @@ closure_attach_named (closure_base_t *cl, object_t *ob, program_t *inherited,
         if (binding->index == index && binding->variable == variable
          && binding->inherited == inherited)
         {
-            cl->named = binding;
+            *result = binding;
             return MY_TRUE;
         }
     size = program_schema_named_key(ob->prog, index, inherited, variable, key, &budget);
@@ -1224,8 +1225,15 @@ closure_attach_named (closure_base_t *cl, object_t *ob, program_t *inherited,
         .index = index, .variable = variable, .key_size = size };
     memcpy(binding->key, key, size);
     ob->named_bindings = binding;
-    cl->named = binding;
+    *result = binding;
     return MY_TRUE;
+} /* closure_get_named_binding() */
+
+static Bool
+closure_attach_named (closure_base_t *cl, object_t *ob, program_t *inherited,
+                      int index, Bool variable)
+{
+    return closure_get_named_binding(&cl->named, ob, inherited, index, variable);
 } /* closure_attach_named() */
 
 void

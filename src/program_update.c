@@ -955,10 +955,19 @@ validate_runtime_object (program_update_request_t *request, object_t *ob)
         break;
     }
 #ifdef USE_PYTHON
-    if (!code && python_program_has_handles(ob))
+    if (!code)
     {
-        code = "PYTHON_HANDLE";
-        reason = "live Python handle depends on the current program.";
+        Bool python_handles = python_program_has_handles(ob, &request->budget.work);
+        if (!request->budget.work)
+        {
+            code = "RUNTIME_DEPENDENCY_LIMIT";
+            reason = "live Python dependency scan limit exceeded.";
+        }
+        else if (python_handles)
+        {
+            code = "PYTHON_HANDLE";
+            reason = "live Python handle depends on the current program.";
+        }
     }
 #endif
     if (!code)
@@ -1370,6 +1379,20 @@ prepare_named_bindings (program_update_request_t *request)
                 }
             if (ambiguous) index = -1;
             if (index < 0)
+            {
+#ifdef USE_PYTHON
+                Bool python_live = python_program_has_named_binding(ob, binding, &request->budget.work);
+                if (!request->budget.work)
+                    errorf("update_blueprint(): named Python dependency work limit exceeded.\n");
+                if (python_live)
+                {
+                    request_failure(request, ambiguous ? "HANDLE_DECLARATION_AMBIGUOUS"
+                                                       : "HANDLE_DECLARATION_REMOVED",
+                        ambiguous ? "A retained Python declaration has ambiguous candidate slots."
+                                  : "A retained Python declaration is missing from the candidate.");
+                    return;
+                }
+#endif
                 for (program_dependency_t *link = ob->program_dependencies; link; link = link->next)
                 {
                     if (!request->budget.work)
@@ -1385,6 +1408,7 @@ prepare_named_bindings (program_update_request_t *request)
                         return;
                     }
                 }
+            }
             stage->bindings[stage->num_bindings++] = (named_translation_t){ binding, index };
             PIPELINE_TEST_STEP(request, "partial named translations", MY_TRUE);
         }
@@ -1605,25 +1629,32 @@ v_update_blueprint (svalue_t *sp, int num_arg)
         put_number(&request->roots[i], 0);
     request->target_limit = BLUEPRINT_UPDATE_MAX_TARGETS;
     request->scan_limit = BLUEPRINT_UPDATE_MAX_SCAN_OBJECTS;
+    request->budget = (schema_budget_t){ BLUEPRINT_UPDATE_MAX_BYTES,
+                                         SCHEMA_MAX_WORK, BLUEPRINT_UPDATE_MAX_VARIABLE_SLOTS };
 #if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
     {
         FILE *input = fopen("requests-limits", "r");
-        unsigned long targets, scanned;
+        unsigned long targets, scanned, work = 0;
         if (input)
         {
-            if (fscanf(input, "%lu %lu", &targets, &scanned) == 2
+            int fields = fscanf(input, "%lu %lu %lu", &targets, &scanned, &work);
+            if (fields >= 2
              && targets && targets <= request->target_limit
              && scanned && scanned <= request->scan_limit)
             {
                 request->target_limit = targets;
                 request->scan_limit = scanned;
             }
+            /* The optional third field exercises bounded weak inventories
+             * without requiring a million test wrappers. Existing two-field
+             * admission-limit fixtures retain their original behavior.
+             */
+            if (fields == 3 && work && work <= request->budget.work)
+                request->budget.work = work;
             fclose(input);
         }
     }
 #endif
-    request->budget = (schema_budget_t){ BLUEPRINT_UPDATE_MAX_BYTES,
-                                         SCHEMA_MAX_WORK, BLUEPRINT_UPDATE_MAX_VARIABLE_SLOTS };
     request_failure(request, "PREPARATION_PENDING", "Blueprint preparation has not completed.");
     request->busy = MY_TRUE;
     request->owner = get_current_object();

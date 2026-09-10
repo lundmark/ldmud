@@ -14,7 +14,10 @@
 
 /* --- Defines --- */
 #ifdef USE_BLUEPRINT_UPDATE
-extern Bool python_program_has_handles(object_t *ob);
+struct named_binding_s;
+extern Bool python_program_has_handles(object_t *ob, size_t *work);
+extern Bool python_program_has_named_binding(object_t *ob, struct named_binding_s *binding,
+                                             size_t *work);
 #endif
 #define PYTHON_EFUN_TABLE_SIZE (2048UL)
   /* The number of entries in the python efun table.

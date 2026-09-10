@@ -165,6 +165,11 @@ extern void      replace_program_lfun_closure_adjust(replace_ob_t *r_ob);
 extern void      replace_program_lambda_adjust(replace_ob_t *r_ob);
 extern void      closure_init_base(closure_base_t * cl, svalue_t obj);
 #ifdef USE_BLUEPRINT_UPDATE
+/* False denotes allocation/rank exhaustion. True with *result == NULL
+ * denotes an unsupported declaration; returned bindings belong to ob.
+ */
+extern Bool      closure_get_named_binding(named_binding_t **result, object_t *ob,
+                                           program_t *inherited, int index, Bool variable);
 extern void      closure_set_bound_object(closure_base_t *cl, int type, svalue_t ob);
 extern void      closure_init_dependencies(closure_base_t *cl);
 extern void      closure_register_dependencies(closure_base_t *cl, int type);
