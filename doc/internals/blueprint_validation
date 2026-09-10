@@ -39,10 +39,49 @@ optional Python requirements, metric definitions and evidence checks. These
 scenarios are explicit and are not discovered by the ordinary t-* runner.
 The native observer exists only in DEBUG/BLUEPRINT_UPDATE_TESTING builds.
 
-Local release checks (2026-09-10)
---------------------------------
+Compiler-support stack (2026-09-10)
+----------------------------------
 
-The final implementation passed the full 94-suite ordinary DEBUG run with
+The blueprint branch is stacked on compiler-support PR #122:
+https://github.com/ldmud/ldmud/pull/122
+
+  master: e1cbe804944c1f5865ad1beeeff220b43c48c7e3
+  check-compile-efun-pr: 5b88fd38ef5c3fbf424e6d19401ea6c54b9034ed
+  rebased implementation: c55ea00095e66f4c11c5fb1ab700e69b0c9709e0
+
+All 31 blueprint commits were retained. The compiler support comes from
+the parent PR. The allocator conflict retains upstream assert_stack_gap()
+and adds the blueprint native-owner guard; the separate 3scapes allocator
+optimization is not part of this stack.
+
+Fresh ordinary DEBUG builds used Python and PCRE, with -Werror (and the
+upstream CI flag -Wno-unused-result for GCC). The enabled clang build verified
+all 89 suites: 87 passed in the full run, while two shell harnesses initially
+failed to start because python3 resolved to an unconfigured environment shim.
+Both passed on rerun with PYTHON=/usr/bin/python3. The disabled GCC build
+passed all 18 selected blueprint and check_compile suites. The twelve legacy
+blocker reference-count messages and two language cleanup messages matched
+the earlier baseline exactly.
+
+The instrumented clang DEBUG/Python/PCRE build passed nine selected suites:
+pipeline failures, swap, Python handles, retirement, workflow, classification,
+ordinary NPC state, blueprint updates and check_compile. The pipeline again
+covered 419, 412 and 279 failed allocation points with successful recovery.
+Swap passed 222 checks, retirement 346, the Python allocation sweep 2458,
+the operator workflow five cases and ordinary NPC state 193 checks.
+
+The nonDEBUG, i386, system-allocator, Memcheck and benchmark results below
+were not repeated for this stack. In particular, the separate upstream
+nonDEBUG build fixes are not included in the compiler-support parent PR.
+
+Local release checks before stacking (2026-09-10)
+------------------------------------------------
+
+The following results and measurements describe the original 3scapes-based
+implementation at c66f67253c7e2effa1c57a2ff6b00afc434a5e47. They are historical
+evidence, not measurements of the branch stacked on the compiler-support PR.
+
+That implementation passed the full 94-suite ordinary DEBUG run with
 GCC 13 and PCRE, without Python. Five clean clang configurations passed 58
 focused suite invocations: disabled, i386, Python, system allocator and
 nonDEBUG. Four builds were warning-free; system malloc retained its fourteen
