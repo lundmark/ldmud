@@ -1,0 +1,92 @@
+SYNOPSIS
+        int update_blueprint(string|object source)
+        int update_blueprint(string|object source, int|object* targets)
+
+DESCRIPTION
+        Submit one deferred, atomic, state-preserving blueprint update.
+        The driver must be built with --enable-blueprint-update (off by
+        default); the two efuns are otherwise unavailable. Compatible requests
+        install the complete selected cohort before heartbeat dispatch.
+        Object identity, retained state, inventory, and scheduling survive;
+        create(), reset(), and __INIT() are not replayed. Variables may be
+        added, removed, and reordered. Retained values and supported named
+        native/Python handles follow declaration identity into the new layout;
+        incompatible types, modifiers, signatures, inheritance, or defaults
+        fail the complete cohort. See blueprint_updates(C) for support limits.
+
+        A string source must name an already loaded ordinary blueprint.
+        The request captures that object and its exact program, then privately
+        compiles the file at execution against its captured parent programs.
+        The source blueprint participates implicitly, even with targets ({}).
+        The candidate remains private until the complete cohort is ready.
+
+        An object source must be the actual loaded ordinary blueprint. Its
+        exact program is the candidate; this mode does not compile a file or
+        implicitly select the source blueprint for an update.
+
+        Omitted targets, or integer zero, select all matching ordinary clones
+        found at execution, after compiler/master callbacks. Other integers
+        are invalid. An array selects only its copied, deduplicated identities.
+        Every input element must be a live same-family clone or the source
+        blueprint. A listed blueprint is excluded from clone counts and is
+        never processed twice. An empty array selects no clones. Changes to
+        the caller's array, including changes during privilege_violation(),
+        do not change the captured selection. Destroyed selected clones are
+        skipped at execution; unsupported surviving members fail the request.
+
+        The master must authorize privilege_violation("update_blueprint",
+        caller, source, targets). Arguments and admission are revalidated
+        after this callback. Invalid arguments, denied privilege, exhausted
+        identifiers, and admission limits raise before assigning an ID.
+        Only ordinary objects are supported. Lightweight callers/targets and
+        special (master or primary/backup simul-efun), virtual, replaced,
+        interactive, shadowing, or shadowed objects are unsupported. Pending
+        replace_program() work in the same family also blocks admission or
+        execution.
+
+        The positive ID increases monotonically for the lifetime of the
+        driver. Submission performs no compilation or migration. A request
+        gets one attempt at the next periodic backend tick after the current
+        stack returns, before heartbeat dispatch. Nested submissions wait
+        for the following tick. Processing also runs without object heartbeats.
+        Destruction of the requester cancels uncommitted requests. Once all
+        new programs and variables are installed, the completed outcome is
+        immutable, including if old-value finalizers destroy the requester
+        or raise errors. The family remains reserved until retirement ends.
+        Source destruction or reloading cannot substitute a new identity for
+        the captured source. Compiler and master-hook external effects are
+        outside rollback; precommit failure leaves the cohort unchanged.
+
+        Configurable defaults are 64 pending/in-flight requests globally,
+        8 per owner, 10000 selected clones, 1000000 examined objects/raw array
+        entries, 1000000 processed variable slots, 64 MiB per request for
+        retained preparation/report storage, and literal nesting depth 64.
+        Only one pending/in-flight request may reserve a canonical family,
+        including disjoint explicit selections. Clone quotas apply after
+        deduplication; raw input examination has its own bound. Schema work
+        and storage are shared across generations and initializer decisions.
+        The byte allowance is per request, not a global byte reservation.
+        Temporary compilation and LPC values also obey normal driver limits.
+
+        Configure options (all numeric bounds must be positive) are:
+          --with-blueprint-update-inflight=64
+          --with-blueprint-update-owner=8
+          --with-blueprint-update-targets=10000
+          --with-blueprint-update-scan-objects=1000000
+          --with-blueprint-update-variable-slots=1000000
+          --with-blueprint-update-bytes=67108864
+          --with-blueprint-update-literal-depth=64
+        The shared schema/runtime/identity work allowance is 1000000 steps.
+        Both staging and retirement slots count toward the variable allowance.
+        Runtime diagnostic scratch and copied evidence share the byte budget.
+
+        This is one deferred driver-thread attempt, not worker-thread work.
+        No migration callback or public prepare/queue/discard lifecycle exists.
+        Use update_blueprint_result() to observe the ID. A mudlib polling
+        timeout does not cancel or fail a driver request. The reusable
+        mudlib/blueprint_update.c coordinator owns its own driver IDs and
+        requires explicit mudlib policy before exposing operator access.
+
+SEE ALSO
+        update_blueprint_result(E), blueprint(E), replace_program(E), clones(E),
+        blueprint_updates(C)

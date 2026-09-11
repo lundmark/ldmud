@@ -1,0 +1,4 @@
+Exercise report incompleteness when bounded source classification exhausts
+its shared work allowance while checking backup simul-efun names. The
+instrumented build reaches the exact boundary with no selected clones.
+An ordinary build still performs a real path-source update.

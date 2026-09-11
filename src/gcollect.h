@@ -59,7 +59,6 @@ extern mapping_t *stale_mappings;
 
 /* --- Prototypes --- */
 
-extern void cleanup_vector(svalue_t *svp, size_t num, cleanup_t * context);
 extern void clear_memory_reference(void *p);
 extern void clear_program_ref(program_t *p, Bool clear_ref);
 extern void clear_object_ref (object_t *p);
@@ -132,6 +131,7 @@ extern time_t time_last_gc;
 
 /* --- Prototypes --- */
 
+extern void cleanup_vector(svalue_t *svp, size_t num, cleanup_t * context);
 extern void cleanup_object (object_t * obj);
 extern void cleanup_all_objects (void);
 extern void cleanup_driver_structures (void);

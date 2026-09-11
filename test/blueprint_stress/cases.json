@@ -1,0 +1,81 @@
+[
+  {
+    "count": 1,
+    "width": 8,
+    "handles": 0,
+    "cycles": 1
+  },
+  {
+    "count": 100,
+    "width": 8,
+    "handles": 0,
+    "cycles": 1
+  },
+  {
+    "count": 1000,
+    "width": 8,
+    "handles": 0,
+    "cycles": 1
+  },
+  {
+    "count": 10000,
+    "width": 8,
+    "handles": 0,
+    "cycles": 1
+  },
+  {
+    "count": 10000,
+    "width": 8,
+    "handles": 0,
+    "cycles": 1,
+    "late_target": 1,
+    "batch": 4,
+    "expected": "TARGET_LIMIT"
+  },
+  {
+    "count": 1000,
+    "width": 64,
+    "handles": 0,
+    "cycles": 1
+  },
+  {
+    "count": 100,
+    "width": 512,
+    "handles": 0,
+    "cycles": 1
+  },
+  {
+    "count": 950,
+    "width": 512,
+    "handles": 0,
+    "cycles": 1,
+    "expected": "PREPARATION_FAILED"
+  },
+  {
+    "count": 1000,
+    "width": 32,
+    "handles": 1,
+    "cycles": 2,
+    "batch": 4
+  },
+  {
+    "count": 100,
+    "width": 8,
+    "handles": 1,
+    "cycles": 10,
+    "churn": 1
+  },
+  {
+    "count": 100,
+    "width": 8,
+    "handles": 2,
+    "cycles": 2
+  },
+  {
+    "count": 500,
+    "width": 8,
+    "handles": 2,
+    "cycles": 1,
+    "expected": "RUNTIME_DEPENDENCY_LIMIT"
+  }
+]

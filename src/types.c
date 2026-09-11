@@ -80,7 +80,15 @@ lpctype_new (void)
  */
 
 {
-    lpctype_t *type = (lpctype_t*) xalloc(sizeof(lpctype_t));
+    lpctype_t *type;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (compile_update_test_fail(COMPILE_TEST_TYPE_ALLOCATION))
+        type = NULL;
+    else
+#endif
+        type = xalloc(sizeof(lpctype_t));
+    if (!type)
+        return NULL;
     type->ref = 1;
     type->t_static = false;
     type->array_of = NULL;
@@ -128,15 +136,155 @@ get_struct_name_type (struct_name_t* name)
         ref_lpctype(type);
     else
     {
-        name->lpctype = type = lpctype_new();
+        type = lpctype_new();
+        if (!type)
+            return NULL;
         type->t_class = TCLASS_STRUCT;
         type->t_struct.name = ref_struct_name(name);
         type->t_struct.def_idx = USHRT_MAX;
         type->t_struct.def = NULL;
+        name->lpctype = type;
     }
 
     return type;
 } /* get_struct_name_type() */
+
+/*-------------------------------------------------------------------------*/
+typedef struct lpctype_context_entry_s
+{
+    struct lpctype_context_entry_s *next;
+    lpctype_t *type;  /* Owned canonical identity; definition is borrowed. */
+    struct struct_info_s info;
+} lpctype_context_entry_t;
+
+static Bool
+type_context_cancelled (lpctype_context_t *context)
+{
+    if (!context)
+        return MY_FALSE;
+    assert_stack_gap();
+    if (stack_gap_guard_failed())
+        context->failed = MY_TRUE;
+    return context->failed;
+}
+
+struct struct_info_s *
+lpctype_struct_info (lpctype_context_t *context, lpctype_t *type)
+
+/* Borrow an existing scratch entry. Read-only comparisons never allocate. */
+
+{
+    lpctype_context_entry_t *entry;
+    if (!context || type->t_static)
+        return &type->t_struct;
+    for (entry = context->entries; entry; entry = entry->next)
+        if (entry->type == type)
+            return &entry->info;
+    return NULL;
+} /* lpctype_struct_info() */
+
+static struct struct_info_s *
+ensure_struct_info (lpctype_context_t *context, lpctype_t *type)
+
+/* Create private scratch, returning NULL without transferring any caller
+ * reference on allocation failure. The context latches that failure.
+ */
+
+{
+    struct struct_info_s *info = lpctype_struct_info(context, type);
+    lpctype_context_entry_t *entry;
+    if (info)
+        return info;
+    if (type_context_cancelled(context))
+        return NULL;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (compile_update_test_fail(COMPILE_TEST_TYPE_CONTEXT))
+        entry = NULL;
+    else
+#endif
+        entry = xalloc(sizeof(*entry));
+    if (!entry)
+    {
+        context->failed = MY_TRUE;
+        return NULL;
+    }
+    entry->type = ref_lpctype(type);
+    entry->info.name = type->t_struct.name;
+    entry->info.def = NULL;
+    entry->info.def_idx = USHRT_MAX;
+    entry->next = context->entries;
+    context->entries = entry;
+    return &entry->info;
+} /* ensure_struct_info() */
+
+struct_type_t *
+lpctype_struct_definition (lpctype_context_t *context, lpctype_t *type)
+{
+    struct struct_info_s *info = lpctype_struct_info(context, type);
+    return info ? info->def : NULL;
+}
+
+unsigned short
+lpctype_struct_index (lpctype_context_t *context, lpctype_t *type)
+{
+    struct struct_info_s *info = lpctype_struct_info(context, type);
+    return info ? info->def_idx : USHRT_MAX;
+}
+
+bool
+lpctype_set_struct_definition (lpctype_context_t *context, lpctype_t *type,
+                              struct_type_t *def)
+{
+    struct struct_info_s *info = ensure_struct_info(context, type);
+    if (!info)
+        return false;
+    info->def = def;
+    return true;
+}
+
+void
+lpctype_set_struct_index (lpctype_context_t *context, lpctype_t *type,
+                         unsigned short index)
+
+/* The definition must already have an owned scratch entry. */
+
+{
+    struct struct_info_s *info = lpctype_struct_info(context, type);
+    assert(info);
+    info->def_idx = index;
+}
+
+void
+free_lpctype_context (lpctype_context_t *context)
+
+/* Release the scratch map after parser references have been released. */
+
+{
+    while (context->entries)
+    {
+        lpctype_context_entry_t *entry = context->entries;
+        context->entries = entry->next;
+        free_lpctype(entry->type);
+        xfree(entry);
+    }
+} /* free_lpctype_context() */
+
+lpctype_t *
+get_struct_type_context (lpctype_context_t *context, struct_type_t *def)
+
+/* Return the canonical identity, recording its definition only in context. */
+
+{
+    lpctype_t *type = get_struct_name_type(def->name);
+    if (!type || !lpctype_set_struct_definition(context, type, def))
+    {
+        if (context)
+            context->failed = MY_TRUE;
+        free_lpctype(type);
+        return NULL;
+    }
+    return type;
+} /* get_struct_type_context() */
 
 /*-------------------------------------------------------------------------*/
 lpctype_t *
@@ -149,7 +297,8 @@ get_struct_type (struct_type_t* def)
 {
     lpctype_t *type = get_struct_name_type(def->name);
 
-    type->t_struct.def = def;
+    if (type)
+        type->t_struct.def = def;
 
     return type;
 } /* get_struct_type() */
@@ -319,6 +468,8 @@ internal_get_object_type (string_t *prog, object_types_t otype)
         s = new_tabled(normalized, prog->info.unicode);
     else
         s = make_tabled_from(prog);
+    if (!s)
+        return NULL;
 
     /* Now look at our table. */
     result = find_object_type(s, otype);
@@ -329,6 +480,11 @@ internal_get_object_type (string_t *prog, object_types_t otype)
     }
 
     result = lpctype_new();
+    if (!result)
+    {
+        free_mstring(s);
+        return NULL;
+    }
     result->t_class = TCLASS_OBJECT;
     result->t_object.program_name = s;
     result->t_object.type = otype;
@@ -388,6 +544,8 @@ get_python_type (int python_type_id)
     if (type == NULL)
     {
         type = lpctype_new();
+        if (!type)
+            return NULL;
         type->t_class = TCLASS_PYTHON;
         type->t_python.type_id = python_type_id;
         enter_python_type(python_type_id, type);
@@ -441,7 +599,9 @@ get_array_type (lpctype_t *element)
     if (type != NULL)
         return ref_lpctype(type);
 
-    element->array_of = type = lpctype_new();
+    type = lpctype_new();
+    if (!type)
+        return NULL;
     type->t_class = TCLASS_ARRAY;
     type->t_array.element = ref_lpctype(element);
     if (element->t_class == TCLASS_ARRAY)
@@ -454,13 +614,14 @@ get_array_type (lpctype_t *element)
         type->t_array.base = element;
         type->t_array.depth = 1;
     }
+    element->array_of = type;
 
     return type;
 } /* get_array_type() */
 
 /*-------------------------------------------------------------------------*/
 lpctype_t *
-get_array_type_with_depth (lpctype_t *element, int depth)
+get_array_type_with_depth_context (lpctype_context_t *context, lpctype_t *element, int depth)
 
 /* Create an array whose depth is exactly <depth>.
  */
@@ -468,6 +629,8 @@ get_array_type_with_depth (lpctype_t *element, int depth)
 {
     lpctype_t *type;
 
+    if (!element)
+        return NULL;
     if (element->t_class == TCLASS_ARRAY)
     {
         if (element->t_array.depth == depth)
@@ -483,11 +646,24 @@ get_array_type_with_depth (lpctype_t *element, int depth)
     for (; depth > 0; depth--)
     {
         lpctype_t *old = type;
+        if (type_context_cancelled(context))
+        {
+            free_lpctype(old);
+            return NULL;
+        }
         type = get_array_type(type);
         free_lpctype(old);
+        if (!type)
+            return NULL;
     }
     return type;
 } /* get_array_type_with_depth() */
+
+lpctype_t *
+get_array_type_with_depth (lpctype_t *element, int depth)
+{
+    return get_array_type_with_depth_context(NULL, element, depth);
+}
 
 /*-------------------------------------------------------------------------*/
 static lpctype_t *
@@ -509,6 +685,8 @@ make_union_type (lpctype_t *head, lpctype_t* member)
         return ref_lpctype(result);
 
     result = lpctype_new();
+    if (!result)
+        return NULL;
     result->t_class = TCLASS_UNION;
     result->t_union.head = ref_lpctype(head);
     result->t_union.member = ref_lpctype(member);
@@ -520,7 +698,7 @@ make_union_type (lpctype_t *head, lpctype_t* member)
 
 /*-------------------------------------------------------------------------*/
 lpctype_t *
-get_union_type (lpctype_t *head, lpctype_t* member)
+get_union_type_context(lpctype_context_t *context, lpctype_t *head, lpctype_t* member)
 
 /* Create a union type from <head> (maybe a union type) adding <member>
  * (should not be a union type). <member> is inserted at the correct
@@ -533,6 +711,9 @@ get_union_type (lpctype_t *head, lpctype_t* member)
 {
     lpctype_t *insert = head;
     lpctype_t *result, *next_member;
+
+    if (type_context_cancelled(context))
+        return NULL;
 
     if (member == NULL || member == lpctype_void)
         return ref_lpctype(head);
@@ -551,24 +732,28 @@ get_union_type (lpctype_t *head, lpctype_t* member)
         do
         {
             insert = result;
-            result = get_union_type(result, next_member->t_union.member);
+            result = get_union_type_context(context, result, next_member->t_union.member);
             free_lpctype(insert);
+            if (!result)
+                return NULL;
 
             next_member = next_member->t_union.head;
         }
         while (next_member->t_class == TCLASS_UNION);
 
         insert = result;
-        result = get_union_type(result, next_member);
+        result = get_union_type_context(context, result, next_member);
         free_lpctype(insert);
 
         return result;
     }
 
-    if (lpctype_contains(member, head))
+    if (lpctype_contains_context(context, member, head))
         return ref_lpctype(head);
-    else if (lpctype_contains(head, member))
+    else if (lpctype_contains_context(context, head, member))
         return ref_lpctype(member);
+    if (type_context_cancelled(context))
+        return NULL;
 
     if (head->t_class == TCLASS_UNION)
     {
@@ -579,7 +764,7 @@ get_union_type (lpctype_t *head, lpctype_t* member)
         {
             lpctype_t *elem = current->t_class == TCLASS_UNION ? current->t_union.member : current;
 
-            if (lpctype_contains(elem, member))
+            if (lpctype_contains_context(context, elem, member))
             {
                 // Okay, build a union type without those inferior members.
                 result = ref_lpctype(member);
@@ -588,11 +773,13 @@ get_union_type (lpctype_t *head, lpctype_t* member)
                 {
                     lpctype_t *insert_elem = insert->t_class == TCLASS_UNION ? insert->t_union.member : insert;
 
-                    if (!lpctype_contains(insert_elem, member))
+                    if (!lpctype_contains_context(context, insert_elem, member))
                     {
                         lpctype_t *prev_result = result;
-                        result = get_union_type(result, insert_elem);
+                        result = get_union_type_context(context, result, insert_elem);
                         free_lpctype(prev_result);
+                        if (!result)
+                            return NULL;
                     }
 
                     if (insert->t_class == TCLASS_UNION)
@@ -629,9 +816,16 @@ get_union_type (lpctype_t *head, lpctype_t* member)
         next_member = insert->unions_of; /* make_union_type will change this. */
         result = make_union_type(insert, member);
     }
+    if (!result)
+        goto allocation_failed;
 
     while (insert != head)
     {
+        if (type_context_cancelled(context))
+        {
+            free_lpctype(result);
+            return NULL;
+        }
         if (next_member)
         {
             insert = next_member;
@@ -639,16 +833,26 @@ get_union_type (lpctype_t *head, lpctype_t* member)
         }
         else
             insert = insert->unions_of;
-        result = make_union_type(result, insert->t_union.member);
-        free_lpctype(result->t_union.head);
+        {
+            lpctype_t *previous = result;
+            result = make_union_type(previous, insert->t_union.member);
+            free_lpctype(previous);
+            if (!result)
+                goto allocation_failed;
+        }
     }
 
     return result;
-} /* get_union_type() */
+
+allocation_failed:
+    if (context)
+        context->failed = MY_TRUE;
+    return NULL;
+} /* get_union_type_context() */
 
 /*-------------------------------------------------------------------------*/
 static lpctype_t *
-internal_get_common_type(lpctype_t *t1, lpctype_t* t2, bool find_one)
+internal_get_common_type_context(lpctype_context_t *context, lpctype_t *t1, lpctype_t* t2, bool find_one)
 
 /* Determine the intersection of both types.
  * Returns NULL if there is no common type.
@@ -656,10 +860,12 @@ internal_get_common_type(lpctype_t *t1, lpctype_t* t2, bool find_one)
  * the result will by TYPE_UNKNOWN, too.
  *
  * If <find_one> is true, then it may finish even if only a part
- * of the result type was found (used for has_common_type()).
+ * of the result type was found (used for has_common_type_context()).
  */
 
 {
+    if (type_context_cancelled(context))
+        return NULL;
     /* Hopefully the most common case. */
     if (t1 && t1 == t2)
         return ref_lpctype(t1);
@@ -715,9 +921,9 @@ internal_get_common_type(lpctype_t *t1, lpctype_t* t2, bool find_one)
             return ref_lpctype(t1);
         /* This is somewhat counterintuitive, but the derived struct
            is more specialized, so it is the result of the intersection. */
-        else if (t2->t_struct.def && struct_baseof_name(t1->t_struct.name, t2->t_struct.def))
+        else if (lpctype_struct_definition(context, t2) && struct_baseof_name(t1->t_struct.name, lpctype_struct_definition(context, t2)))
             return ref_lpctype(t2);
-        else if (t1->t_struct.def && struct_baseof_name(t2->t_struct.name, t1->t_struct.def))
+        else if (lpctype_struct_definition(context, t1) && struct_baseof_name(t2->t_struct.name, lpctype_struct_definition(context, t1)))
             return ref_lpctype(t1);
         else
             return NULL;
@@ -744,8 +950,10 @@ internal_get_common_type(lpctype_t *t1, lpctype_t* t2, bool find_one)
             return NULL;
         else
         {
-            lpctype_t *common_element = get_common_type(t1->t_array.element, t2->t_array.element);
+            lpctype_t *common_element = get_common_type_context(context, t1->t_array.element, t2->t_array.element);
             lpctype_t *result = get_array_type(common_element);
+            if (common_element && !result && context)
+                context->failed = MY_TRUE;
             free_lpctype(common_element);
             return result;
         }
@@ -755,14 +963,19 @@ internal_get_common_type(lpctype_t *t1, lpctype_t* t2, bool find_one)
             lpctype_t *result = NULL;
             while (true)
             {
+                if (type_context_cancelled(context))
+                {
+                    free_lpctype(result);
+                    return NULL;
+                }
                 lpctype_t *base = t1->t_class == TCLASS_UNION ? t1->t_union.member : t1;
-                lpctype_t *common_base = get_common_type(t2, base);
+                lpctype_t *common_base = get_common_type_context(context, t2, base);
                 lpctype_t *oldresult = result;
 
                 if (find_one && common_base)
                     return common_base;
 
-                result = get_union_type(result, common_base);
+                result = get_union_type_context(context, result, common_base);
                 free_lpctype(common_base);
                 free_lpctype(oldresult);
 
@@ -779,24 +992,24 @@ internal_get_common_type(lpctype_t *t1, lpctype_t* t2, bool find_one)
         fatal("Unknown type class %d!\n", t1->t_class);
         return NULL;
     }
-} /* internal_get_common_type() */
+} /* internal_get_common_type_context() */
 
 /*-------------------------------------------------------------------------*/
 bool
-has_common_type(lpctype_t *t1, lpctype_t* t2)
+has_common_type_context(lpctype_context_t *context, lpctype_t *t1, lpctype_t* t2)
 
 /* Determine whether the intersection of both types is non-empty.
  */
 
 {
-    lpctype_t *result = internal_get_common_type(t1, t2, true);
+    lpctype_t *result = internal_get_common_type_context(context, t1, t2, true);
     free_lpctype(result);
     return (result != NULL);
-} /* has_common_type() */
+} /* has_common_type_context() */
 
 /*-------------------------------------------------------------------------*/
 lpctype_t *
-get_common_type(lpctype_t *t1, lpctype_t* t2)
+get_common_type_context(lpctype_context_t *context, lpctype_t *t1, lpctype_t* t2)
 
 /* Determine the intersection of both types.
  * Returns NULL if there is no common type.
@@ -805,8 +1018,33 @@ get_common_type(lpctype_t *t1, lpctype_t* t2)
  */
 
 {
-    return internal_get_common_type(t1, t2, false);
-} /* get_common_type() */
+    return internal_get_common_type_context(context, t1, t2, false);
+} /* get_common_type_context() */
+
+/* Runtime entry points intentionally have no compiler context. */
+lpctype_t *
+get_union_type (lpctype_t *head, lpctype_t *member)
+{
+    return get_union_type_context(NULL, head, member);
+}
+
+lpctype_t *
+get_common_type (lpctype_t *t1, lpctype_t *t2)
+{
+    return get_common_type_context(NULL, t1, t2);
+}
+
+bool
+has_common_type (lpctype_t *t1, lpctype_t *t2)
+{
+    return has_common_type_context(NULL, t1, t2);
+}
+
+bool
+lpctype_contains (lpctype_t *src, lpctype_t *dest)
+{
+    return lpctype_contains_context(NULL, src, dest);
+}
 
 /*-------------------------------------------------------------------------*/
 void
@@ -961,7 +1199,7 @@ _free_lpctype (lpctype_t *t)
 
 /*-------------------------------------------------------------------------*/
 bool
-lpctype_contains (lpctype_t* src, lpctype_t* dest)
+lpctype_contains_context(lpctype_context_t *context, lpctype_t* src, lpctype_t* dest)
 
 /* Returns true when a variable of type <src> can be
  * stored in a variable of type <dest>.
@@ -971,6 +1209,8 @@ lpctype_contains (lpctype_t* src, lpctype_t* dest)
  */
 
 {
+    if (type_context_cancelled(context))
+        return false;
     /* We have no type information? Then anything is possible. */
     if (src == NULL || dest == NULL)
         return true;
@@ -984,6 +1224,8 @@ lpctype_contains (lpctype_t* src, lpctype_t* dest)
         /* Walk through the dest union. */
         while (true)
         {
+            if (type_context_cancelled(context))
+                return false;
             lpctype_t *destbase = dest->t_class == TCLASS_UNION ? dest->t_union.member : dest;
 
             if (destbase->t_class == TCLASS_PRIMARY && destbase->t_primary == TYPE_ANY)
@@ -1008,9 +1250,9 @@ lpctype_contains (lpctype_t* src, lpctype_t* dest)
 
                     if (destbase->t_struct.name == NULL) /* Matches any struct */
                         found = true;
-                    else if (destbase->t_struct.name && srcbase->t_struct.def)
+                    else if (destbase->t_struct.name && lpctype_struct_definition(context, srcbase))
                     {
-                        if(struct_baseof_name(destbase->t_struct.name, srcbase->t_struct.def))
+                        if(struct_baseof_name(destbase->t_struct.name, lpctype_struct_definition(context, srcbase)))
                             found = true;
                     }
                 }
@@ -1037,7 +1279,7 @@ lpctype_contains (lpctype_t* src, lpctype_t* dest)
                 if (destbase->t_class == TCLASS_ARRAY)
                 {
                     if (destbase->t_array.depth == srcbase->t_array.depth)
-                        found = lpctype_contains(srcbase->t_array.base, destbase->t_array.base);
+                        found = lpctype_contains_context(context, srcbase->t_array.base, destbase->t_array.base);
                     else if (destbase->t_array.depth > srcbase->t_array.depth)
                     {
                         lpctype_t *destelem = destbase->t_array.element;
@@ -1046,7 +1288,7 @@ lpctype_contains (lpctype_t* src, lpctype_t* dest)
                         for (;i;i--)
                             destelem = destelem->t_array.element;
 
-                        found = lpctype_contains(srcbase->t_array.base, destelem);
+                        found = lpctype_contains_context(context, srcbase->t_array.base, destelem);
                     }
                     else
                     {
@@ -1056,7 +1298,7 @@ lpctype_contains (lpctype_t* src, lpctype_t* dest)
                         for (;i;i--)
                             srcelem = srcelem->t_array.element;
 
-                        found = lpctype_contains(srcelem, destbase->t_array.base);
+                        found = lpctype_contains_context(context, srcelem, destbase->t_array.base);
                     }
                 }
                 break;
@@ -1085,7 +1327,7 @@ lpctype_contains (lpctype_t* src, lpctype_t* dest)
     }
 
     return true;
-} /* lpctype_contains() */
+} /* lpctype_contains_context() */
 
 /*-------------------------------------------------------------------------*/
 static bool

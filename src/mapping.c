@@ -214,6 +214,7 @@
  */
 
 #include "driver.h"
+#include "program_update.h"
 #include "typedefs.h"
 
 #include "my-alloca.h"
@@ -343,7 +344,7 @@ new_map_chain (mapping_t * m)
 {
     map_chain_t *rc;
 
-    rc = xalloc(SIZEOF_MCH(rc, m->num_values));
+    rc = DEFAULT_TEST_NULL(DEFAULT_TEST_CHAIN, xalloc(SIZEOF_MCH(rc, m->num_values)));
     if (rc)
     {
         LOG_ALLOC("new_map_chain", SIZEOF_MCH(rc, m->num_values), SIZEOF_MCH(rc, m->num_values));
@@ -418,7 +419,7 @@ get_new_hash ( mapping_t *m, mp_int hash_size)
      * TODO: The 0x100000 seems to be a safety offset, but is it?
      */
     if (hash_size > (mp_int)((SIZE_MAX - sizeof *hm - 0x100000) / sizeof *mcp)
-     || !(hm = xalloc(sizeof *hm + sizeof *mcp * hash_size) ) )
+     || !(hm = DEFAULT_TEST_NULL(DEFAULT_TEST_HASH, xalloc(sizeof *hm + sizeof *mcp * hash_size))) )
     {
         return NULL;
     }
@@ -475,7 +476,7 @@ get_new_mapping ( wiz_list_t * user, mp_int num_values
     }
 
     /* Allocate the structures */
-    m = xalloc(sizeof *m);
+    m = DEFAULT_TEST_NULL(DEFAULT_TEST_MAPPING, xalloc(sizeof *m));
     if (!m)
         return NULL;
 

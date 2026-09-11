@@ -1,0 +1,1 @@
+/* Empty parent for bounded inheritance traversal tests. */

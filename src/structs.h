@@ -83,6 +83,7 @@ struct struct_type_s
     struct_type_t * base;      /* Counted link to the base structure,
                                 * or NULL if none
                                 */
+    Bool            unpublished; /* Private candidate; excluded from publication/GC. */
     int32           prog_id;   /* ID number of the defining program */
     string_t      * unique_name; /* The unique name of this struct,
                                   * composed from .name, .prog_name and

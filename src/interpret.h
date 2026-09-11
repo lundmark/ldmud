@@ -16,6 +16,13 @@
 #include "bytecode.h"
 #include "svalue.h"
 
+#ifdef TRACE_CODE
+extern void invalidate_program_trace(program_t *prog);
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+extern void program_update_trace_test(program_t *prog, Bool retired);
+#endif
+#endif
+
 /* --- Types --- */
 
 /* --- struct control_stack: one control stack element
@@ -253,6 +260,12 @@ extern void normalize_svalue(svalue_t *svp, bool collapse_lvalues);
 extern void assign_svalue_no_free(svalue_t *to, svalue_t *from);
 extern void assign_rvalue_no_free(svalue_t *to, svalue_t *from);
 extern void assign_rvalue_no_free_no_collapse(svalue_t *to, svalue_t *from);
+#ifdef USE_BLUEPRINT_UPDATE
+struct schema_budget_s;
+extern void assign_update_svalue_no_free(svalue_t *to, svalue_t *from);
+extern void assign_update_rvalue_no_free(svalue_t *to, svalue_t *from,
+                                         struct schema_budget_s *budget);
+#endif
 extern void assign_svalue(svalue_t *dest, svalue_t *v);
 extern void assign_rvalue(svalue_t *dest, svalue_t *v);
 extern void copy_svalue_no_free (svalue_t *to, svalue_t *from);
@@ -302,6 +315,13 @@ extern Bool privilege_violation2(string_t *what, svalue_t *arg, svalue_t *arg2, 
 extern Bool privilege_violation4(string_t *what, svalue_t whom, string_t *how_str, int how_num, svalue_t *sp);
 extern Bool privilege_violation_n(string_t *what, svalue_t whom, svalue_t *sp, int num_arg);
 
+#ifdef USE_BLUEPRINT_UPDATE
+/* Only fresh native default trees: numbers, strings/bytes, arrays, mappings.
+ * No lvalues, objects, structs, closures, or Python values, including children.
+ */
+extern Bool check_rtt_compatibility_bounded(lpctype_t *formaltype, svalue_t *svp,
+                                           size_t *remaining, Bool *exhausted);
+#endif
 extern Bool check_rtt_compatibility(lpctype_t *formaltype, svalue_t *svp) __attribute__((nonnull(2)));
 extern lpctype_t* get_rtt_type(lpctype_t *formaltype, svalue_t *svp) __attribute__((nonnull(2)));
 extern int translate_virtual_variable_index(int num);
@@ -378,6 +398,7 @@ extern int last_instructions(int length, Bool verbose, svalue_t **svpp);
 #ifdef DEBUG
 extern int check_state(void);
 extern void count_inherits(program_t *progp);
+extern void count_extra_ref_in_prog(program_t *prog);
 extern void count_extra_ref_in_object(object_t *ob);
 extern void count_extra_ref_in_vector(svalue_t *svp, size_t num);
 extern void check_a_lot_ref_counts(program_t *search_prog);

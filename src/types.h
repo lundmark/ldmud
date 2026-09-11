@@ -103,6 +103,26 @@ struct struct_info_s
     unsigned short def_idx;
 };
 
+/* Private compiler scratch for canonical struct types. Runtime operations
+ * use a NULL context and never consult these entries. */
+typedef struct lpctype_context_s
+{
+    struct lpctype_context_entry_s *entries;
+    Bool failed;
+} lpctype_context_t;
+
+extern struct struct_info_s *lpctype_struct_info(lpctype_context_t *context, lpctype_t *type);
+extern struct_type_t *lpctype_struct_definition(lpctype_context_t *context, lpctype_t *type);
+extern unsigned short lpctype_struct_index(lpctype_context_t *context, lpctype_t *type);
+extern bool lpctype_set_struct_definition(lpctype_context_t *context, lpctype_t *type, struct_type_t *def);
+extern void lpctype_set_struct_index(lpctype_context_t *context, lpctype_t *type, unsigned short index);
+extern void free_lpctype_context(lpctype_context_t *context);
+extern lpctype_t *get_struct_type_context(lpctype_context_t *context, struct_type_t *def);
+extern lpctype_t *get_union_type_context(lpctype_context_t *context, lpctype_t *head, lpctype_t *member);
+extern lpctype_t *get_common_type_context(lpctype_context_t *context, lpctype_t *t1, lpctype_t *t2);
+extern bool has_common_type_context(lpctype_context_t *context, lpctype_t *t1, lpctype_t *t2);
+extern bool lpctype_contains_context(lpctype_context_t *context, lpctype_t *src, lpctype_t *dest);
+
 struct object_type_s
 {
     /* The program name of the object (refcounted).
@@ -288,6 +308,8 @@ extern lpctype_t *get_python_type(int python_type_id);
 #endif
 extern lpctype_t *get_array_type(lpctype_t *element);
 extern lpctype_t *get_array_type_with_depth(lpctype_t *element, int depth);
+extern lpctype_t *get_array_type_with_depth_context(lpctype_context_t *context,
+                                                   lpctype_t *element, int depth);
 extern lpctype_t *get_union_type(lpctype_t *head, lpctype_t* member);
 extern lpctype_t *get_common_type(lpctype_t *t1, lpctype_t* t2);
 extern bool has_common_type(lpctype_t *t1, lpctype_t* t2);

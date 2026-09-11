@@ -549,6 +549,10 @@ object  present_clone(object|string, object|int|void, int|void);
 string  program_name(null|object|lwobject default: F_THIS_OBJECT);
 int     program_time(object|lwobject default: F_THIS_OBJECT);
 void    replace_program(void|string) no_lightweight;
+#ifdef USE_BLUEPRINT_UPDATE
+int     update_blueprint(string|object, void|int|object*) no_lightweight;
+mapping update_blueprint_result(int) no_lightweight;
+#endif
 int     find_input_to(object, object|string|closure, void|string);
 mixed * input_to_info(object);
 int     remove_input_to(object, void|object|string|closure, void|string);

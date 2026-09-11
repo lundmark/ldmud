@@ -1,0 +1,28 @@
+The suite uses the actual reusable mudlib coordinator through coordinator_source.c
+and a local wrapper with small compile-time bounds. It never uses a production
+mudlib or an external checkout. Standard test/run.sh discovers this directory.
+
+Reports cover exact object_name() fields (run in COMPAT and non-COMPAT modes),
+all matching raw/named/Python dependencies, ordinary schema/structural failure,
+140 matching instances, shared work limits, isolated nested report copies,
+removed declarations on success/failure, and diagnostic allocation/GC roots.
+
+The operator workflow covers deny-default/current policy, separate command and
+wizard authority, driver ownership, policy selection mutation/reentry, all and
+explicit-empty selections, loaded/path sources, already-current dependencies,
+local capacity, poll exhaustion, scheduling failure, local expiry and driver TTL,
+historical clones selection, retained state, and no initializer replay.
+
+The report allocation sweep recognizes an ordinary build by an uninjected point
+zero, still validates the real report and successful recovery, and reports zero
+injected boundaries. Instrumented builds sweep through all diagnostic boundaries.
+Python-specific rows are skipped explicitly when Python support is absent.
+
+Successful completion prints BLUEPRINT_WORKFLOW: N cases passed. with N > 0.
+A disabled driver prints BLUEPRINT_WORKFLOW: feature disabled. instead.
+
+Private driver clock/work/copy-budget controls are asserted only in instrumented
+builds. Ordinary enabled builds still exercise real reports, all coordinator
+source/selection modes, policy, local expiry, and successful recovery. Each GC
+check removes its previous log; only a fresh completed collection log increments
+the actual count. sysmalloc reports unsupported GC checks separately.
