@@ -2302,6 +2302,7 @@ dry_compile_object_file (const char *lname, compile_check_cleanup_t *cleanup
     char *fname;
     compile_check_context_t *ctx = &cleanup->ctx;
     compile_check_program_t *program_entry = NULL;
+    size_t program_index = 0;
     Bool program_entry_activated = MY_FALSE;
     Bool ok = MY_FALSE;
 
@@ -2351,6 +2352,10 @@ dry_compile_object_file (const char *lname, compile_check_cleanup_t *cleanup
     else
         program_entry = compile_check_add_program_entry(ctx, name);
 
+    /* Recursive compiles add entries and may reallocate ctx->programs, so
+     * remember the index instead of the pointer.
+     */
+    program_index = program_entry - ctx->programs;
     program_entry->active = MY_TRUE;
     program_entry_activated = MY_TRUE;
 
@@ -2477,7 +2482,7 @@ dry_compile_object_file (const char *lname, compile_check_cleanup_t *cleanup
             goto cleanup;
         }
 
-        program_entry->prog = compiled_prog;
+        ctx->programs[program_index].prog = compiled_prog;
         compiled_prog = NULL;
         ok = MY_TRUE;
         break;
@@ -2485,7 +2490,7 @@ dry_compile_object_file (const char *lname, compile_check_cleanup_t *cleanup
 
 cleanup:
     if (program_entry_activated)
-        program_entry->active = MY_FALSE;
+        ctx->programs[program_index].active = MY_FALSE;
 
     if (cleanup->fd >= 0)
     {
