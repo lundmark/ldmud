@@ -14,8 +14,8 @@
  *
  * Additionally this module also offers a couple of functions to 'clean up'
  * an object, ie. to scan all data referenced by this object for destructed
- * objects and remove those references, and to change all untabled strings
- * into tabled strings. These functions are used by the garbage collector
+ * objects and remove those references, and to table immutable strings.
+ * These functions are used by the garbage collector
  * to deallocate as much memory by normal means as possible; but they
  * are also called from the backend as part of the regular reset/swap/cleanup
  * handling.
@@ -77,6 +77,7 @@
  */
 
 #include "driver.h"
+#include "program_schema.h"
 #include "typedefs.h"
 
 #include <sys/types.h>
@@ -109,6 +110,7 @@
 #include "mregex.h"
 #include "mstrings.h"
 #include "object.h"
+#include "program_update.h"
 #include "otable.h"
 #include "parse.h"
 #include "pkg-pgsql.h"
@@ -466,7 +468,11 @@ cleanup_vector (svalue_t *svp, size_t num, cleanup_t * context)
 
         case T_STRING:
         case T_BYTES:
-            if (!mstr_tabled(p->u.str))
+            /* Protected character and range lvalues depend on the identity
+             * of mutable storage, including the value in a backing cell.
+             * Tabling a copy here would detach those aliases.
+             */
+            if (!mstr_tabled(p->u.str) && !mstr_mutable(p->u.str))
                 p->u.str = make_tabled(p->u.str);
             break;
 
@@ -515,18 +521,14 @@ cleanup_vector (svalue_t *svp, size_t num, cleanup_t * context)
                     break;
 
                 case LVALUE_PROTECTED_CHAR:
-                    NOOP;
+                    if (p->u.protected_char_lvalue->var != NULL)
+                        cleanup_vector(&p->u.protected_char_lvalue->var->val, 1, context);
                     break;
 
                 case LVALUE_PROTECTED_RANGE:
-                    /* Only clean, if it's a vector.
-                     * We don't want to make that string tabled.
-                     */
-                    if (p->u.protected_range_lvalue->vec.type == T_POINTER)
-                    {
-                        cleanup_vector(&p->u.protected_range_lvalue->vec, 1, context);
+                    cleanup_vector(&p->u.protected_range_lvalue->vec, 1, context);
+                    if (p->u.protected_range_lvalue->var != NULL)
                         cleanup_vector(&p->u.protected_range_lvalue->var->val, 1, context);
-                    }
                     break;
 
                 case LVALUE_PROTECTED_MAPENTRY:
@@ -569,7 +571,7 @@ cleanup_single_object (object_t * obj, cleanup_t * context)
  * had to be swapped in.
  *
  * The function checks all variables of this object for references
- * to destructed objects and removes them. Also, untabled strings
+ * to destructed objects and removes them. Also, immutable, untabled strings
  * are made tabled.
  */
 
@@ -653,14 +655,18 @@ cleanup_structures (cleanup_t * context)
                 {
                     lambda_t * l = driver_hook[i].u.lambda;
 
-                    free_svalue(&(l->base.ob));
-                    put_ref_object(&(l->base.ob), master_ob, "cleanup_structures");
+                    closure_set_bound_object(&l->base, driver_hook[i].x.closure_type,
+                                             svalue_object(master_ob));
                 }
             }
             else
                 cleanup_vector(&driver_hook[i], 1, context);
         }
     }
+
+#ifdef USE_BLUEPRINT_UPDATE
+    program_update_cleanup(context);
+#endif
 
 #ifdef USE_PYTHON
     cleanup_python_data(context);
@@ -1108,6 +1114,15 @@ clear_string_ref (string_t *p)
 
 {
     p->info.ref = 0;
+    if (mstr_mutable(p))
+    {
+        /* These lists are weak: unreachable lvalues are swept without
+         * running their destructors. Rebuild the lists from marked lvalues
+         * after all reference clearing has finished.
+         */
+        p->u.mutable.char_lvalues = NULL;
+        p->u.mutable.range_lvalues = NULL;
+    }
 } /* clear_string_ref() */
 
 /*-------------------------------------------------------------------------*/
@@ -1122,6 +1137,10 @@ clear_program_ref (program_t *p, Bool clear_ref)
 {
     int i;
 
+#if defined(DEBUG) && defined(USE_BLUEPRINT_UPDATE)
+    program_schema_check(p);
+#endif
+    /* Internal schema argument types share the existing types root table. */
     if (clear_ref)
     {
         p->ref = 0;
@@ -1341,6 +1360,9 @@ mark_object_ref (object_t *ob)
 
 {
     MARK_PLAIN_REF(ob); ob->ref++;
+#ifdef USE_BLUEPRINT_UPDATE
+    closure_count_object_bindings(ob);
+#endif
     if (ob->prog) mark_program_ref(ob->prog);
     if (ob->name) MARK_MSTRING_REF(ob->name);
     if (ob->load_name) MARK_MSTRING_REF(ob->load_name);
@@ -1567,6 +1589,13 @@ clear_ref_in_vector (svalue_t *svp, size_t num)
                     {
                         lv->ref = 0;
                         clear_string_ref(lv->str);
+
+                        struct protected_lvalue* var = lv->var;
+                        if (var != NULL && var->ref)
+                        {
+                            var->ref = 0;
+                            clear_ref_in_vector(&var->val, 1);
+                        }
                     }
                     break;
                 }
@@ -1580,7 +1609,7 @@ clear_ref_in_vector (svalue_t *svp, size_t num)
                         clear_ref_in_vector(&lv->vec, 1);
 
                         struct protected_lvalue* var = lv->var;
-                        if (var->ref)
+                        if (var != NULL && var->ref)
                         {
                             var->ref = 0;
                             clear_ref_in_vector(&var->val, 1);
@@ -1781,6 +1810,27 @@ gc_count_ref_in_vector (svalue_t *svp, size_t num
                     if (CHECK_REF(lv))
                     {
                         MARK_MSTRING_REF(lv->str);
+                        if (mstr_mutable(lv->str))
+                        {
+                            lv->next = lv->str->u.mutable.char_lvalues;
+                            lv->str->u.mutable.char_lvalues = lv;
+                        }
+
+                        struct protected_lvalue* var = lv->var;
+                        if (var != NULL)
+                        {
+                            if (CHECK_REF(var))
+                            {
+#ifdef CHECK_OBJECT_GC_REF
+                                gc_count_ref_in_vector(&var->val, 1, file, line);
+#else
+                                count_ref_in_vector(&var->val, 1);
+#endif
+                                num_protected_lvalues++;
+                            }
+                            var->ref++;
+                        }
+
                         num_protected_lvalues++;
                     }
                     lv->ref++;
@@ -1797,18 +1847,27 @@ gc_count_ref_in_vector (svalue_t *svp, size_t num
 #else
                         count_ref_in_vector(&lv->vec, 1);
 #endif
+                        if ((lv->vec.type == T_STRING || lv->vec.type == T_BYTES)
+                         && mstr_mutable(lv->vec.u.str))
+                        {
+                            lv->next = lv->vec.u.str->u.mutable.range_lvalues;
+                            lv->vec.u.str->u.mutable.range_lvalues = lv;
+                        }
 
                         struct protected_lvalue* var = lv->var;
-                        if (CHECK_REF(var))
+                        if (var != NULL)
                         {
+                            if (CHECK_REF(var))
+                            {
 #ifdef CHECK_OBJECT_GC_REF
-                            gc_count_ref_in_vector(&var->val, 1, file, line);
+                                gc_count_ref_in_vector(&var->val, 1, file, line);
 #else
-                            count_ref_in_vector(&var->val, 1);
+                                count_ref_in_vector(&var->val, 1);
 #endif
-                            num_protected_lvalues++;
+                                num_protected_lvalues++;
+                            }
+                            var->ref++;
                         }
-                        var->ref++;
 
                         num_protected_lvalues++;
                     }
@@ -2004,6 +2063,7 @@ gc_count_ref_in_malloced_closure (svalue_t *csvp)
                 if(csvp->u.lfun_closure->inhProg)
                     mark_program_ref(csvp->u.lfun_closure->inhProg);
             }
+            closure_register_dependencies(cl, type);
         }
     }
 
@@ -2263,6 +2323,14 @@ garbage_collection(void)
 
     /* --- Pass 1: clear the 'referenced' flag in all malloced blocks ---
      */
+#ifdef USE_BLUEPRINT_UPDATE
+    /* Allocator sweeping bypasses destructors. Detach every old weak node
+     * while it and its neighbors still exist; only actual roots rebuild
+     * membership in the count pass. Inventory is never a GC root.
+     */
+    for (ob = obj_list; ob; ob = ob->next_all)
+        program_dependencies_clear(ob);
+#endif
     mem_clear_ref_flags();
 
     /* --- Pass 2: clear the ref counts ---
@@ -2384,6 +2452,9 @@ garbage_collection(void)
     clear_compiler_refs();
     clear_simul_efun_refs();
     clear_interpreter_refs();
+#ifdef USE_BLUEPRINT_UPDATE
+    program_update_clear_refs();
+#endif
     clear_comm_refs();
     clear_rxcache_refs();
     clear_tabled_struct_refs();
@@ -2607,6 +2678,9 @@ garbage_collection(void)
     note_otable_ref();
     count_comm_refs();
     count_interpreter_refs();
+#ifdef USE_BLUEPRINT_UPDATE
+    program_update_count_refs();
+#endif
     count_heart_beat_refs();
     count_std_struct_refs();
     count_rxcache_refs();

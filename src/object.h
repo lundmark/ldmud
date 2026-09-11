@@ -28,6 +28,18 @@ struct object_s
 #ifdef DEBUG
     p_int extra_ref;      /* Used to check ref count. */
 #endif
+#ifdef USE_BLUEPRINT_UPDATE
+    struct program_update_request_s *program_updates;
+      /* Non-owning reverse links for requests owned by this object. */
+    struct program_dependency_s *program_dependencies;
+      /* Non-owning live closure and unfinished coroutine dependencies. */
+    struct named_binding_s *named_bindings;
+      /* Owned leaf metadata; contains no object/program/string references.
+       * Stays resident with the object when its program/values are swapped.
+       */
+    p_uint next_named_rank;
+      /* Zero before first update, then monotonically increasing, no reuse. */
+#endif
     program_t *prog;      /* Program code for this object */
     string_t *name;
       /* name of the object (untabled), always w/o leading '/' */

@@ -67,6 +67,7 @@
  */
 
 #include "driver.h"
+#include "program_update.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -431,7 +432,7 @@ mstring_alloc_string (size_t iSize MTRACE_DECL)
 
     /* Get the memory */
 
-    string = xalloc_pass(iSize + 1 + sizeof(*string));
+    string = DEFAULT_TEST_NULL(DEFAULT_TEST_STRING, xalloc_pass(iSize + 1 + sizeof(*string)));
     if (!string)
         return NULL;
 

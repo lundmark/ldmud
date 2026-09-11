@@ -7,12 +7,26 @@
 #include "bytecode.h"
 #include "svalue.h"
 #include "exec.h"
+#include "program_update.h"
 
 /* In case offsetof() is not a compiler builtin include stddef.h which
  * supplies a define as fallback. Needed for LAMBDA_VALUE_OFFSET */
 #include <stddef.h>
 
 /* --- Types --- */
+
+#ifdef USE_BLUEPRINT_UPDATE
+typedef struct named_binding_s
+{
+    struct named_binding_s *next;
+    program_t *inherited;       /* Borrowed from the owner's fixed graph. */
+    p_uint rank;               /* Immutable ordering within object/kind. */
+    int index;                 /* Current physical resolution, or -1. */
+    Bool variable;
+    size_t key_size;
+    char key[];                /* Owned canonical declaration key. */
+} named_binding_t;
+#endif
 
 /* --- struct closure_base_s:  ---
  *
@@ -25,6 +39,10 @@ struct closure_base_s
 {
     p_int ref;
       /* ref count */
+#ifdef USE_BLUEPRINT_UPDATE
+    program_dependency_t binding_dependency, target_dependency;
+    named_binding_t *named;     /* Owned by fun_ob, or ob for identifiers. */
+#endif
     svalue_t ob;
       /* Normal or lightweight object the closure is bound to.
        * (Refcounted except for CLOSURE_UNBOUND_LAMBDA.)
@@ -114,7 +132,7 @@ struct lfun_closure_s
        */
 };
 
-#define SIZEOF_LFUN_CLOSURE(num) (sizeof(lambda_t) + ((int)num) * sizeof(svalue_t))
+#define SIZEOF_LFUN_CLOSURE(num) (sizeof(lfun_closure_t) + ((int)num) * sizeof(svalue_t))
   /* size_t SIZEOF_LFUN_CLOSURE(int num)
    *   Size of a lambda closure with <num> context variables.
    */
@@ -146,6 +164,30 @@ extern int       replace_program_variable_adjust(replace_ob_t *r_ob, int var_idx
 extern void      replace_program_lfun_closure_adjust(replace_ob_t *r_ob);
 extern void      replace_program_lambda_adjust(replace_ob_t *r_ob);
 extern void      closure_init_base(closure_base_t * cl, svalue_t obj);
+#ifdef USE_BLUEPRINT_UPDATE
+/* False denotes allocation/rank exhaustion. True with *result == NULL
+ * denotes an unsupported declaration; returned bindings belong to ob.
+ */
+extern Bool      closure_get_named_binding(named_binding_t **result, object_t *ob,
+                                           program_t *inherited, int index, Bool variable);
+extern void      closure_set_bound_object(closure_base_t *cl, int type, svalue_t ob);
+extern void      closure_init_dependencies(closure_base_t *cl);
+extern void      closure_register_dependencies(closure_base_t *cl, int type);
+extern void      closure_detach_dependencies(closure_base_t *cl);
+extern void      closure_free_object_bindings(object_t *ob);
+#ifdef GC_SUPPORT
+extern void      closure_count_object_bindings(object_t *ob);
+#endif
+#ifdef DEBUG
+extern void      closure_check_object_bindings(object_t *ob);
+#endif
+#else
+#define closure_set_bound_object(cl, type, value) \
+    assign_object_svalue(&(cl)->ob, value, "closure binding")
+#define closure_init_dependencies(cl) ((void)0)
+#define closure_register_dependencies(cl, type) ((void)0)
+#define closure_detach_dependencies(cl) ((void)0)
+#endif
 extern lambda_t *closure_new_lambda (svalue_t obj, unsigned short context_size, Bool raise_error);
 extern void      closure_lfun (svalue_t *dest, svalue_t obj, program_t *prog, int ix, unsigned short num, Bool raise_error);
 extern void      closure_literal(svalue_t *dest, int ix, unsigned short inhIndex, unsigned short num);
@@ -167,6 +209,24 @@ extern svalue_t *v_compile_string(svalue_t *sp, int num_arg);
 extern void      align_switch(bytecode_p pc);
 
 /* --- helper functions --- */
+
+static INLINE unsigned short
+closure_lfun_index (const lfun_closure_t *cl)
+{
+#ifdef USE_BLUEPRINT_UPDATE
+    if (cl->base.named) return (unsigned short)cl->base.named->index;
+#endif
+    return cl->fun_index;
+}
+
+static INLINE unsigned short
+closure_identifier_index (const identifier_closure_t *cl)
+{
+#ifdef USE_BLUEPRINT_UPDATE
+    if (cl->base.named) return (unsigned short)cl->base.named->index;
+#endif
+    return cl->var_index;
+}
 
 static INLINE svalue_t get_bound_object(const svalue_t cl)
 /* Return the object, the closure is bound to.

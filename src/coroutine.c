@@ -29,6 +29,9 @@ clear_coroutine (coroutine_t *cr, bool clear_variables)
  */
 
 {
+#ifdef USE_BLUEPRINT_UPDATE
+    program_dependency_detach(&cr->dependency);
+#endif
     free_svalue(&cr->ob);
     if (cr->prog)
         free_prog(cr->prog, true);
@@ -129,6 +132,9 @@ create_empty_coroutine (int num_variables)
         return NULL;
 
     result->ref = 1;
+#ifdef USE_BLUEPRINT_UPDATE
+    program_dependency_init(&result->dependency, result, PROGRAM_DEPENDENCY_COROUTINE);
+#endif
     result->num_variables = num_variables;
     result->num_values = 0;
 #ifdef DEBUG
@@ -187,6 +193,11 @@ create_coroutine (svalue_t *closure)
         transfer_svalue_no_free(--var, inter_sp--);
 
     result->last_frame = inter_sp;
+
+#ifdef USE_BLUEPRINT_UPDATE
+    if (result->ob.type == T_OBJECT)
+        program_dependency_attach(&result->dependency, result->ob.u.ob);
+#endif
 
     return result;
 } /* create_coroutine() */
@@ -649,6 +660,10 @@ count_coroutine_ref (coroutine_t *cr)
         if (cr->prog)
             mark_program_ref(cr->prog);
         count_ref_in_vector(&cr->ob, 1);
+#ifdef USE_BLUEPRINT_UPDATE
+        if (cr->state != CS_FINISHED && cr->ob.type == T_OBJECT)
+            program_dependency_attach(&cr->dependency, cr->ob.u.ob);
+#endif
         count_ref_in_vector(&cr->closure, 1);
         if (cr->num_values > CR_RESERVED_EXTRA_VALUES)
         {

@@ -375,6 +375,10 @@ enum function_header_sizes {
 struct variable_s
 {
     string_t   *name;   /* Name of the variable (shared string) */
+#ifdef USE_BLUEPRINT_UPDATE
+    bool schema_declared; /* True only for a declaration in this program. */
+    uint32_t schema_default; /* One-based own default record; zero if inherited. */
+#endif
     fulltype_t  type;
       /* Type and visibility of the variable (type object counted).
        * If a variable is inherited virtually, the function flag
@@ -437,6 +441,9 @@ struct inherit_s
       /* Offset of the inherited program's variables block within the
        * inheriting program's variable block. This offset points
        * to the first non-virtual variable of <prog>.
+       *
+       * For normal inherits this is relative to this program's nonvirtual
+       * block; virtual/extra inherits are relative to its complete block.
        *
        * The NON_VIRTUAL_OFFSET_TAG marks the variables of non-virtual
        * inherits temporarily during compiles.
@@ -585,6 +592,89 @@ struct call_cache_s
  * TODO:: the program even for clones.
  */
 
+#ifdef USE_BLUEPRINT_UPDATE
+/* Scalar internal signature entries; type references belong to prog->types.
+ * This table is independent of the public save_types tables.
+ */
+struct schema_argument_s
+{
+    unsigned short type_index;
+    typeflags_t flags;
+};
+
+enum schema_function_kind
+{
+    SCHEMA_FUNCTION_GENERATED,
+    SCHEMA_FUNCTION_NAMED,
+    SCHEMA_FUNCTION_INLINE
+};
+
+/* Default evidence is a packed, immutable scalar payload. All offsets are
+ * relative to its start; values contain no separately owned references.
+ */
+enum schema_default_status
+{
+    SCHEMA_DEFAULT_MISSING,
+    SCHEMA_DEFAULT_INT_ZERO,
+    SCHEMA_DEFAULT_FLOAT_ZERO,
+    SCHEMA_DEFAULT_SUPPORTED,
+    SCHEMA_DEFAULT_UNSUPPORTED,
+    SCHEMA_DEFAULT_UNAVAILABLE
+};
+
+enum schema_default_reason
+{
+    SCHEMA_DEFAULT_REASON_NONE,
+    SCHEMA_DEFAULT_REASON_SYNTAX,
+    SCHEMA_DEFAULT_REASON_LIMIT,
+    SCHEMA_DEFAULT_REASON_NUMBER,
+    SCHEMA_DEFAULT_REASON_WIDTH,
+    SCHEMA_DEFAULT_REASON_METADATA
+};
+
+enum schema_default_kind
+{
+    SCHEMA_DEFAULT_INTEGER,
+    SCHEMA_DEFAULT_FLOAT,
+    SCHEMA_DEFAULT_STRING,
+    SCHEMA_DEFAULT_BYTES,
+    SCHEMA_DEFAULT_ARRAY,
+    SCHEMA_DEFAULT_MAPPING
+};
+
+#define SCHEMA_DEFAULT_VERSION 1
+#define SCHEMA_DEFAULT_RTT_CHECK 1
+
+struct schema_default_s
+{
+    uint32_t status, reason, root;
+    uint32_t source_start, source_size, line;
+    uint32_t flags;
+};
+
+struct schema_default_node_s
+{
+    uint32_t kind, edge_start, edge_count;
+    uint32_t text_start, text_size, unicode, depth;
+    p_int width;
+    union
+    {
+        p_int integer;
+        /* Already quantized through the driver's scalar float format. */
+        double floating;
+    } value;
+};
+
+struct schema_defaults_s
+{
+    uint32_t version;
+    uint32_t records, record_offset;
+    uint32_t nodes, node_offset;
+    uint32_t edges, edge_offset;
+    uint32_t bytes, byte_offset;
+};
+#endif
+
 struct program_s
 {
     p_int           ref;           /* Reference count */
@@ -610,6 +700,14 @@ struct program_s
        * information for this program without actually pointing to
        * the structure.
        */
+#ifdef USE_BLUEPRINT_UPDATE
+    p_int schema_generation; /* Monotonic for this driver lifetime, never reused. */
+    struct schema_argument_s *schema_arguments; /* Embedded, relocatable table. */
+    unsigned int num_schema_arguments;
+    funflag_t *schema_function_flags; /* Effective flags before address encoding. */
+    bytecode_p schema_defaults;   /* Embedded scalar/byte default descriptions. */
+    uint32_t schema_defaults_size;
+#endif
     mp_int          load_time;     /* When has it been compiled ? */
     linenumbers_t  *line_numbers;
       /* Line number information, NULL when not swapped in.
@@ -853,6 +951,10 @@ struct function_s
 
     funflag_t     flags;      /* Function flags */
     lpctype_t    *type;       /* Return type of function (counted). */
+#ifdef USE_BLUEPRINT_UPDATE
+    unsigned int schema_argument_start;
+    unsigned char schema_kind; /* enum schema_function_kind */
+#endif
     unsigned char num_locals; /* Number of local variables */
     unsigned char num_arg;    /* Number of arguments needed. */
     unsigned char num_opt_arg;/* Number of optional arguments (with default values). */

@@ -18,6 +18,12 @@ DESCRIPTION
           == 1: return the clones of the previous blueprints only.
           == 2: return all clones of the blueprint.
 
+        Selection uses historical load time and load ID relative to the
+        named blueprint. update_blueprint() preserves that creation history;
+        migrating a clone's current program does not move it between these
+        historical selections. Use the update report for the actual selected
+        migration cohort, and blueprint() for the installed program's blueprint.
+
         Note: this efun is computationally expensive.
 
         If the driver is compiled with DYNAMIC_COSTS, the cost of this
@@ -39,4 +45,5 @@ HISTORY
         LDMud 3.2.9 added the dynamic cost.
 
 SEE ALSO
-        blueprint(E), clone_object(E), clonep(E)
+        blueprint(E), clone_object(E), clonep(E), update_blueprint(E),
+        blueprint_updates(C)

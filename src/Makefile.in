@@ -103,7 +103,7 @@ SRC = access_check.c actions.c applied_decl.c array.c arraylist.c \
       parser.c parse.c pkg-iksemel.c pkg-xml2.c pkg-idna.c \
       pkg-mccp.c pkg-mysql.c pkg-gcrypt.c pkg-json.c pkg-python.c \
       pkg-pgsql.c pkg-sqlite.c pkg-tls.c pkg-openssl.c pkg-gnutls.c \
-      port.c ptrtable.c \
+      port.c ptrtable.c program_schema.c program_update.c \
       random.c regexp.c sha1.c simulate.c simul_efun.c stdstrings.c \
       stdstructs.c strfuns.c structs.c sprintf.c swap.c types.c \
       unidata.c wiz_list.c xalloc.c 
@@ -116,7 +116,7 @@ OBJ = access_check.o actions.o applied_decl.o array.o arraylist.o \
       parser.o parse.o pkg-iksemel.o pkg-xml2.o pkg-idna.o \
       pkg-mccp.o pkg-mysql.o pkg-gcrypt.o pkg-json.o pkg-python.o \
       pkg-pgsql.o pkg-sqlite.o pkg-tls.o pkg-openssl.o pkg-gnutls.o \
-      port.o ptrtable.o \
+      port.o ptrtable.o program_schema.o program_update.o \
       random.o regexp.o sha1.o simulate.o simul_efun.o stdstrings.o \
       stdstructs.o strfuns.o structs.o sprintf.o swap.o types.o \
       unidata.o wiz_list.o xalloc.o @ALLOCA@ 
@@ -697,6 +697,12 @@ pkg-pgsql.o : instrs.h stdstrings.h
 
 pkg-python.o : instrs.h stdstrings.h
 
+program_update.o : program_update.h config.h driver.h array.h backend.h exec.h \
+    gcollect.h interpret.h main.h mapping.h mstrings.h object.h simulate.h \
+    simul_efun.h stdstrings.h svalue.h swap.h xalloc.h i-current_object.h
+
+backend.o simulate.o gcollect.o interpret.o : program_update.h
+
 pkg-sqlite.o : stdstrings.h
 
 simul_efun.o : stdstrings.h
@@ -718,3 +724,15 @@ wiz_list.o : stdstrings.h
 xalloc.o : stdstrings.h
 
 # --- DO NOT MODIFY THIS LINE -- SELECTED AUTO-DEPENDS PRECEDE ---
+
+program_schema.o : program_schema.h config.h driver.h array.h exec.h interpret.h \
+                   mapping.h mstrings.h structs.h svalue.h xalloc.h program_update.h object.h
+program_update.o : program_schema.h efuns.h ptrtable.h
+
+object.o gcollect.o interpret.o : program_schema.h
+
+# The test-only include is optional in source-only release distributions.
+program_schema.o : $(wildcard ../test/t-blueprint-update/defaults_native.inc)
+program_update.o : $(wildcard ../test/t-blueprint-migration/native.inc)
+
+array.o mapping.o mstrings.o : program_update.h
