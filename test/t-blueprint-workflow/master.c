@@ -11,8 +11,8 @@ int privilege_violation(string op, mixed who, mixed a, mixed b)
     return 1;
 }
 int current;
-#ifdef TASK33_CASE
-string *cases = ({TASK33_CASE});
+#ifdef BLUEPRINT_WORKFLOW_CASE
+string *cases = ({BLUEPRINT_WORKFLOW_CASE});
 #else
 string *cases = ({"reports", "advanced", "coordinator", "report_faults", "python_reports"});
 #endif

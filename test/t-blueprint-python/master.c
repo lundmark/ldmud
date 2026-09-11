@@ -13,10 +13,10 @@ mixed include_file(string path, string from, int system)
 void next(int failed)
 {
     if (failed) { shutdown(1); return; }
-#ifdef TASK32_CASE
+#ifdef BLUEPRINT_PYTHON_CASE
     if (current) { shutdown(0); return; }
     current++;
-    load_object(cases[TASK32_CASE]).run(#'next);
+    load_object(cases[BLUEPRINT_PYTHON_CASE]).run(#'next);
 #else
     if (current == sizeof(cases)) { shutdown(0); return; }
     load_object(cases[current++]).run(#'next);

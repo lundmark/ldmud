@@ -47,12 +47,10 @@ https://github.com/ldmud/ldmud/pull/122
 
   master: e1cbe804944c1f5865ad1beeeff220b43c48c7e3
   check-compile-efun-pr: 5b88fd38ef5c3fbf424e6d19401ea6c54b9034ed
-  rebased implementation: c55ea00095e66f4c11c5fb1ab700e69b0c9709e0
 
-All 31 blueprint commits were retained. The compiler support comes from
-the parent PR. The allocator conflict retains upstream assert_stack_gap()
-and adds the blueprint native-owner guard; the separate 3scapes allocator
-optimization is not part of this stack.
+The compiler support comes from the parent PR. Blueprint updates retain
+upstream assert_stack_gap() and add a guard for native compiler ownership
+during allocation failures.
 
 Fresh ordinary DEBUG builds used Python and PCRE, with -Werror (and the
 upstream CI flag -Wno-unused-result for GCC). The enabled clang build verified
