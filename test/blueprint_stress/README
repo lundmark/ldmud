@@ -1,0 +1,88 @@
+Blueprint update stress measurements
+====================================
+
+This disposable mudlib is outside t-* and is run explicitly. Build the driver
+with DEBUG, BLUEPRINT_UPDATE_TESTING, and blueprint updates enabled. The Python
+handle scenarios additionally require the optional Python package. For example,
+from src, with the Python development package installed:
+
+    ./configure --enable-debug --enable-blueprint-update --enable-swap-efun \
+        --enable-use-python EXTRA_CFLAGS=-DBLUEPRINT_UPDATE_TESTING
+    make clean
+    make
+
+Other packages can be enabled as needed. Omit --enable-use-python and the Python
+handle cases when building without that package. Then, from test:
+
+    python3 blueprint_stress.py --driver ../src/ldmud \
+        --cases blueprint_stress/cases.json --output /tmp/blueprint-stress-run
+
+The evidence-join counterexamples can be checked without running a driver:
+
+    python3 -m unittest discover -s blueprint_stress -p test_measurements.py
+
+The output directory must not exist. Each bounded scenario gets fresh source,
+logs, an inherited loopback listener, a process deadline, and the normal alarm
+interval of two seconds. A nonzero exit or missing positive assertion/metric
+marker fails the run. Configuration limits may require changing the expected
+outcome in the case file; retain the original failed run as evidence. Use
+--allow-unmeasured only for semantic control runs, never timing conclusions.
+
+The JSON cases choose clone count, retained variable width, handle mode (0 none,
+1 native function/variable closures, 2 Python function/variable wrappers), and
+update cycles. late_target creates an additional clone after admission to test
+execution-time cohort limits. batch adds independent source-only requests to
+the same tick. churn acquires and releases fresh declaration handles after each
+successful update. Every retained variable, clone identity and held handle is
+checked across publication or rejection; successful later generations reorder
+variables and add/remove a declaration. A failed request must leave every
+cohort member on its preceding program and values.
+
+The native selector blueprint-measure is read only in DEBUG/testing builds.
+The batch timer brackets program_update_process(), including initial/final
+report expiry. Each request timer includes selection, candidate compilation,
+schema/default/report work, variable and binding preparation, publication, and
+retirement. Setup, queue wait, polling and LPC verification are outside these
+timers. The probe stores at most 64 requests in static scalar records and prints
+them after both timers stop; overflowing this observation capacity invalidates
+the measurement without changing request processing. The final nonallocating
+validation and atomic commit contain no new observation calls.
+
+Timing uses the driver's existing gettimeofday platform API. Negative or failed
+clock readings invalidate the run. The launcher also compares elapsed wall and
+monotonic clocks to reject discontinuities; this is not a monotonic native
+timer. Request and batch microseconds include the small cost of scalar timing
+and allocator-counter reads. They do not include the final metric output IO.
+
+Allocator snapshots are taken at request entry, after the candidate and final
+cohort are available, after all fallible preparation before final validation,
+and after retirement/input release. The points bitmask records which snapshots
+exist for an early failure. *_used reports xalloc_used() driver data bytes;
+*_allocated reports xalloc_allocated(), including allocator overhead. These are
+simultaneous-storage snapshots, not the compiler's transient high-water mark or
+whole-process RSS. candidate_bytes is the program's total_size; it does not
+include every temporary compiler allocation. System-allocator builds may lack
+useful allocation accounting and should not supply these memory conclusions.
+
+The Python verification also obtains a transient version-function wrapper; its
+inactive binding key can remain in addition to the two held wrappers. The
+Python cases therefore do not imply exactly two registry keys per clone.
+
+Initial handle memory compares the same preallocated clone/array cohort before
+and after creating handles. The native delta includes closures, returned handle
+arrays, and binding headers/keys. Python runs report driver allocation separately
+from shallow wrapper sizes and Python tracemalloc deltas; the latter include
+Python cohort wrappers, tuples and stored hashes and are not a whole-process
+memory measurement. The trace is stopped before update timing begins.
+
+Each churn sample compares memory immediately before acquiring new declaration
+handles, while held, and after releasing them within one LPC evaluation. Its
+retained_delta therefore excludes reports accumulated between requests. Inactive
+binding keys remain until object disposal, without retaining old programs; do
+not interpret this intentional registry growth as a retained-program leak.
+
+The request limits combine clone count, variable slots, bytes and work. A wide
+layout or many Python handles can exhaust work before reaching the configured
+clone/slot limit. Record observed successful and first rejected scenarios and
+their exact configuration before proposing an operational clone count. These
+ordinary-object fixtures provide no interactive/player-session acceptance.

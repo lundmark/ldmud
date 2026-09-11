@@ -9,8 +9,11 @@ jobs:
                 coverage: [false, true]
                 machine: [i386, amd64]
                 async_io: [false, true]
+                blueprint: [false, true]
                 exclude:
                     - machine: i386
+                      coverage: true
+                    - blueprint: false
                       coverage: true
         runs-on: ${{ matrix.machine == 'i386' && 'ubuntu-22.04' || 'ubuntu-latest' }}
         continue-on-error: ${{ matrix.coverage }}
@@ -29,6 +32,8 @@ jobs:
               working-directory: src
               shell: sh
               run: ./configure --enable-use-ipv6 --enable-use-mccp --enable-use-json --enable-use-pcre
+                               --enable-debug
+                               ${{ matrix.blueprint && '--enable-blueprint-update' || '--disable-blueprint-update' }}
                                --enable-use-mysql --enable-use-pgsql --enable-use-sqlite
                                --enable-use-xml --enable-use-tls  --enable-use-gcrypt
                                --enable-malloc-trace --enable-malloc-lpc-trace  --enable-dynamic-costs
@@ -40,6 +45,19 @@ jobs:
                                EXTRA_CFLAGS="-DINSIDE_TRAVIS -Werror ${{ matrix.machine == 'i386' && '-m32' || '' }} ${{ matrix.cc == 'gcc' && '-Wno-unused-result' || '' }} ${{ matrix.cc == 'gcc' && !matrix.coverage && '-D_FORTIFY_SOURCE=2' || '' }}"
                                ${{ matrix.machine == 'i386' && 'LDFLAGS=-m32'}}
                                CC=${{ matrix.cc }}
+            - name: Check blueprint configuration
+              working-directory: src
+              shell: sh
+              run: |
+                if ${{ matrix.blueprint }}; then
+                    grep -Eq '^#define USE_BLUEPRINT_UPDATE([[:space:]]|$)' config.h
+                else
+                    if grep -Eq '^#define USE_BLUEPRINT_UPDATE([[:space:]]|$)' config.h; then
+                        exit 1
+                    else
+                        test "$?" -eq 1
+                    fi
+                fi
             - name: Build driver
               working-directory: src
               run: make ${{ matrix.cc == 'gcc' && matrix.coverage && 'PROFIL="--coverage"' || ''}} ${{ matrix.cc == 'clang' && matrix.coverage && 'PROFIL="-fprofile-instr-generate -fcoverage-mapping "' || ''}}
@@ -58,6 +76,30 @@ jobs:
                 ./run_async_io_worker_test.sh
                 ./run_async_io_lifecycle_test.sh
                 ./run_async_io_allocation_test.sh
+            - name: Check blueprint runtime coverage
+              working-directory: test
+              shell: sh
+              run: |
+                grep -Eq '^Blueprint baseline: [1-9][0-9]* checks passed\.$' log/result.t-blueprint-update.log
+                if ${{ matrix.blueprint }}; then
+                    grep -Eq '^BLUEPRINT_UPDATE_ENABLED: [1-9][0-9]* checks passed\.$' log/result.t-blueprint-update.log
+                    grep -Eq '^BLUEPRINT_MIGRATION: [1-9][0-9]* checks passed\.$' log/result.t-blueprint-migration.log
+                    grep -Eq '^BLUEPRINT_WORKFLOW: [1-9][0-9]* cases passed\.$' log/result.t-blueprint-workflow.log
+                    grep -Eq '^BLUEPRINT_WORLD: [1-9][0-9]* checks, ordinary NPC state, inventory, callbacks and generations passed\.$' log/result.t-blueprint-world.log
+                    grep -q '^BLUEPRINT_PIPELINE_CONFIG: ordinary$' log/result.t-blueprint-failures.sh.log.d/detect.debug
+                    if grep -q 'feature disabled' log/result.t-blueprint-migration.log; then
+                        exit 1
+                    else
+                        test "$?" -eq 1
+                    fi
+                else
+                    if grep -q '^BLUEPRINT_UPDATE_ENABLED:' log/result.t-blueprint-update.log; then
+                        exit 1
+                    else
+                        test "$?" -eq 1
+                    fi
+                    grep -q '^BLUEPRINT_PIPELINE_CONFIG: disabled$' log/result.t-blueprint-failures.sh.log.d/detect.debug
+                fi
             - name: Generate coverage reports (gcc)
               if: matrix.cc == 'gcc' && matrix.coverage
               shell: bash
@@ -80,3 +122,43 @@ jobs:
               with:
                 name: coverage ${{ matrix.cc }} async-${{ matrix.async_io }}
                 path: test/html
+
+    blueprint-faults:
+        runs-on: ubuntu-24.04
+        timeout-minutes: 45
+        steps:
+            - name: Install dependencies
+              run: |
+                sudo apt-get update -y
+                sudo apt-get install -y --no-install-recommends clang bison autoconf autogen python3 python3-dev libpcre3-dev
+            - name: Checkout sources
+              uses: actions/checkout@v3
+            - name: Generate build files
+              working-directory: src
+              run: ./autogen.sh
+            - name: Configure instrumented driver
+              working-directory: src
+              run: |
+                ./configure --enable-debug --enable-blueprint-update --enable-use-python --enable-use-pcre \
+                    --enable-swap-efun --enable-dynamic-costs --enable-eval-cost-trace --disable-use-gcrypt \
+                    CC=clang EXTRA_CFLAGS='-Werror -DBLUEPRINT_UPDATE_TESTING'
+                grep -Eq '^#define USE_BLUEPRINT_UPDATE([[:space:]]|$)' config.h
+                grep -Eq '^#define DEBUG([[:space:]]|$)' config.h
+            - name: Build instrumented driver
+              working-directory: src
+              run: make -j2
+            - name: Run allocation and retirement regressions
+              working-directory: test
+              run: ./run.sh t-blueprint-failures.sh t-blueprint-swap.sh t-blueprint-python t-blueprint-retirement t-blueprint-workflow t-blueprint-classification
+            - name: Require executed fault coverage
+              working-directory: test
+              shell: sh
+              run: |
+                grep -q '^BLUEPRINT_PIPELINE_CONFIG: testing$' log/result.t-blueprint-failures.sh.log.d/detect.debug
+                for mode in 0 1 2; do
+                    grep -Eq "^BLUEPRINT_PIPELINE: mode $mode, every point 0\.\.[0-9]+ failed; successful recovery at [1-9][0-9]*\.$" log/result.t-blueprint-failures.sh.log
+                done
+                grep -Eq '^BLUEPRINT_SWAP: [1-9][0-9]* checks passed;' log/result.t-blueprint-swap.sh.log
+                grep -Eq '^BLUEPRINT_PYTHON_FAULTS: [1-9][0-9]* checks, [1-9][0-9]* admission failures, [1-9][0-9]* execution failures, 2 binding MemoryErrors, success at [1-9][0-9]*\.$' log/result.t-blueprint-python.log
+                grep -Eq '^BLUEPRINT_RETIREMENT: [1-9][0-9]* checks;' log/result.t-blueprint-retirement.log
+                grep -Eq '^BLUEPRINT_WORKFLOW: [1-9][0-9]* cases passed\.$' log/result.t-blueprint-workflow.log

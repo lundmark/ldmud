@@ -1,0 +1,189 @@
+SYNOPSIS
+        mapping update_blueprint_result(int id)
+
+DESCRIPTION
+        Read a fresh, non-consuming report for update_blueprint(). Only the
+        requesting object or the master may read it. Unknown, cancelled,
+        expired, evicted, and unauthorized identifiers raise an error.
+        Polling does not execute or advance a request.
+
+        The mapping always has these thirteen fields:
+
+          id                    Positive, driver-lifetime request identifier.
+          origin                Canonical load name, with leading /, without .c.
+          selection             "all" or "explicit".
+          status                "pending", "completed", or "failed".
+          candidate_generation  Exact candidate's numeric generation label.
+          matched               Surviving selected clones, including current ones.
+          updated               Selected clones that received the candidate.
+          already_current       Clones already using the exact candidate program.
+          destroyed             Destroyed identities in the saved explicit set.
+          blueprint_updated     1 if the path-source blueprint was updated, else 0.
+          variable_changes      Array of generation-specific schema evidence.
+          errors                Array of reasons and diagnostic records.
+          completed_at          Driver completion time in seconds.
+
+        While pending, generation/count/time fields are zero and both arrays
+        are empty, including during compiler callbacks. These zeros mean
+        unknown, not an empty terminal selection. Clone counts exclude the
+        blueprint. All mode has no admission snapshot from which to count
+        earlier destruction. Survivor failures retain complete discovered
+        counts; if discovery itself exceeds its scan bound, counts remain
+        zero and the reason says that selection counts are unavailable.
+        Generation labels identify exact programs; they are not source hashes,
+        persistent versions, or object creation times.
+
+        Each variable_changes row has old_generation, candidate_generation,
+        matched, added, removed, functions, and blockers. Here matched is an
+        array of retained variable declarations, not a clone count. Added and
+        removed are variable declaration arrays; functions describes old/new
+        function locations, including removals. A function may be removed if
+        no retained supported handle needs it. Each actual old generation
+        appears once, even when many selected clones share it.
+
+        Declaration records have program (canonical declaring load name),
+        name, occurrence (inheritance occurrence path), old_slot, new_slot,
+        and generated (0 or 1). A missing side has slot -1. Physical slots
+        may change when variables/functions are added, removed, or reordered;
+        slots are locations, not declaration identity. Added variables also
+        have a default mapping. Function signature/argument evidence is
+        captured independently of pragma save_types; save_types is not a
+        blanket prerequisite for updates.
+
+        Default mappings are conditional:
+
+          kind "shared"       Copy the blueprint's prepared/current value;
+                              no live value is exposed in the report.
+          kind "missing"      Required metadata is absent; may contain only kind.
+          kind "unavailable"  Evidence or materialization is unavailable/invalid.
+          kind "unsupported"  Captured initializer is unsupported.
+          kind "literal"      Supported literal, with native value.
+          kind "implicit"     Implicit integer or float zero, with value.
+
+        File and line identify the initializer when available. Unsupported
+        or unavailable capture may include numeric reason: 0 none, 1 syntax,
+        2 capture/storage limit, 3 unrepresentable number, 4 invalid mapping
+        width, 5 missing/invalid metadata (reserved; not currently emitted
+        by compiler capture). An unavailable materialization may contain
+        value 0; that does not make the default usable. A successful literal
+        or implicit value can have type_warning: 1 under warn_rtt_checks.
+        Retained initializers are not replayed. Literal report values contain
+        only native scalar/array/mapping data, never live object/handle values.
+
+        Path-source mode adds an implicit blueprint generation row even
+        without clones. It also has blueprint: 1, blueprint_defaults (added
+        declarations with the blueprint's default decisions), and
+        blueprint_blockers. Its ordinary added decisions describe clone
+        defaults if that generation has selected clones, otherwise blueprint
+        defaults. Thus a literal blueprint default and a clone's shared
+        decision remain distinguishable for the same generation. Object-source
+        mode does not implicitly migrate its loaded blueprint.
+
+        Failed requests begin errors with code and message for the primary
+        failure. Structural/source checks precede schema, native/Python runtime
+        dependencies, and named declaration resolution. Existing compiler and
+        schema-limit reasons keep their precedence. Completed requests contain
+        only compiler warnings, if any. Empty or already-current selections
+        can complete with zero updated clones.
+
+        Compiler diagnostic rows have code (COMPILE_ERROR or COMPILE_WARNING),
+        file, line, warning (0 or 1), and message. Schema blocker rows have
+        code and optional program/name/occurrence. Flattened schema errors
+        also have old_generation, candidate_generation, and role
+        ("generation" or "blueprint"). Message is optional for schema rows.
+        Inheritance blockers add inherit_index (-1 for the whole graph),
+        old_inherit_count, and candidate_inherit_count. An identifiable edge
+        also adds old_parent, candidate_parent, old_parent_generation,
+        candidate_parent_generation, old_mapped, and candidate_mapped.
+
+        Instance rows follow the shared compiler/schema evidence. They have
+        code, message, object, role ("clone" or "blueprint"), old_generation,
+        and candidate_generation. Object exactly follows object_name() in
+        the current COMPAT mode, including its leading slash convention.
+        Generation 0 means unavailable metadata on an unsafe/swapped instance.
+        SCHEMA_INCOMPATIBLE instance rows link to shared generation evidence.
+        Every safely discoverable blocked selected instance is represented, including
+        the implicit path-source blueprint; repeated handles with the same
+        instance/reason may collapse into one row. Independent runtime and
+        named diagnostics are collected after ordinary schema failures.
+
+        HANDLE_DECLARATION_REMOVED and HANDLE_DECLARATION_AMBIGUOUS instance
+        rows additionally have kind ("function" or "variable"), program,
+        name, occurrence, and dispatch when explicit inherited dispatch needs
+        distinguishing. Native closure and Python owners of a declaration
+        have separate rows whose messages identify the handle category.
+        Private serialized identity keys and handle pointers are not exposed.
+        LIVE_CLOSURE, LIVE_COROUTINE, and PYTHON_HANDLE identify unsupported
+        live dependencies. Already-current object-source clones need no
+        dependency rejection because their program is unchanged.
+
+        Incomplete evidence marks errors[0] with incomplete: 1 and supplies
+        incomplete_code and incomplete_message. If a later evidence limit
+        follows an earlier primary failure, errors[0] retains its primary
+        code/message. A separate limit row identifies that later failure. No omitted-instance count is invented. Byte/work
+        limits use REPORT_SIZE_LIMIT and RUNTIME_DEPENDENCY_LIMIT. Complete
+        schema/removal evidence survives later diagnostic preparation failure;
+        an interrupted schema pass is discarded. Compilation, unavailable
+        source identity, or exceptional allocation/callback failure can leave
+        only minimal evidence. There is no promise of complete diagnostics
+        after an explicit incompleteness marker.
+
+        Other request reasons are:
+          UNSUPPORTED_OBJECT, SPECIAL_OBJECT, SOURCE_UNSUPPORTED,
+          UNRELATED_TARGET: unsupported role, source, or family membership.
+          SOURCE_INVALIDATED, SOURCE_CHANGED: captured source identity,
+          program, or loaded blueprint values changed during preparation.
+          REPLACEMENT_PENDING: same-family replace_program() conflict.
+          SWAP_FAILED: required object/program could not be unswapped.
+          COMPILE_FAILED, COMPILE_CALLBACK_FAILED, COMPILE_RESOURCE_FAILED:
+          private compilation, its callback, or its resources failed.
+          TARGET_LIMIT, SELECTION_SCAN_LIMIT, VARIABLE_STORAGE_LIMIT,
+          REQUEST_SIZE_LIMIT: selection or retained preparation bounds.
+          REPORT_ALLOCATION_FAILED, PREPARATION_FAILED, RESOURCE_FAILED:
+          evidence allocation, preparation, or guarded resource failure.
+          SCHEMA_INCOMPATIBLE: see the shared schema blocker details.
+          COMPILE_DIAGNOSTIC_LIMIT, SCHEMA_DIAGNOSTIC_LIMIT: bounded evidence
+          overflow, distinct from a complete report exactly at the cap.
+
+        Schema blocker codes are MISSING_SCHEMA_METADATA, SCHEMA_DEPTH_LIMIT,
+        SCHEMA_WORK_LIMIT, SCHEMA_MEMORY_LIMIT, SCHEMA_DIAGNOSTIC_LIMIT,
+        INHERITANCE_CHANGED, MAPPED_INHERITANCE_UNSUPPORTED,
+        UNMATCHABLE_VARIABLE, VARIABLE_TYPE_CHANGED, VARIABLE_MODIFIERS_CHANGED,
+        FUNCTION_SIGNATURE_CHANGED, FUNCTION_MODIFIERS_CHANGED,
+        STRUCT_LAYOUT_CHANGED, MISSING_DEFAULT_METADATA,
+        INVALID_DEFAULT_METADATA, UNSUPPORTED_DEFAULT,
+        UNAVAILABLE_BLUEPRINT_DEFAULT, DEFAULT_MATERIALIZATION_LIMIT,
+        DEFAULT_TYPE_WORK_LIMIT, and DEFAULT_TYPE_MISMATCH. They distinguish
+        missing evidence, graph/layout/declaration incompatibility, and
+        unavailable or invalid new-variable defaults.
+
+        Compiler evidence is bounded to 128 rows and 65536 text bytes, sharing
+        request storage. Each generation/role has at most 128 schema blockers
+        plus one overflow row. Runtime instances have no 128-row cap: checked
+        count/reservation/fill passes use the shared byte/work budgets.
+        See update_blueprint() and blueprint_updates(C) for all limits.
+
+        Each read returns independent nested arrays and mappings, preserving
+        sharing within that returned value. Mutation or allocation/evaluation
+        failure during copying cannot consume or change the cached report.
+        Copying has a fresh bounded allowance and obeys the caller's normal
+        array/mapping/evaluation limits; it raises rather than returning a
+        partial result. Terminal evidence retains no source/target objects,
+        programs, native closures, or Python references. Temporary preparation
+        and retirement roots are released before cache eligibility.
+
+        Terminal reports expire at 300 seconds after completion. Reads do not
+        renew the time. At most 256 terminal reports are cached; eviction
+        removes the oldest completion, breaking ties by the lower ID. This
+        cache is separate from pending capacity. Requester destruction removes
+        uncommitted requests and failed reports; committed reports remain
+        readable by the master until expiry/eviction. Cleanup is automatic.
+
+        The unknown/expired error text is exactly:
+          update_blueprint_result(): unknown or expired request id.
+        Catch adds its usual leading '*' and the error ends with a newline.
+        Other errors, including another owner's ID and copying limits, must
+        not be classified as expiry by an operator wrapper.
+
+SEE ALSO
+        update_blueprint(E), object_name(E), blueprint_updates(C)

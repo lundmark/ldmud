@@ -440,7 +440,7 @@ static bool python_start_thread();
 static void python_finish_thread(bool started);
 static void python_save_context();
 static void python_clear_context();
-static void python_restore_context();
+static PyObject *python_restore_context();
 
 /* -- Python definitions and functions --- */
 
@@ -1649,6 +1649,10 @@ struct ldmud_program_and_index_s
                                 /* Object can never by NULL. */
 
     int index;                  /* Function or variable index. */
+#ifdef USE_BLUEPRINT_UPDATE
+    named_binding_t *named;     /* Borrowed from the owned ordinary target. */
+    p_uint named_rank;          /* Immutable; safe after target cleanup. */
+#endif
 };
 
 struct ldmud_program_lfun_argument_s
@@ -3849,6 +3853,11 @@ static ldmud_lpctype_t ldmud_bytes_type =
 /* Programs (Regular and Lightweight Objects) */
 
 /*-------------------------------------------------------------------------*/
+#ifdef USE_BLUEPRINT_UPDATE
+static PyTypeObject ldmud_program_lfun_type;
+static PyTypeObject ldmud_program_variable_type;
+#endif
+
 static bool
 ldmud_program_check_available (ldmud_program_t* self)
 
@@ -3882,6 +3891,24 @@ ldmud_program_check_available (ldmud_program_t* self)
             /* Update the program entry. */
             self->lpc_program = self->lpc_object.u.ob->prog;
 
+#ifdef USE_BLUEPRINT_UPDATE
+            if (Py_TYPE(self) == &ldmud_program_lfun_type
+             || Py_TYPE(self) == &ldmud_program_variable_type)
+            {
+                ldmud_program_and_index_t *ref = (ldmud_program_and_index_t *)self;
+                if (ref->named)
+                {
+                    int limit = ref->named->variable ? self->lpc_program->num_variables
+                                                    : self->lpc_program->num_functions;
+                    if (ref->named->index < 0 || ref->named->index >= limit)
+                    {
+                        PyErr_SetString(PyExc_ValueError, "LPC declaration is no longer available");
+                        return false;
+                    }
+                    ref->index = ref->named->index;
+                }
+            }
+#endif
             return true;
 
         case T_LWOBJECT:
@@ -3922,8 +3949,8 @@ ldmud_program_dealloc (ldmud_program_t* self)
  */
 
 {
-    free_svalue(&(self->lpc_object));
     remove_gc_object(&gc_program_list, (ldmud_gc_var_t*)self);
+    free_svalue(&(self->lpc_object));
 
     Py_TYPE(self)->tp_free((PyObject*)self);
 } /* ldmud_program_dealloc() */
@@ -3979,6 +4006,31 @@ ldmud_program_register_replace_program_protector (ldmud_program_and_index_t* ref
 
     return true;
 } /* ldmud_program_register_replace_program_protector() */
+
+#ifdef USE_BLUEPRINT_UPDATE
+static bool
+ldmud_program_attach_named (ldmud_program_and_index_t *ref, Bool variable)
+
+/* The owned target also owns the binding. No separate root or program
+ * reference is introduced, and iterators never enter this helper.
+ */
+
+{
+    ref->named = NULL;
+    ref->named_rank = 0;
+    if (ref->ob_base.lpc_object.type != T_OBJECT)
+        return true;
+    if (!closure_get_named_binding(&ref->named, ref->ob_base.lpc_object.u.ob,
+                                   NULL, ref->index, variable))
+    {
+        PyErr_SetString(PyExc_MemoryError, "out of memory when creating LPC declaration binding");
+        return false;
+    }
+    if (ref->named)
+        ref->named_rank = ref->named->rank;
+    return true;
+} /* ldmud_program_attach_named() */
+#endif
 
 /*-------------------------------------------------------------------------*/
 static void
@@ -4075,6 +4127,17 @@ ldmud_program_and_index_hash (ldmud_program_and_index_t *val)
 
 {
     void *ptr;
+#ifdef USE_BLUEPRINT_UPDATE
+    if (val->ob_base.lpc_object.type == T_OBJECT && val->named)
+    {
+        /* Only scalar identity is needed: cleanup/destruction may already
+         * have invalidated the borrowed leaf. Hashing must not unswap or
+         * change identity when a physical slot moves.
+         */
+        Py_hash_t hash = _Py_HashPointer(val->ob_base.lpc_object.u.ob) ^ val->named_rank;
+        return hash == -1 ? -2 : hash;
+    }
+#endif
     switch (val->ob_base.lpc_object.type)
     {
         case T_OBJECT:
@@ -4200,6 +4263,8 @@ ldmud_program_and_index_richcompare (ldmud_program_and_index_t *self, PyObject *
     svalue_t self_ob, other_ob;
     bool result;
     PyObject* resultval;
+    p_uint self_index, other_index;
+    int index_cmp;
 
     if (Py_TYPE(self) != Py_TYPE(other))
     {
@@ -4209,6 +4274,24 @@ ldmud_program_and_index_richcompare (ldmud_program_and_index_t *self, PyObject *
 
     self_ob = self->ob_base.lpc_object;
     other_ob = ((ldmud_program_and_index_t*)other)->ob_base.lpc_object;
+    self_index = self->index;
+    other_index = ((ldmud_program_and_index_t*)other)->index;
+#ifdef USE_BLUEPRINT_UPDATE
+    /* Do not dereference borrowed leaves here, including after destruction. */
+    if (self_ob.type == T_OBJECT && self->named)
+        self_index = self->named_rank;
+    if (other_ob.type == T_OBJECT && ((ldmud_program_and_index_t*)other)->named)
+        other_index = ((ldmud_program_and_index_t*)other)->named_rank;
+#endif
+    index_cmp = self_index < other_index ? -1 : self_index > other_index;
+#ifdef USE_BLUEPRINT_UPDATE
+    /* A generated function's current slot may equal a named declaration's
+     * retained rank. As with native closures, these are distinct identities.
+     */
+    if (!index_cmp && self_ob.type == T_OBJECT && other_ob.type == T_OBJECT
+     && !!self->named != !!((ldmud_program_and_index_t*)other)->named)
+        index_cmp = self->named ? 1 : -1;
+#endif
 
     if(self_ob.type < other_ob.type)
         result = op == Py_LT || op == Py_LE || op == Py_NE;
@@ -4254,7 +4337,7 @@ ldmud_program_and_index_richcompare (ldmud_program_and_index_t *self, PyObject *
                     break;
                 }
 
-                result = (self->index < ((ldmud_program_and_index_t*)other)->index);
+                result = index_cmp < 0;
                 break;
             }
 
@@ -4273,16 +4356,16 @@ ldmud_program_and_index_richcompare (ldmud_program_and_index_t *self, PyObject *
                     break;
                 }
 
-                result = (self->index <= ((ldmud_program_and_index_t*)other)->index);
+                result = index_cmp <= 0;
                 break;
             }
 
             case Py_EQ:
-                 result = (self_rob == other_rob && self_lwob == other_lwob && self->index == ((ldmud_program_and_index_t*)other)->index);
+                 result = (self_rob == other_rob && self_lwob == other_lwob && index_cmp == 0);
                  break;
 
             case Py_NE:
-                 result = (self_rob != other_rob || self_lwob != other_lwob || self->index != ((ldmud_program_and_index_t*)other)->index);
+                 result = (self_rob != other_rob || self_lwob != other_lwob || index_cmp != 0);
                  break;
 
             case Py_GT:
@@ -4300,7 +4383,7 @@ ldmud_program_and_index_richcompare (ldmud_program_and_index_t *self, PyObject *
                     break;
                 }
 
-                result = (self->index > ((ldmud_program_and_index_t*)other)->index);
+                result = index_cmp > 0;
                 break;
             }
 
@@ -4319,7 +4402,7 @@ ldmud_program_and_index_richcompare (ldmud_program_and_index_t *self, PyObject *
                     break;
                 }
 
-                result = (self->index >= ((ldmud_program_and_index_t*)other)->index);
+                result = index_cmp >= 0;
                 break;
             }
 
@@ -4647,7 +4730,11 @@ ldmud_program_lfun_create (svalue_t ob, program_t *prog, unsigned short index)
     lfun->index = index;
 
     add_gc_object(&gc_program_list, (ldmud_gc_var_t*)lfun);
-    if (!ldmud_program_register_replace_program_protector(lfun))
+    if (
+#ifdef USE_BLUEPRINT_UPDATE
+        !ldmud_program_attach_named(lfun, MY_FALSE) ||
+#endif
+        !ldmud_program_register_replace_program_protector(lfun))
     {
         Py_DECREF(lfun);
         return NULL;
@@ -4833,7 +4920,7 @@ ldmud_program_functions_dir (ldmud_program_t *self)
     /* Now add all the functions. */
     if (self->lpc_program)
     {
-        program_t *progp = self->lpc_program;
+        program_t *progp;
 
         if (!ldmud_program_check_available(self))
         {
@@ -4841,6 +4928,7 @@ ldmud_program_functions_dir (ldmud_program_t *self)
             return NULL;
         }
 
+        progp = self->lpc_program;
         for (int idx = 0; idx < progp->num_function_names; idx++)
         {
             string_t *fun = get_function_header(progp, progp->function_names[idx])->name;
@@ -4878,7 +4966,7 @@ ldmud_program_functions_dict (ldmud_program_t *self, void *closure)
 
     if (self->lpc_program)
     {
-        program_t *progp = self->lpc_program;
+        program_t *progp;
 
         if (!ldmud_program_check_available(self))
         {
@@ -4886,6 +4974,7 @@ ldmud_program_functions_dict (ldmud_program_t *self, void *closure)
             return NULL;
         }
 
+        progp = self->lpc_program;
         for (int idx = 0; idx < progp->num_function_names; idx++)
         {
             int fx = progp->function_names[idx];
@@ -5258,7 +5347,11 @@ ldmud_program_variable_create (svalue_t ob, program_t *prog, unsigned short inde
     var->index = index;
 
     add_gc_object(&gc_program_list, (ldmud_gc_var_t*)var);
-    if (!ldmud_program_register_replace_program_protector(var))
+    if (
+#ifdef USE_BLUEPRINT_UPDATE
+        !ldmud_program_attach_named(var, MY_TRUE) ||
+#endif
+        !ldmud_program_register_replace_program_protector(var))
     {
         Py_DECREF(var);
         return NULL;
@@ -5446,7 +5539,7 @@ ldmud_program_variables_dir (ldmud_program_t *self)
     /* Now add all the variables. */
     if (self->lpc_program)
     {
-        program_t *progp = self->lpc_program;
+        program_t *progp;
 
         if (!ldmud_program_check_available(self))
         {
@@ -5454,6 +5547,7 @@ ldmud_program_variables_dir (ldmud_program_t *self)
             return NULL;
         }
 
+        progp = self->lpc_program;
         for (int ix = 0; ix < progp->num_variables; ix++)
         {
             string_t *var = progp->variables[ix].name;
@@ -5583,6 +5677,58 @@ static PyTypeObject ldmud_program_variables_type =
     0,                                  /* tp_members */
     ldmud_program_variables_getset,     /* tp_getset */
 };
+
+#ifdef USE_BLUEPRINT_UPDATE
+static Bool
+python_program_scan_handles (object_t *ob, named_binding_t *binding, size_t *work)
+
+/* With binding == NULL, look for unsupported old-layout dependencies.
+ * Otherwise test whether Python alone retains that declaration. Charge every
+ * weak-list entry to the request's work budget, without allocation, Python
+ * calls, or decrefs. Callers report exhaustion after this traversal returns.
+ */
+
+{
+    ldmud_gc_var_t *var;
+    Bool found = MY_FALSE;
+    bool started = python_start_thread();
+
+    for (var = gc_program_list; var; var = var->gcnext)
+    {
+        ldmud_program_t *self = (ldmud_program_t *)var;
+        PyTypeObject *type = Py_TYPE(self);
+
+        if (!*work)
+            break;
+        --*work;
+        if (self->lpc_object.type != T_OBJECT || self->lpc_object.u.ob != ob)
+            continue;
+        if (type == &ldmud_program_lfun_type || type == &ldmud_program_variable_type)
+            found = ((ldmud_program_and_index_t *)self)->named == binding;
+        else if (!binding)
+            found = type == &ldmud_program_functions_iter_type
+                 || type == &ldmud_program_variables_iter_type;
+        if (found)
+        {
+            break;
+        }
+    }
+    python_finish_thread(started);
+    return found;
+}
+
+Bool
+python_program_has_handles (object_t *ob, size_t *work)
+{
+    return python_program_scan_handles(ob, NULL, work);
+}
+
+Bool
+python_program_has_named_binding (object_t *ob, named_binding_t *binding, size_t *work)
+{
+    return python_program_scan_handles(ob, binding, work);
+}
+#endif /* USE_BLUEPRINT_UPDATE */
 
 /*-------------------------------------------------------------------------*/
 /* Objects */
@@ -9389,7 +9535,7 @@ ldmud_closure_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
         }
 
         /* The closure was bound to the wrong object */
-        assign_object_svalue(&(cl.u.lfun_closure->base.ob), sv_bound_ob, "ldmud_closure_init");
+        closure_set_bound_object(&cl.u.lfun_closure->base, CLOSURE_LFUN, sv_bound_ob);
     }
 
     result = ldmud_closure_create(&cl);
@@ -9725,7 +9871,7 @@ ldmud_lfun_closure_init (ldmud_closure_t *self, PyObject *args, PyObject *kwds)
     }
 
     /* The closure was bound to the wrong object */
-    assign_object_svalue(&(self->lpc_closure.u.lfun_closure->base.ob), sv_bound_ob, "ldmud_closure_init");
+    closure_set_bound_object(&self->lpc_closure.u.lfun_closure->base, CLOSURE_LFUN, sv_bound_ob);
 
     return 0;
 } /* ldmud_lfun_closure_init() */
@@ -9771,7 +9917,14 @@ ldmud_lfun_closure_get_lfun (ldmud_closure_t *self, void *closure)
         return NULL;
 
     cl = self->lpc_closure.u.lfun_closure;
-    ix = cl->fun_index;
+#ifdef USE_BLUEPRINT_UPDATE
+    if (cl->base.named && cl->base.named->index < 0)
+    {
+        PyErr_SetString(PyExc_ValueError, "named closure declaration is no longer available");
+        return NULL;
+    }
+#endif
+    ix = closure_lfun_index(cl);
     switch (cl->fun_ob.type)
     {
         case T_OBJECT:
@@ -10037,13 +10190,13 @@ ldmud_identifier_closure_get_variable (ldmud_closure_t *self, void *closure)
             fatal("Invalid object type for closure.\n");
     }
 
-    if (cl->var_index == VANISHED_VARCLOSURE_INDEX)
+    if (closure_identifier_index(cl) == VANISHED_VARCLOSURE_INDEX)
     {
         Py_INCREF(Py_None);
         return Py_None;
     }
 
-    return ldmud_program_variable_create(cl->base.ob, prog, cl->var_index);
+    return ldmud_program_variable_create(cl->base.ob, prog, closure_identifier_index(cl));
 } /* ldmud_identifier_closure_get_lfun() */
 
 /*-------------------------------------------------------------------------*/
@@ -10308,6 +10461,7 @@ ldmud_bound_lambda_closure_init (ldmud_closure_t *self, PyObject *args, PyObject
     closure_init_base(&(l->base), sv_ob);
     l->lambda = lambda->lpc_closure.u.lambda;
     lambda->lpc_closure.u.lambda->base.ref++;
+    closure_register_dependencies(&l->base, CLOSURE_BOUND_LAMBDA);
 
     free_svalue(&self->lpc_closure);
     self->lpc_closure.type = T_CLOSURE;
@@ -17222,7 +17376,21 @@ call_lpc_secure (CClosureFun fun, int num_arg, void* data)
     struct error_recovery_info error_recovery_info;
     struct control_stack *save_csp;
     svalue_t *save_sp;
-    bool result = false;
+    volatile bool result = false;
+    /* Native final-owner disposal must not unwind its partially drained
+     * free_svalue queue. LPC callbacks have their own recovery and must keep
+     * ordinary resource/error semantics, including secure_apply_error and
+     * Python context restoration. Suspend the guard for this entire boundary.
+     */
+    stack_gap_guard_t *save_guard = set_stack_gap_guard(NULL);
+    bool external = python_is_external;
+    svalue_t save_ob = current_object;
+    object_t *save_command = command_giver;
+    /* The restored wrapper pins an LW context even if nested Python entry
+     * replaces its ContextVar. Its LPC ownership remains on the normal Python
+     * GC lists. current_object itself is always a borrowed reference.
+     */
+    PyObject *context_ref = external ? python_restore_context() : NULL;
 
     error_recovery_info.rt.last = rt_context;
     error_recovery_info.rt.type = ERROR_RECOVERY_APPLY;
@@ -17242,21 +17410,18 @@ call_lpc_secure (CClosureFun fun, int num_arg, void* data)
          * a reference here.
          */
         string_t *error = ref_mstring(current_error);
-        secure_apply_error(save_sp, save_csp, python_is_external);
+        secure_apply_error(save_sp, save_csp, external);
 
-        PyErr_SetString(PyExc_RuntimeError, get_txt(current_error));
+        PyErr_SetString(PyExc_RuntimeError, get_txt(error));
         free_mstring(error);
     }
     else
     {
-        svalue_t save_ob = current_object;
-
-        if(python_is_external)
+        if(external)
         {
             /* We do externally called python code
              * in the context of the master ob.
              */
-            python_restore_context();
             if (current_object.type == T_NUMBER)
                 set_current_object(master_ob);
             mark_start_evaluation();
@@ -17265,15 +17430,18 @@ call_lpc_secure (CClosureFun fun, int num_arg, void* data)
         (*fun)(num_arg, data);
         result = true;
 
-        if(python_is_external)
-        {
-            mark_end_evaluation();
-            python_save_context();
-            current_object = save_ob;
-        }
+        if(external) mark_end_evaluation();
+    }
+    if (external)
+    {
+        python_save_context();
+        current_object = save_ob;
+        command_giver = save_command;
     }
 
     rt_context = error_recovery_info.rt.last;
+    set_stack_gap_guard(save_guard);
+    Py_XDECREF(context_ref);
 
     return result;
 } /* call_lpc_secure() */
@@ -17501,17 +17669,18 @@ python_restore_contextvar_object (PyObject* contextvar, object_t** object)
 } /* python_restore_contextvar_object() */
 
 /*-------------------------------------------------------------------------*/
-static void
+static PyObject *
 python_restore_contextvar_value (PyObject* contextvar, svalue_t* dest)
 
-/* Restore an LPC value from the corresponding Python context variable.
+/* Borrow an object/LW value and return its retained Python wrapper. The caller
+ * must hold this wrapper until the borrowed native context has been restored.
  */
 
 {
     PyObject *val;
 
     if (!contextvar)
-        return;
+        return NULL;
 
     if (PyContextVar_Get(contextvar, NULL, &val) < 0)
     {
@@ -17522,29 +17691,50 @@ python_restore_contextvar_value (PyObject* contextvar, svalue_t* dest)
         *dest = const0;
     else
     {
-        if (python_to_svalue(dest, val) != NULL)
-            *dest = const0;
-        Py_DECREF(val);
+        *dest = const0;
+        if (ldmud_object_check(val))
+        {
+            object_t *ob = ((ldmud_object_t *)val)->lpc_object;
+            if (ob && !(ob->flags & O_DESTRUCTED))
+            {
+                dest->type = T_OBJECT;
+                dest->u.ob = ob;
+            }
+        }
+        else if (ldmud_lwobject_check(val))
+        {
+            lwobject_t *ob = ((ldmud_lwobject_t *)val)->lpc_lwobject;
+            if (ob)
+            {
+                dest->type = T_LWOBJECT;
+                dest->u.lwob = ob;
+            }
+        }
+        return val;
     }
-} /* python_restore_contextvar_object() */
+    return NULL;
+} /* python_restore_contextvar_value() */
 #endif
 
 /*-------------------------------------------------------------------------*/
-static void
+static PyObject *
 python_restore_context ()
 
 /* Restore the current context (current object, current command giver) from
  * the corresponding Python context variables. Should only be called for
- * external calls.
+ * external calls. The returned Python wrapper keeps a borrowed LW current
+ * object alive until the caller restores the previous native context.
  */
 
 {
 #ifdef USE_PYTHON_CONTEXT
-    python_restore_contextvar_value(python_contextvar_current_object, &current_object);
+    PyObject *context = python_restore_contextvar_value(python_contextvar_current_object, &current_object);
     python_restore_contextvar_object(python_contextvar_command_giver, &command_giver);
+    return context;
 #else
     clear_current_object();
     command_giver = NULL;
+    return NULL;
 #endif
 } /* python_restore_context() */
 

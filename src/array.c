@@ -48,6 +48,7 @@
  */
 
 #include "driver.h"
+#include "program_update.h"
 #include "typedefs.h"
 
 #include "my-alloca.h"
@@ -137,7 +138,7 @@ _allocate_array(mp_int n MTRACE_DECL)
 
     num_arrays++;
 
-    p = ALLOC_VECTOR(n);
+    p = DEFAULT_TEST_NULL(DEFAULT_TEST_ARRAY, ALLOC_VECTOR(n));
     if (!p) {
 #ifndef MALLOC_TRACE
         (*allocate_array_error_handler)

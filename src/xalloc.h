@@ -208,6 +208,24 @@ extern void dump_malloc_trace (int d, void *adr) __attribute__((nonnull(2)));
 
 extern void get_stack_direction (void);
 
+/* A native owner may briefly finish a partially completed transfer before
+ * cancelling at its next ownership-safe checkpoint. This guard only
+ * defers recoverable stack-gap errors; actual overlap remains fatal.
+ * Storage must outlive every guarded release, and callbacks must suspend
+ * the guard so ordinary runtime recovery remains in force.
+ */
+typedef struct stack_gap_guard_s
+{
+    Bool failed;
+} stack_gap_guard_t;
+
+extern stack_gap_guard_t *set_stack_gap_guard(stack_gap_guard_t *guard);
+extern stack_gap_guard_t *get_stack_gap_guard(void);
+extern Bool stack_gap_guard_failed(void);
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+extern void test_stack_gap_failure(void);
+#endif
+
 extern char * stack_gap_fast_limit;
 extern void assert_stack_gap_slow(void);
 

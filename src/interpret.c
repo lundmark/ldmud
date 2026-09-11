@@ -224,6 +224,8 @@
 #include "mapping.h"
 #include "mstrings.h"
 #include "object.h"
+#include "program_update.h"
+#include "program_schema.h"
 #include "otable.h"
 #include "parse.h"
 #include "prolang.h"
@@ -1806,6 +1808,32 @@ internal_assign_svalue_no_free (svalue_t *to, svalue_t *from)
 
 } /* internal_assign_svalue_no_free() */
 
+#ifdef USE_BLUEPRINT_UPDATE
+void
+assign_update_svalue_no_free (svalue_t *to, svalue_t *from)
+
+/* Retain an exact variable representation without normalizing its source.
+ * In particular, migration must retain protected cells and even obsolete
+ * object/coroutine wrappers until ordinary data cleaning visits them.
+ * The destination must already be a rooted, empty ownership slot.
+ */
+
+{
+    if (from->type == T_OBJECT)
+    {
+        *to = *from;
+        ref_object(to->u.ob, "blueprint variable staging");
+    }
+    else if (from->type == T_COROUTINE)
+    {
+        *to = *from;
+        ref_coroutine(to->u.coroutine);
+    }
+    else
+        internal_assign_svalue_no_free(to, from);
+} /* assign_update_svalue_no_free() */
+#endif
+
 /*-------------------------------------------------------------------------*/
 static INLINE void
 inl_copy_svalue_no_free (svalue_t *to, svalue_t *from)
@@ -2017,6 +2045,138 @@ internal_assign_rvalue_no_free ( svalue_t *to, svalue_t *from )
     }
 
 } /* internal_assign_rvalue_no_free() */
+
+#ifdef USE_BLUEPRINT_UPDATE
+static void
+update_copy_bytes (schema_budget_t *budget, size_t count, size_t unit,
+                   size_t header)
+{
+    if (header >= budget->bytes || count > (SSIZE_MAX - header) / unit
+     || count > (budget->bytes - header - 1) / unit)
+        errorf("update_blueprint(): shared value storage limit exceeded.\n");
+    budget->bytes -= header + count * unit;
+}
+
+static void
+update_copy_rvalue (svalue_t *to, svalue_t *from, schema_budget_t *budget,
+                    unsigned int depth)
+
+/* The ordinary rvalue helpers normalize source cells and backing mappings.
+ * Added shared variables need the same value semantics, without those
+ * mutations. Every allocated result is installed in its rooted destination
+ * before another allocation. Container values themselves remain shared;
+ * only ranges and mutable strings require materialization.
+ */
+
+{
+    if (!budget->work || depth >= BLUEPRINT_UPDATE_MAX_LITERAL_DEPTH)
+        errorf("update_blueprint(): shared value work limit exceeded.\n");
+    budget->work--;
+    if (from->type == T_LVALUE)
+    {
+        switch (from->x.lvalue_type)
+        {
+        case LVALUE_PROTECTED:
+            /* normalize_lvalue() zeroes obsolete references in a protected
+             * cell, including closures. Raw closure values, however, retain
+             * their representation during ordinary clone initialization.
+             */
+            if (destructed_object_ref(&from->u.protected_lvalue->val))
+                put_number(to, 0);
+            else
+                update_copy_rvalue(to, &from->u.protected_lvalue->val, budget, depth + 1);
+            return;
+        case LVALUE_PROTECTED_CHAR:
+            put_number(to, read_protected_char(from->u.protected_char_lvalue));
+            return;
+        case LVALUE_PROTECTED_MAPENTRY:
+        {
+            struct protected_mapentry_lvalue *entry = from->u.protected_mapentry_lvalue;
+            svalue_t *value;
+            push_number(inter_sp, 0);
+            update_copy_rvalue(inter_sp, &entry->key, budget, depth + 1);
+            value = get_map_value(entry->map, inter_sp);
+            if (value != &const0 && destructed_object_ref(value + entry->index))
+                put_number(to, 0);
+            else
+                update_copy_rvalue(to, value == &const0 ? value : value + entry->index,
+                                   budget, depth + 1);
+            pop_stack();
+            return;
+        }
+        case LVALUE_PROTECTED_RANGE:
+        case LVALUE_PROTECTED_MAP_RANGE:
+        {
+            svalue_t *values;
+            size_t start, length;
+            Bool absent = MY_FALSE;
+            if (from->x.lvalue_type == LVALUE_PROTECTED_RANGE)
+            {
+                struct protected_range_lvalue *range = from->u.protected_range_lvalue;
+                start = range->index1;
+                length = range->index2 > range->index1 ? range->index2 - range->index1 : 0;
+                if (range->vec.type == T_STRING || range->vec.type == T_BYTES)
+                {
+                    string_t *str;
+                    update_copy_bytes(budget, length, 1, sizeof(string_t) + 1);
+                    str = length ? mstr_extract(range->vec.u.str, start, start + length - 1)
+                                 : ref_mstring(range->vec.type == T_STRING ? STR_EMPTY : empty_byte_string);
+                    if (!str) outofmemory("blueprint shared string range");
+                    if (range->vec.type == T_STRING) put_string(to, str);
+                    else put_bytes(to, str);
+                    return;
+                }
+                assert(range->vec.type == T_POINTER);
+                values = range->vec.u.vec->item;
+            }
+            else
+            {
+                struct protected_map_range_lvalue *range = from->u.protected_map_range_lvalue;
+                start = range->index1;
+                length = range->index2 - range->index1;
+                push_number(inter_sp, 0);
+                update_copy_rvalue(inter_sp, &range->key, budget, depth + 1);
+                values = get_map_value(range->map, inter_sp);
+                absent = values == &const0;
+            }
+            if ((max_array_size && length > max_array_size) || length > budget->slots)
+                errorf("update_blueprint(): shared range slot limit exceeded.\n");
+            update_copy_bytes(budget, length, sizeof(svalue_t), sizeof(vector_t));
+            budget->slots -= length;
+            put_array(to, allocate_array(length));
+            if (stack_gap_guard_failed())
+                errorf("update_blueprint(): memory pressure copying shared range.\n");
+            for (size_t i = 0; i < length; i++)
+                update_copy_rvalue(&to->u.vec->item[i], absent ? &const0 : values + start + i,
+                                   budget, depth + 1);
+            if (from->x.lvalue_type == LVALUE_PROTECTED_MAP_RANGE)
+                pop_stack();
+            return;
+        }
+        default:
+            fatal("Invalid blueprint shared lvalue type %d.\n", from->x.lvalue_type);
+        }
+    }
+    if ((from->type == T_STRING || from->type == T_BYTES) && mstr_mutable(from->u.str))
+    {
+        string_t *str;
+        size_t length = mstrsize(from->u.str);
+        update_copy_bytes(budget, length, 1, sizeof(string_t) + 1);
+        str = new_n_mstring(get_txt(from->u.str), length, from->u.str->info.unicode);
+        if (!str) outofmemory("blueprint shared mutable string");
+        if (from->type == T_STRING) put_string(to, str);
+        else put_bytes(to, str);
+    }
+    else
+        internal_assign_svalue_no_free(to, from);
+}
+
+void
+assign_update_rvalue_no_free (svalue_t *to, svalue_t *from, schema_budget_t *budget)
+{
+    update_copy_rvalue(to, from, budget, 0);
+} /* assign_update_rvalue_no_free() */
+#endif
 
 /*-------------------------------------------------------------------------*/
 void
@@ -8093,7 +8253,8 @@ test_efun_args (int instr, int args, svalue_t *argp)
 
 /*-------------------------------------------------------------------------*/
 static INLINE Bool
-check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **svptype)
+check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **svptype,
+                            size_t *remaining, Bool *exhausted)
 // This function checks if <formal_type> and the svalue pointed to by <svp>
 // are compatible (that means, it is allowed to assign *svp to an LPC variable
 // having the type described by <formal_type>. The function handles lvalues,
@@ -8102,6 +8263,15 @@ check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **sv
 // If <svptype> is not NULL, the function stores the type of the value there,
 // which is useful for error messages. (The caller must free it afterwards.)
 {
+    if (remaining)
+    {
+        if (!*remaining)
+        {
+            *exhausted = MY_TRUE;
+            return MY_FALSE;
+        }
+        --*remaining;
+    }
     lpctype_t *valuetype = NULL;
     svalue_t *bsvp = get_rvalue_no_collapse(svp, NULL);
 
@@ -8177,6 +8347,15 @@ check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **sv
 
             while (true)
             {
+                if (remaining)
+                {
+                    if (!*remaining)
+                    {
+                        *exhausted = MY_TRUE;
+                        return MY_FALSE;
+                    }
+                    --*remaining;
+                }
                 // Walk through all possibilities of <formaltype>.
                 lpctype_t *member = head->t_class == TCLASS_UNION ? head->t_union.member : head;
                 if (member->t_class == TCLASS_ARRAY)
@@ -8192,7 +8371,8 @@ check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **sv
                         if (!item)
                             break;
 
-                        if(!check_rtt_compatibility_inl(element, item, svptype ? &svpresult : NULL))
+                        if(!check_rtt_compatibility_inl(element, item, svptype ? &svpresult : NULL,
+                                                        remaining, exhausted))
                             correct = MY_FALSE;
 
                         // mixed is returned when the element is '0'.
@@ -8334,6 +8514,24 @@ check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **sv
         }
         else
         {
+            /* The bounded caller supplies only native literal values and
+             * never requests diagnostic types. Scalar union checks must also
+             * account for alternatives visited by lpctype_contains().
+             */
+            if (remaining)
+            {
+                lpctype_t *head = formaltype;
+                do
+                {
+                    if (!*remaining)
+                    {
+                        *exhausted = MY_TRUE;
+                        return MY_FALSE;
+                    }
+                    --*remaining;
+                    head = head->t_class == TCLASS_UNION ? head->t_union.head : NULL;
+                } while (head);
+            }
             result = lpctype_contains(valuetype, formaltype);
             if (svptype)
                 *svptype = ref_lpctype(valuetype);
@@ -8355,15 +8553,29 @@ check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **sv
 Bool
 check_rtt_compatibility(lpctype_t *formaltype, svalue_t *svp) 
 {
-    return check_rtt_compatibility_inl(formaltype, svp, NULL);
+    return check_rtt_compatibility_inl(formaltype, svp, NULL, NULL, NULL);
 }
-#define check_rtt_compatibility(ft, svp) check_rtt_compatibility_inl(ft, svp, NULL)
+#ifdef USE_BLUEPRINT_UPDATE
+Bool
+check_rtt_compatibility_bounded(lpctype_t *formaltype, svalue_t *svp,
+                                size_t *remaining, Bool *exhausted)
+
+/* Only native default trees, recursively limited to scalar literals, arrays
+ * and mappings. Arbitrary runtime objects/lvalues need separate accounting;
+ * this path never owns an allocated diagnostic struct or Python type.
+ */
+{
+    *exhausted = MY_FALSE;
+    return check_rtt_compatibility_inl(formaltype, svp, NULL, remaining, exhausted);
+}
+#endif
+#define check_rtt_compatibility(ft, svp) check_rtt_compatibility_inl(ft, svp, NULL, NULL, NULL)
 
 lpctype_t*
 get_rtt_type(lpctype_t *formaltype, svalue_t *svp)
 {
     lpctype_t *result;
-    check_rtt_compatibility_inl(formaltype, svp, &result);
+    check_rtt_compatibility_inl(formaltype, svp, &result, NULL, NULL);
     return result;
 }
 
@@ -11047,6 +11259,10 @@ again:
         /* Copy header and code. */
         l =  (lambda_t*)(block + value_size);
         memcpy(l, orig, lambda_size);
+        closure_init_dependencies(&l->base);
+#ifdef USE_BLUEPRINT_UPDATE
+        l->base.ref = 1;
+#endif
         l->base.prog_ob = ref_valid_object(orig->base.prog_ob, "context_lambda");
         assign_object_svalue_no_free(&l->base.ob, orig->base.ob, "context_lambda");
 
@@ -11083,6 +11299,8 @@ again:
         orig_values = (svalue_t*)(((void*)orig) - ((void*)l) + ((void*)values));
         while (values != (void*)l)
             assign_svalue_no_free(values++, orig_values++);
+
+        closure_register_dependencies(&l->base, CLOSURE_LAMBDA);
 
         sp++;
         sp->type = T_CLOSURE;
@@ -21093,6 +21311,11 @@ apply_master_ob (string_t *fun, int num_arg, Bool external)
     struct control_stack *save_csp;
     svalue_t *result;
 
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (fun == STR_RUNTIME && get_stack_gap_guard())
+        fatal("Blueprint native guard entered runtime_error callback.\n");
+#endif
+
     /* Get the master object. */
     assert_master_ob_loaded();
 
@@ -21114,6 +21337,7 @@ apply_master_ob (string_t *fun, int num_arg, Bool external)
     save_csp = csp;
     if (setjmp(error_recovery_info.con.text))
     {
+        compile_update_callback_failed();
         secure_apply_error(save_sp - num_arg, save_csp, external);
         printf("%s Error in master_ob->%s()\n", time_stamp(), get_txt(fun));
         debug_message("%s Error in master_ob->%s()\n", time_stamp(), get_txt(fun));
@@ -21544,17 +21768,17 @@ int_call_lambda (svalue_t *lsvp, int num_arg, bool external, svalue_t *bind_ob)
             current_prog = get_current_object_program();
 
 #ifdef DEBUG
-            if (l->fun_index >= current_prog->num_functions)
+            if (closure_lfun_index(l) >= current_prog->num_functions)
                 fatal("Calling non-existing lfun closure #%hu in program '%s' "
                       "with %hu functions.\n"
-                     , l->fun_index
+                     , closure_lfun_index(l)
                      , get_txt(current_prog->name)
                      , current_prog->num_functions
                     );
 #endif
 
             /* inter_sp == sp */
-            setup_new_frame(l->fun_index, l->inhProg);
+            setup_new_frame(closure_lfun_index(l), l->inhProg);
 
             /* Check arguments. */
             check_function_args(current_prog->function_headers[FUNCTION_HEADER_INDEX(csp->funstart)].offset.fx, current_prog, csp->funstart);
@@ -21611,7 +21835,7 @@ int_call_lambda (svalue_t *lsvp, int num_arg, bool external, svalue_t *bind_ob)
             }
 
             /* Do we have the variable? */
-            if ( cl->var_index == VANISHED_VARCLOSURE_INDEX)
+            if ( closure_identifier_index(cl) == VANISHED_VARCLOSURE_INDEX)
             {
                 errorf("Variable not inherited\n");
                 /* NOTREACHED */
@@ -21627,7 +21851,7 @@ int_call_lambda (svalue_t *lsvp, int num_arg, bool external, svalue_t *bind_ob)
                     fatal("%s Fatal: call_lambda on variable for object %p '%s' "
                           "w/o variables, index %d\n"
                          , time_stamp(), cl->base.ob.u.ob
-                         , get_txt(cl->base.ob.u.ob->name), cl->var_index);
+                         , get_txt(cl->base.ob.u.ob->name), closure_identifier_index(cl));
 #endif
             }
             else
@@ -21638,11 +21862,11 @@ int_call_lambda (svalue_t *lsvp, int num_arg, bool external, svalue_t *bind_ob)
                     fatal("%s Fatal: call_lambda on variable for lightweight object %p '/%s' "
                           "w/o variables, index %d\n"
                          , time_stamp(), cl->base.ob.u.lwob
-                         , get_txt(cl->base.ob.u.lwob->prog->name), cl->var_index);
+                         , get_txt(cl->base.ob.u.lwob->prog->name), closure_identifier_index(cl));
 #endif
             }
 
-            assign_svalue_no_free(++sp, vars+cl->var_index);
+            assign_svalue_no_free(++sp, vars+closure_identifier_index(cl));
             inter_sp = sp;
             return;
         }
@@ -23260,11 +23484,32 @@ opcdump (string_t * fname)
 #ifdef TRACE_CODE
 
 /*-------------------------------------------------------------------------*/
+void
+invalidate_program_trace (program_t *prog)
+
+/* The instruction ring borrows bytecode. In-place updates preserve objects,
+ * so destruction cleanup cannot protect entries from an old program's final
+ * release. Invalidate borrowed fields only: counted history objects remain
+ * owned until ordinary overwrite/cleanup, outside atomic publication.
+ */
+
+{
+    for (int i = 0; i < TOTAL_TRACE_LENGTH; i++)
+        if (previous_programs[i] == prog)
+        {
+            previous_instruction[i] = 0;
+            previous_programs[i] = NULL;
+            previous_pc[i] = NULL;
+        }
+}
+
+/*-------------------------------------------------------------------------*/
 static char *
-get_arg (int a)
+get_arg (int a, program_t *prog)
 
 /* Return the argument for the instruction at previous_pc[<a>] as a string.
- * If there is no argument, return "".
+ * <prog> is the still-live recorded program, or NULL. If there is no safe
+ * program-backed argument to decode, return "".
  *
  * Helper function for last_instructions().
  */
@@ -23272,11 +23517,29 @@ get_arg (int a)
 {
     static char buff[12];
     bytecode_p from, to;
+    p_uint first, limit;
     int b;
 
     b = (a+1) % TOTAL_TRACE_LENGTH;
+    /* Operand lengths depend on BOTH entries. A live instruction can precede
+     * an invalidated one; never subtract null or unrelated bytecode pointers.
+     */
+    if (!prog || !previous_instruction[a] || !previous_instruction[b]
+     || !previous_pc[a] || !previous_pc[b]
+     || previous_programs[a] != previous_programs[b])
+        return "";
     from = previous_pc[a];
     to = previous_pc[b];
+    /* Efun closures execute a temporary native stack fragment; lambda code
+     * also has ownership independent of the recorded current program. Its
+     * address can outlive that storage. Compare address ranges without pointer
+     * subtraction, then decode only bytes owned by the proven live program.
+     */
+    first = (p_uint)prog->program;
+    limit = (p_uint)PROGRAM_END(*prog);
+    if ((p_uint)from < first || (p_uint)from >= limit
+     || (p_uint)to < first || (p_uint)to > limit)
+        return "";
 
     if (to - from < 2)
         return "";
@@ -23306,6 +23569,35 @@ get_arg (int a)
 
     return "";
 } /* get_arg() */
+
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+void
+program_update_trace_test (program_t *prog, Bool retired)
+{
+    static int entries, adjacent;
+    if (!retired)
+    {
+        entries = adjacent = 0;
+        for (int i = 0; i < TOTAL_TRACE_LENGTH; i++)
+            if (previous_instruction[i] && previous_programs[i] == prog)
+            {
+                int before = (i + TOTAL_TRACE_LENGTH - 1) % TOTAL_TRACE_LENGTH;
+                entries++;
+                if (previous_instruction[before] && previous_programs[before] != prog)
+                    adjacent++;
+            }
+        assert(entries && adjacent);
+        return;
+    }
+    /* prog is now a freed address: compare only, never dereference it. */
+    for (int i = 0; i < TOTAL_TRACE_LENGTH; i++)
+        assert(previous_programs[i] != prog);
+    last_instructions(TOTAL_TRACE_LENGTH, MY_FALSE, NULL);
+    last_instructions(TOTAL_TRACE_LENGTH, MY_TRUE, NULL);
+    debug_message("BLUEPRINT_TRACE_NATIVE: %d retired entries, %d adjacent boundaries; both trace modes after final release.\n",
+                  entries, adjacent);
+}
+#endif
 
 /*-------------------------------------------------------------------------*/
 static void
@@ -23444,20 +23736,21 @@ last_instructions (int length, Bool verbose, svalue_t **svpp)
         i = (i + 1) % TOTAL_TRACE_LENGTH;
         if (previous_instruction[i] != 0)
         {
+            program_t *ppr = previous_programs[i];
+            Bool live_program = program_exists(ppr, previous_objects[i]);
             if (verbose)
             {
                 string_t *file;
-                program_t *ppr;
                 bytecode_p ppc;
 
-                ppr = previous_programs[i];
-                ppc = previous_pc[i]+1;
-                if (!program_exists(ppr, previous_objects[i]))
+                ppc = (bytecode_p)((p_uint)previous_pc[i] + 1);
+                if (!live_program)
                 {
                     file = ref_mstring(STR_PROG_DEALLOCATED);
                     line = 0;
                 }
-                else if (ppc < ppr->program || ppc > PROGRAM_END(*ppr))
+                else if ((p_uint)ppc < (p_uint)ppr->program
+                      || (p_uint)ppc > (p_uint)PROGRAM_END(*ppr))
                 {
                     file = ref_mstring(STR_UNKNOWN_LAMBDA);
                     line = 0;
@@ -23490,7 +23783,7 @@ last_instructions (int length, Bool verbose, svalue_t **svpp)
             snprintf(buf, sizeof(buf)-40, "%6p: %3d %8s %-26s (%td:%3td)"
                    , previous_pc[i]
                    , previous_instruction[i] /* instrs.h has these numbers */
-                   , get_arg(i)
+                   , get_arg(i, live_program ? ppr : NULL)
                    , get_f_name(previous_instruction[i])
                    , (stack_size[i] + 1)
                    , (abs_stack_size[i])
@@ -23858,11 +24151,15 @@ check_extra_ref_in_mapping_filter (svalue_t *key, svalue_t *data
     check_extra_ref_in_vector(data, (size_t)extra);
 }
 
-static void
+void
 count_extra_ref_in_prog (program_t *prog)
 /* Count extra refs for <prog>.
  */
 {
+#ifdef USE_BLUEPRINT_UPDATE
+    program_schema_check(prog);
+#endif
+
     if (NULL != register_pointer(ptable, prog))
     {
         prog->extra_ref = 1;
@@ -23896,6 +24193,9 @@ count_extra_ref_in_object (object_t *ob)
     }
 
     ob->extra_ref = 1;
+#ifdef USE_BLUEPRINT_UPDATE
+    closure_check_object_bindings(ob);
+#endif
     if ( !O_PROG_SWAPPED(ob) )
     {
         ob->prog->extra_ref++;
@@ -24122,14 +24422,18 @@ count_extra_ref_in_vector (svalue_t *svp, size_t num)
                     break;
 
                 case LVALUE_PROTECTED_CHAR:
+                    if (p->u.protected_char_lvalue->var != NULL
+                     && NULL != register_pointer(ptable, p->u.protected_char_lvalue->var))
+                        count_extra_ref_in_vector(&p->u.protected_char_lvalue->var->val, 1);
                     break;
 
                 case LVALUE_PROTECTED_RANGE:
-                    if (p->u.protected_range_lvalue->vec.type == T_POINTER
-                     && NULL != register_pointer(ptable, p->u.protected_range_lvalue))
+                    if (NULL != register_pointer(ptable, p->u.protected_range_lvalue))
                     {
                         count_extra_ref_in_vector(&p->u.protected_range_lvalue->vec, 1);
-                        count_extra_ref_in_vector(&p->u.protected_range_lvalue->var->val, 1);
+                        if (p->u.protected_range_lvalue->var != NULL
+                         && NULL != register_pointer(ptable, p->u.protected_range_lvalue->var))
+                            count_extra_ref_in_vector(&p->u.protected_range_lvalue->var->val, 1);
                     }
                     break;
 
@@ -24243,14 +24547,18 @@ check_extra_ref_in_vector (svalue_t *svp, size_t num)
                     break;
 
                 case LVALUE_PROTECTED_CHAR:
+                    if (p->u.protected_char_lvalue->var != NULL
+                     && NULL != register_pointer(ptable, p->u.protected_char_lvalue->var))
+                        check_extra_ref_in_vector(&p->u.protected_char_lvalue->var->val, 1);
                     break;
 
                 case LVALUE_PROTECTED_RANGE:
-                    if (p->u.protected_range_lvalue->vec.type == T_POINTER
-                     && NULL != register_pointer(ptable, p->u.protected_range_lvalue))
+                    if (NULL != register_pointer(ptable, p->u.protected_range_lvalue))
                     {
                         check_extra_ref_in_vector(&p->u.protected_range_lvalue->vec, 1);
-                        check_extra_ref_in_vector(&p->u.protected_range_lvalue->var->val, 1);
+                        if (p->u.protected_range_lvalue->var != NULL
+                         && NULL != register_pointer(ptable, p->u.protected_range_lvalue->var))
+                            check_extra_ref_in_vector(&p->u.protected_range_lvalue->var->val, 1);
                     }
                     break;
 
@@ -24363,6 +24671,9 @@ check_a_lot_ref_counts (program_t *search_prog)
     count_extra_ref_from_wiz_list();
     count_simul_efun_extra_refs(ptable);
     count_comm_extra_refs();
+#ifdef USE_BLUEPRINT_UPDATE
+    program_update_count_extra_refs();
+#endif
 #ifdef USE_PYTHON
     count_python_extra_refs();
 #endif

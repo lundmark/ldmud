@@ -577,6 +577,16 @@ enable_opcprof=no
 # into the statistic.
 enable_verbose_opcprof=no
 
+# Experimental blueprint update lifecycle and per-request resource limits.
+with_blueprint_update_inflight=64
+with_blueprint_update_owner=8
+with_blueprint_update_targets=10000
+with_blueprint_update_scan_objects=1000000
+with_blueprint_update_variable_slots=1000000
+with_blueprint_update_bytes=67108864
+with_blueprint_update_literal_depth=64
+enable_blueprint_update=no
+
 # --- Standard Debugging ---
 # These options are 'standard' debugging options.
 

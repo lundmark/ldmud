@@ -338,6 +338,13 @@ locate_out (program_t *prog)
     if (prog->lwo_call_cache)
         prog->lwo_call_cache = MAKEOFFSET(call_cache_t *, lwo_call_cache);
     prog->types              = MAKEOFFSET(lpctype_t **, types);
+#ifdef USE_BLUEPRINT_UPDATE
+    if (prog->schema_arguments)
+        prog->schema_arguments = MAKEOFFSET(struct schema_argument_s *, schema_arguments);
+    prog->schema_function_flags = MAKEOFFSET(funflag_t *, schema_function_flags);
+    if (prog->schema_defaults)
+        prog->schema_defaults = MAKEOFFSET(bytecode_p, schema_defaults);
+#endif
     if (prog->type_start)
     {
         prog->argument_types = MAKEOFFSET(unsigned short *, argument_types);
@@ -389,6 +396,13 @@ locate_in (program_t *prog)
     if (prog->lwo_call_cache)
         prog->lwo_call_cache = MAKEPTR(call_cache_t *, lwo_call_cache);
     prog->types              = MAKEPTR(lpctype_t **, types);
+#ifdef USE_BLUEPRINT_UPDATE
+    if (prog->schema_arguments)
+        prog->schema_arguments = MAKEPTR(struct schema_argument_s *, schema_arguments);
+    prog->schema_function_flags = MAKEPTR(funflag_t *, schema_function_flags);
+    if (prog->schema_defaults)
+        prog->schema_defaults = MAKEPTR(bytecode_p, schema_defaults);
+#endif
     if (prog->type_start)
     {
         prog->argument_types = MAKEPTR(unsigned short *, argument_types);
@@ -2617,4 +2631,3 @@ swap_driver_info (svalue_t *svp, int value)
 } /* swap_driver_info() */
 
 /***************************************************************************/
-

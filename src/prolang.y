@@ -126,21 +126,42 @@
 
 #define YYMAXDEPTH        600
 
+static bool compiler_reduction_cancelled(const void *result,
+    const void *normal_result, const void *rhs, const void *error_rhs);
+
+#ifdef USE_BLUEPRINT_UPDATE
+#define DEFAULT_LOCATION_COPY(dst, src) \
+    do { (dst).source_file = (src).source_file; \
+         (dst).source_line = (src).source_line; } while (0)
+static void compiler_default_reset(void);
+#else
+#define DEFAULT_LOCATION_COPY(dst, src) ((void)0)
+#define compiler_default_reset() ((void)0)
+#endif
+
 #define YYLLOC_DEFAULT(cur, rhs, n)                         \
     do                                                      \
     {                                                       \
+        if (compiler_reduction_cancelled(&(cur), &yyloc,     \
+                                         (rhs), yyerror_range)) \
+        {                                                   \
+            yylen = 0;                                      \
+            YYABORT;                                        \
+        }                                                   \
         if (n)                                              \
         {                                                   \
             (cur).start = YYRHSLOC(rhs, 1).start;           \
             (cur).end   = YYRHSLOC(rhs, n).end;             \
             (cur).source = YYRHSLOC(rhs, 1).source;         \
             lex_extend_span(&(cur).source, YYRHSLOC(rhs, n).source); \
+            DEFAULT_LOCATION_COPY(cur, YYRHSLOC(rhs, 1));   \
         }                                                   \
         else                                                \
         {                                                   \
             (cur).start = (cur).end = YYRHSLOC(rhs, 0).end; \
             (cur).source = YYRHSLOC(rhs, 0).source;         \
             (cur).source.column = (cur).source.end_column; \
+            DEFAULT_LOCATION_COPY(cur, YYRHSLOC(rhs, 0));   \
         }                                                   \
     } while (0)
 
@@ -280,6 +301,19 @@ struct struct_init_s
     fulltype_t      type;  /* Type of expression */
     string_t      * name;  /* Member name, or NULL if unnamed */
 };
+
+static void
+free_struct_initializers (struct_init_t *list)
+{
+    while (list)
+    {
+        struct_init_t *next = list->next;
+        free_mstring(list->name);
+        free_fulltype(list->type);
+        xfree(list);
+        list = next;
+    }
+}
 
 /* --- struct efun_shadow_s: Store info about masked efuns ---
  *
@@ -449,6 +483,16 @@ enum e_saved_areas {
     /* (struct_def_t) Tabled descriptors of all struct definitions.
      */
 
+#ifdef USE_BLUEPRINT_UPDATE
+ , A_SCHEMA_FUNCTION_FLAGS
+    /* (funflag_t) Effective flags before addresses overwrite low flag bits. */
+ , A_SCHEMA_ARGUMENTS
+    /* (schema_argument_s) Internal declared argument evidence, even without
+     * exact_types or save_types. Type references are owned by A_TYPES.
+     */
+ , A_SCHEMA_DEFAULTS
+    /* (bytecode_t) Packed immutable default records, nodes, edges and bytes. */
+#endif
  , NUMPAREAS  /* Number of saved areas */
 };
 
@@ -465,6 +509,10 @@ typedef unsigned short       A_ARGUMENT_TYPE_INDEX_t;
 typedef unsigned short       A_ARGUMENT_INDEX_t;
 typedef include_t            A_INCLUDES_t;
 typedef struct_def_t         A_STRUCT_DEFS_t;
+#ifdef USE_BLUEPRINT_UPDATE
+typedef struct schema_argument_s A_SCHEMA_ARGUMENTS_t;
+typedef funflag_t A_SCHEMA_FUNCTION_FLAGS_t;
+#endif
 
 enum e_internal_areas {
    A_FUNCTIONS = NUMPAREAS
@@ -581,6 +629,17 @@ enum e_internal_areas {
      * string compilation when looking up u.global.struct_id from
      * identifiers.
      */
+
+#ifdef USE_BLUEPRINT_UPDATE
+ , A_SCHEMA_DEFAULT_RECORDS
+ , A_SCHEMA_DEFAULT_NODES
+ , A_SCHEMA_DEFAULT_EDGES
+ , A_SCHEMA_DEFAULT_BYTES
+ , A_DEFAULT_CAPTURE_NODES
+ , A_DEFAULT_CAPTURE_EDGES
+ , A_DEFAULT_CAPTURE_BYTES
+ , A_DEFAULT_CAPTURE_LINKS
+#endif
 
  , NUMAREAS  /* Total number of areas */
 };
@@ -1108,6 +1167,9 @@ static char *last_yalloced = NULL;
    */
 
 static program_t NULL_program;
+#ifdef USE_BLUEPRINT_UPDATE
+static p_int schema_generation;
+#endif
   /* Empty program_t structure for initialisations.
    */
 
@@ -1448,7 +1510,126 @@ int yyparse(void);
 static void add_new_init_jump(void);
 static void transfer_init_control(void);
 static void copy_structs(program_t *, funflag_t);
-static void new_inline_closure (void);
+
+/* Only parser call sites receive private definition scratch. Runtime hooks
+ * continue to call the ordinary type APIs with no context. */
+static lpctype_context_t *compiler_type_context;
+
+static bool
+compiler_reduction_cancelled (const void *result, const void *normal_result,
+                              const void *rhs, const void *error_rhs)
+
+/* At a normal reduction no action has changed RHS ownership yet. Bison
+ * 2.7--3.5 also use yyloc during error-token shifts, so both identities
+ * matter. Clear yylen before YYABORT so normal destruction includes the
+ * pending rule's intact RHS. Never inspect stale, partly executed actions.
+ */
+
+{
+    if (result != normal_result || rhs == error_rhs
+     || !compile_update_cancelled())
+        return false;
+    if (!num_parse_error)
+        num_parse_error = 1;
+    return true;
+}
+
+static lpctype_t *
+compiler_require_type (lpctype_t *type)
+
+/* An allocation failure must still leave the current action a valid type
+ * to release. The failed parse cannot produce a candidate program.
+ */
+
+{
+    if (!type && compiler_type_context)
+    {
+        compiler_type_context->failed = MY_TRUE;
+        yyerror("Out of memory for compiler type");
+        return lpctype_mixed;
+    }
+    return type;
+}
+
+static lpctype_t *
+compiler_get_array_type (lpctype_t *element)
+{
+    lpctype_t *type = get_array_type(element);
+    return element ? compiler_require_type(type) : NULL;
+}
+
+static lpctype_t *
+compiler_get_union_type (lpctype_t *head, lpctype_t *member)
+{
+    lpctype_t *type = get_union_type_context(compiler_type_context, head, member);
+    return compiler_type_context && compiler_type_context->failed
+           ? compiler_require_type(type) : type;
+}
+
+#define get_array_type(t) compiler_get_array_type(t)
+#define get_array_type_with_depth(t,d) compiler_require_type(get_array_type_with_depth_context(compiler_type_context, (t), (d)))
+#define get_object_type(n) compiler_require_type(get_object_type(n))
+#define get_lwobject_type(n) compiler_require_type(get_lwobject_type(n))
+#define get_python_type(n) compiler_require_type(get_python_type(n))
+
+/* A private file compilation has one native owner until adoption. The
+ * provisional program only borrows references from the compiler areas;
+ * compiled_prog owns them after adoption. Lexer activity is independent
+ * of current_loc, which backend error recovery clears.
+ */
+static struct
+{
+    Bool active;
+    Bool initialized;
+    Bool lexer_started;
+    Bool basic_cleaned;
+    Bool adopted;
+    size_t structs_cleaned;
+    program_t *provisional;
+} compiler_file_state;
+#define compiler_struct_definition(t) lpctype_struct_definition(compiler_type_context, (t))
+#define compiler_struct_index(t) lpctype_struct_index(compiler_type_context, (t))
+#define set_compiler_struct_index(t,i) lpctype_set_struct_index(compiler_type_context, (t), (i))
+#define get_struct_type(d) compiler_get_struct_type(d)
+#define get_union_type(a,b) compiler_get_union_type((a), (b))
+#define get_common_type(a,b) get_common_type_context(compiler_type_context, (a), (b))
+#define has_common_type(a,b) has_common_type_context(compiler_type_context, (a), (b))
+#define lpctype_contains(a,b) lpctype_contains_context(compiler_type_context, (a), (b))
+#define update_struct_type(t,d) compiler_update_struct_type((t), (d))
+#define clean_struct_type(t) compiler_clean_struct_type(t)
+
+static lpctype_t *
+compiler_get_struct_type (struct_type_t *def)
+{
+    lpctype_t *type = get_struct_type_context(compiler_type_context, def);
+    if (!type)
+        yyerror("Out of memory for compiler struct type context");
+    return type;
+}
+
+static bool
+compiler_update_struct_type (lpctype_t *type, struct_type_t *def)
+{
+    if (!lpctype_set_struct_definition(compiler_type_context, type, def))
+    {
+        yyerror("Out of memory for compiler struct type context");
+        return false;
+    }
+    return true;
+}
+
+static void
+compiler_clean_struct_type (lpctype_t *type)
+{
+    if (type && !type->t_static && type->t_class == TCLASS_STRUCT)
+    {
+        struct struct_info_s *info = lpctype_struct_info(compiler_type_context, type);
+        if (info)
+            info->def = NULL;
+    }
+}
+
+static Bool new_inline_closure (void);
 static int inherit_program(program_t *from, funflag_t funmodifier, funflag_t varmodifier, funflag_t structmodifier);
 static void fix_variable_index_offsets(program_t *);
 static short store_prog_string (string_t *str);
@@ -1464,8 +1645,10 @@ report_compile_diagnostic (source_span_t location, Bool warning, const char *str
 
 {
     char message[16384];
-    const char *file = location.loc.file ? location.loc.file->name : NULL;
+    const char *file = location.loc.file ? location.loc.file->name : compiled_file;
 
+    if (!warning)
+        compiler_default_reset();
     if (!warning && num_parse_error > 5)
         return;
     if (string_context && !warning)
@@ -1608,6 +1791,12 @@ yalloc (size_t size)
     p = xalloc(size+sizeof(char*));
     if (!p)
     {
+        if (compiler_type_context)
+        {
+            compiler_type_context->failed = MY_TRUE;
+            yyerror("Out of memory for compiler temporary");
+            return NULL;
+        }
         fatal("Out of memory in compiler.\n");
         return NULL;
     }
@@ -1626,6 +1815,8 @@ yfree (void *block)
 {
     char **p;
 
+    if (!block)
+        return;
     p = (char **)block;
     if (p != (char **)last_yalloced)
     {
@@ -1647,7 +1838,8 @@ ystring_copy (char *str)
     char *p;
 
     p = yalloc(strlen(str)+1);
-    strcpy(p, str);
+    if (p)
+        strcpy(p, str);
     return p;
 } /* ystring_copy() */
 
@@ -1724,6 +1916,29 @@ reserve_mem_block (int n, size_t size)
 
 {
     mem_block_t *mbp = &mem_block[n];
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    int point = n == A_FUNCTIONS ? COMPILE_TEST_FUNCTION_STORAGE
+              : n == A_VARIABLES ? COMPILE_TEST_VARIABLE_STORAGE
+              : n == A_TYPES ? COMPILE_TEST_TYPE_STORAGE
+              : n == A_ARGUMENT_TYPES ? COMPILE_TEST_ARGUMENT_STORAGE
+              : n == A_ARGUMENT_TYPE_INDEX ? COMPILE_TEST_ARGUMENT_INDEX
+              : n == A_LOCAL_VARIABLES_DBG ? COMPILE_TEST_LOCAL_DEBUG
+              : n == A_STRUCT_MEMBERS ? COMPILE_TEST_STRUCT_MEMBER
+              : n == A_INLINE_CLOSURE ? COMPILE_TEST_INLINE_STORAGE
+#ifdef USE_BLUEPRINT_UPDATE
+              : n >= A_DEFAULT_CAPTURE_NODES && n <= A_DEFAULT_CAPTURE_LINKS
+                  ? COMPILE_TEST_DEFAULT_CAPTURE
+              : n == A_SCHEMA_DEFAULT_NODES || n == A_SCHEMA_DEFAULT_EDGES
+                  ? COMPILE_TEST_DEFAULT_FREEZE
+              : n == A_SCHEMA_DEFAULTS ? COMPILE_TEST_DEFAULT_PACK
+#endif
+              : 0;
+    if (point && size && compile_update_test_fail(point))
+    {
+        lex_close("Out of memory");
+        return false;
+    }
+#endif
 
     if (size && mbp->current_size + size > mbp->max_size)
         return realloc_mem_block(mbp, mbp->current_size + size);
@@ -1833,6 +2048,476 @@ DEFINE_RESERVE_MEM_BLOCK(RESERVE_DEFAULT_LAMBDA_VALUES, A_DEFAULT_LAMBDA_VALUES)
 DEFINE_RESERVE_MEM_BLOCK(RESERVE_LAMBDA_VALUES, A_LAMBDA_VALUES)
 DEFINE_RESERVE_MEM_BLOCK(RESERVE_LAMBDA_VALUES_TABLE, A_LAMBDA_VALUES_TABLE)
 DEFINE_RESERVE_MEM_BLOCK(RESERVE_LAMBDA_VALUES_NEXT, A_LAMBDA_VALUES_NEXT)
+
+#ifdef USE_BLUEPRINT_UPDATE
+static uint32_t default_epoch;
+static uint32_t active_default;
+
+static void
+compiler_default_reset (void)
+
+/* Invalidate IDs without touching storage an interrupted helper may use. */
+
+{
+    active_default = 0;
+}
+
+static struct default_descriptor_s
+compiler_default_reject (uint32_t status, uint32_t reason)
+
+{
+    return (struct default_descriptor_s)
+        { active_default ? default_epoch : 0, 0, status, reason };
+}
+
+static bool
+compiler_default_append (int area, const void *data, size_t size)
+
+/* Optional evidence limits do not change ordinary LPC acceptance. Actual
+ * allocator failure uses the compiler's existing fallible append path.
+ */
+
+{
+    size_t used = 0;
+    int first = area >= A_DEFAULT_CAPTURE_NODES
+                ? A_DEFAULT_CAPTURE_NODES : A_SCHEMA_DEFAULT_RECORDS;
+    int last = area >= A_DEFAULT_CAPTURE_NODES
+               ? A_DEFAULT_CAPTURE_LINKS : A_SCHEMA_DEFAULT_BYTES;
+
+    for (int i = first; i <= last; i++)
+    {
+        if (mem_block[i].current_size > BLUEPRINT_UPDATE_MAX_BYTES - used)
+            return false;
+        used += mem_block[i].current_size;
+    }
+    if (size > BLUEPRINT_UPDATE_MAX_BYTES - used
+     || size > UINT32_MAX - mem_block[area].current_size)
+        return false;
+    return add_to_mem_block(area, (void *)data, size);
+}
+
+static struct default_descriptor_s
+compiler_default_node (struct schema_default_node_s node)
+
+{
+    uint32_t index;
+    if (!active_default)
+        return compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+    index = mem_block[A_DEFAULT_CAPTURE_NODES].current_size / sizeof(node);
+    if (!compiler_default_append(A_DEFAULT_CAPTURE_NODES, &node, sizeof(node)))
+        return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                       SCHEMA_DEFAULT_REASON_LIMIT);
+    return (struct default_descriptor_s)
+        { default_epoch, index, SCHEMA_DEFAULT_SUPPORTED, 0 };
+}
+
+static struct default_descriptor_s
+compiler_default_integer (p_int number)
+
+{
+    struct schema_default_node_s node = {0};
+    node.kind = SCHEMA_DEFAULT_INTEGER;
+    node.depth = 1;
+    node.value.integer = number;
+    return compiler_default_node(node);
+}
+
+static struct default_descriptor_s
+compiler_default_float (double number)
+
+{
+    struct schema_default_node_s node = {0};
+    svalue_t scalar;
+    if (!active_default)
+        return compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+    if (!isfinite(number))
+        return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                       SCHEMA_DEFAULT_REASON_NUMBER);
+    scalar = svalue_float(number);
+    node.kind = SCHEMA_DEFAULT_FLOAT;
+    node.depth = 1;
+    node.value.floating = READ_DOUBLE(&scalar);
+    return compiler_default_node(node);
+}
+
+static struct default_descriptor_s
+compiler_default_string (string_t *str)
+
+/* Copy while the existing lexer owner still holds the string reference. */
+
+{
+    struct schema_default_node_s node = {0};
+    if (!active_default)
+        return compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+    node.kind = str->info.unicode == STRING_BYTES
+                ? SCHEMA_DEFAULT_BYTES : SCHEMA_DEFAULT_STRING;
+    node.unicode = str->info.unicode;
+    node.depth = 1;
+    node.text_start = mem_block[A_DEFAULT_CAPTURE_BYTES].current_size;
+    if (mstrsize(str) > UINT32_MAX
+     || !compiler_default_append(A_DEFAULT_CAPTURE_BYTES, get_txt(str), mstrsize(str)))
+        return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                       SCHEMA_DEFAULT_REASON_LIMIT);
+    node.text_size = mstrsize(str);
+    return compiler_default_node(node);
+}
+
+static struct default_descriptor_s
+compiler_default_negate (struct default_descriptor_s value)
+
+{
+    struct schema_default_node_s node;
+    if (!active_default || value.epoch != default_epoch)
+        return compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+    if (value.status != SCHEMA_DEFAULT_SUPPORTED)
+        return value;
+    node = ((struct schema_default_node_s *)mem_block[A_DEFAULT_CAPTURE_NODES].block)[value.node];
+    if (node.kind == SCHEMA_DEFAULT_INTEGER)
+    {
+        /* Ordinary literal folding preserves this wrapped boundary. */
+        if (node.value.integer != PINT_MIN)
+            node.value.integer = -node.value.integer;
+    }
+    else if (node.kind == SCHEMA_DEFAULT_FLOAT)
+    {
+        svalue_t scalar = svalue_float(node.value.floating);
+        STORE_DOUBLE(&scalar, -READ_DOUBLE(&scalar));
+        node.value.floating = READ_DOUBLE(&scalar);
+    }
+    else
+        return compiler_default_reject(SCHEMA_DEFAULT_UNSUPPORTED,
+                                       SCHEMA_DEFAULT_REASON_SYNTAX);
+    return compiler_default_node(node);
+}
+
+struct default_link_s
+{
+    uint32_t node, next;
+};
+
+static struct default_list_s
+compiler_default_list (p_int width)
+
+{
+    struct default_list_s list = {0};
+    list.width = width;
+    list.head = list.tail = UINT32_MAX;
+    list.description = compiler_default_reject(active_default
+                            ? SCHEMA_DEFAULT_SUPPORTED : SCHEMA_DEFAULT_MISSING, 0);
+    return list;
+}
+
+static struct default_list_s
+compiler_default_list_add (struct default_list_s list,
+                           struct default_descriptor_s value)
+
+{
+    struct default_link_s link = { value.node, UINT32_MAX };
+    uint32_t index;
+    list.count++;
+    if (!active_default || list.description.epoch != default_epoch
+     || value.epoch != default_epoch)
+    {
+        list.description = compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+        return list;
+    }
+    if (list.description.status != SCHEMA_DEFAULT_SUPPORTED)
+        return list;
+    if (value.status != SCHEMA_DEFAULT_SUPPORTED)
+    {
+        list.description = value;
+        return list;
+    }
+    index = mem_block[A_DEFAULT_CAPTURE_LINKS].current_size / sizeof(link);
+    if (!compiler_default_append(A_DEFAULT_CAPTURE_LINKS, &link, sizeof(link)))
+    {
+        list.description = compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                                   SCHEMA_DEFAULT_REASON_LIMIT);
+        return list;
+    }
+    if (list.tail == UINT32_MAX)
+        list.head = index;
+    else
+        ((struct default_link_s *)mem_block[A_DEFAULT_CAPTURE_LINKS].block)[list.tail].next = index;
+    list.tail = index;
+    return list;
+}
+
+static struct default_list_s
+compiler_default_list_join (struct default_list_s left, struct default_list_s right)
+
+{
+    left.count += right.count;
+    if (!active_default || left.description.epoch != default_epoch
+     || right.description.epoch != default_epoch)
+    {
+        left.description = compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+        return left;
+    }
+    if (left.description.status != SCHEMA_DEFAULT_SUPPORTED)
+        return left;
+    if (right.description.status != SCHEMA_DEFAULT_SUPPORTED)
+    {
+        left.description = right.description;
+        return left;
+    }
+    if (right.head == UINT32_MAX)
+        return left;
+    if (left.tail == UINT32_MAX)
+        left.head = right.head;
+    else
+        ((struct default_link_s *)mem_block[A_DEFAULT_CAPTURE_LINKS].block)[left.tail].next = right.head;
+    left.tail = right.tail;
+    return left;
+}
+
+static struct default_descriptor_s
+compiler_default_container (struct default_list_s list, uint32_t kind)
+
+{
+    struct schema_default_node_s node = {0};
+    uint32_t link = list.head;
+    if (!active_default || list.description.epoch != default_epoch)
+        return compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+    if (list.description.status != SCHEMA_DEFAULT_SUPPORTED)
+        return list.description;
+    if (list.count < 0 || (p_uint)list.count > UINT32_MAX
+     || (kind == SCHEMA_DEFAULT_ARRAY && list.count > USHRT_MAX))
+        return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                       SCHEMA_DEFAULT_REASON_LIMIT);
+    node.kind = kind;
+    node.width = list.width;
+    node.depth = 1;
+    node.edge_count = list.count;
+    node.edge_start = mem_block[A_DEFAULT_CAPTURE_EDGES].current_size / sizeof(uint32_t);
+    for (p_int i = 0; i < list.count; i++)
+    {
+        struct default_link_s entry =
+            ((struct default_link_s *)mem_block[A_DEFAULT_CAPTURE_LINKS].block)[link];
+        const struct schema_default_node_s *child =
+            (const struct schema_default_node_s *)mem_block[A_DEFAULT_CAPTURE_NODES].block + entry.node;
+        if (child->depth >= BLUEPRINT_UPDATE_MAX_LITERAL_DEPTH)
+            return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                           SCHEMA_DEFAULT_REASON_LIMIT);
+        if (node.depth <= child->depth)
+            node.depth = child->depth + 1;
+        if (!compiler_default_append(A_DEFAULT_CAPTURE_EDGES, &entry.node, sizeof(entry.node)))
+            return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                           SCHEMA_DEFAULT_REASON_LIMIT);
+        link = entry.next;
+    }
+    return compiler_default_node(node);
+}
+
+static struct default_descriptor_s
+compiler_default_mapping_width (struct default_descriptor_s width)
+
+{
+    const struct schema_default_node_s *node;
+    if (!active_default || width.epoch != default_epoch)
+        return compiler_default_reject(SCHEMA_DEFAULT_MISSING, 0);
+    if (width.status != SCHEMA_DEFAULT_SUPPORTED)
+        return width;
+    node = (const struct schema_default_node_s *)mem_block[A_DEFAULT_CAPTURE_NODES].block + width.node;
+    if (node->kind != SCHEMA_DEFAULT_INTEGER || node->value.integer < 0
+     || (p_uint)node->value.integer > (SSIZE_MAX - sizeof(void *)
+                                      - 2 * sizeof(svalue_t)) / sizeof(svalue_t))
+        return compiler_default_reject(SCHEMA_DEFAULT_UNAVAILABLE,
+                                       SCHEMA_DEFAULT_REASON_WIDTH);
+    return compiler_default_container(compiler_default_list(node->value.integer),
+                                      SCHEMA_DEFAULT_MAPPING);
+}
+
+static uint32_t
+compiler_default_declaration (fulltype_t type, Bool with_init,
+                              const code_location_t *location)
+
+{
+    struct schema_default_s record = {0};
+    uint32_t index;
+    const char *filename = location->source_file
+                           ? location->source_file->name : compiled_file;
+    size_t length = filename ? strlen(filename) : 0;
+
+    compiler_default_reset();
+    record.status = with_init ? SCHEMA_DEFAULT_UNSUPPORTED
+                    : type.t_type == lpctype_float ? SCHEMA_DEFAULT_FLOAT_ZERO
+                                                   : SCHEMA_DEFAULT_INT_ZERO;
+    record.reason = with_init ? SCHEMA_DEFAULT_REASON_SYNTAX : 0;
+    record.line = location->source_line > 0 ? location->source_line : 0;
+    record.source_start = mem_block[A_SCHEMA_DEFAULT_BYTES].current_size;
+    if (length <= UINT32_MAX
+     && compiler_default_append(A_SCHEMA_DEFAULT_BYTES, filename, length))
+        record.source_size = length;
+    index = mem_block[A_SCHEMA_DEFAULT_RECORDS].current_size / sizeof(record) + 1;
+    if (!compiler_default_append(A_SCHEMA_DEFAULT_RECORDS, &record, sizeof(record)))
+        return 0;
+    if (with_init)
+    {
+        for (int i = A_DEFAULT_CAPTURE_NODES; i <= A_DEFAULT_CAPTURE_LINKS; i++)
+            mem_block[i].current_size = 0;
+        default_epoch++;
+        if (!default_epoch)
+            default_epoch++;
+        active_default = index;
+    }
+    return index;
+}
+
+static void
+compiler_default_end (struct default_descriptor_s value);
+
+static bool
+compiler_default_freeze (uint32_t index, uint32_t *result, unsigned int depth)
+
+/* Reserve the parent's edge range before visiting children. Child tables
+ * can grow independently, so reacquire its destination after recursion.
+ */
+
+{
+    struct schema_default_node_s node =
+        ((struct schema_default_node_s *)mem_block[A_DEFAULT_CAPTURE_NODES].block)[index];
+    uint32_t source_edges = node.edge_start;
+    if (depth >= BLUEPRINT_UPDATE_MAX_LITERAL_DEPTH)
+        return false;
+    node.edge_start = mem_block[A_SCHEMA_DEFAULT_EDGES].current_size / sizeof(uint32_t);
+    for (uint32_t i = 0; i < node.edge_count; i++)
+    {
+        uint32_t zero = 0;
+        if (!compiler_default_append(A_SCHEMA_DEFAULT_EDGES, &zero, sizeof(zero)))
+            return false;
+    }
+    for (uint32_t i = 0; i < node.edge_count; i++)
+    {
+        uint32_t child = ((uint32_t *)mem_block[A_DEFAULT_CAPTURE_EDGES].block)[source_edges + i];
+        uint32_t frozen;
+        if (child >= index || !compiler_default_freeze(child, &frozen, depth + 1))
+            return false;
+        ((uint32_t *)mem_block[A_SCHEMA_DEFAULT_EDGES].block)[node.edge_start + i] = frozen;
+    }
+    if (node.kind == SCHEMA_DEFAULT_STRING || node.kind == SCHEMA_DEFAULT_BYTES)
+    {
+        uint32_t offset = mem_block[A_SCHEMA_DEFAULT_BYTES].current_size;
+        if (!compiler_default_append(A_SCHEMA_DEFAULT_BYTES,
+                mem_block[A_DEFAULT_CAPTURE_BYTES].block + node.text_start, node.text_size))
+            return false;
+        node.text_start = offset;
+    }
+    *result = mem_block[A_SCHEMA_DEFAULT_NODES].current_size / sizeof(node);
+    return compiler_default_append(A_SCHEMA_DEFAULT_NODES, &node, sizeof(node));
+}
+
+static void
+compiler_default_end (struct default_descriptor_s value)
+
+{
+    struct schema_default_s *record;
+    uint32_t index = active_default;
+    size_t saved_bytes = mem_block[A_SCHEMA_DEFAULT_BYTES].current_size;
+    size_t saved_nodes = mem_block[A_SCHEMA_DEFAULT_NODES].current_size;
+    size_t saved_edges = mem_block[A_SCHEMA_DEFAULT_EDGES].current_size;
+
+    if (!index)
+        return;
+    if (value.epoch != default_epoch)
+        value = compiler_default_reject(SCHEMA_DEFAULT_UNSUPPORTED,
+                                        SCHEMA_DEFAULT_REASON_SYNTAX);
+    if (value.status == SCHEMA_DEFAULT_SUPPORTED)
+    {
+        if (!compiler_default_freeze(value.node, &value.node, 0))
+        {
+            mem_block[A_SCHEMA_DEFAULT_BYTES].current_size = saved_bytes;
+            mem_block[A_SCHEMA_DEFAULT_NODES].current_size = saved_nodes;
+            mem_block[A_SCHEMA_DEFAULT_EDGES].current_size = saved_edges;
+            value.status = SCHEMA_DEFAULT_UNAVAILABLE;
+            value.reason = SCHEMA_DEFAULT_REASON_LIMIT;
+        }
+    }
+    record = (struct schema_default_s *)mem_block[A_SCHEMA_DEFAULT_RECORDS].block + index - 1;
+    record->status = value.status;
+    record->reason = value.reason;
+    record->root = value.node;
+    compiler_default_reset();
+}
+
+static bool
+compiler_default_pack (void)
+
+{
+    struct schema_defaults_s header = {0};
+    size_t size = align(sizeof(header));
+    bytecode_p block;
+    header.version = SCHEMA_DEFAULT_VERSION;
+#define DEFAULT_PART(count, field, area, type) \
+    header.count = mem_block[area].current_size / sizeof(type); \
+    header.field##_offset = size; \
+    size += align(mem_block[area].current_size)
+    DEFAULT_PART(records, record, A_SCHEMA_DEFAULT_RECORDS, struct schema_default_s);
+    DEFAULT_PART(nodes, node, A_SCHEMA_DEFAULT_NODES, struct schema_default_node_s);
+    DEFAULT_PART(edges, edge, A_SCHEMA_DEFAULT_EDGES, uint32_t);
+    DEFAULT_PART(bytes, byte, A_SCHEMA_DEFAULT_BYTES, bytecode_t);
+#undef DEFAULT_PART
+    if (size > UINT32_MAX || !extend_mem_block(A_SCHEMA_DEFAULTS, size))
+        return false;
+    block = (bytecode_p)mem_block[A_SCHEMA_DEFAULTS].block;
+    memset(block, 0, size);
+    memcpy(block, &header, sizeof(header));
+    for (int i = A_SCHEMA_DEFAULT_RECORDS; i <= A_SCHEMA_DEFAULT_BYTES; i++)
+    {
+        size_t offset = i == A_SCHEMA_DEFAULT_RECORDS ? header.record_offset
+                        : i == A_SCHEMA_DEFAULT_NODES ? header.node_offset
+                        : i == A_SCHEMA_DEFAULT_EDGES ? header.edge_offset
+                                                     : header.byte_offset;
+        if (mem_block[i].current_size)
+            memcpy(block + offset, mem_block[i].block, mem_block[i].current_size);
+    }
+    return true;
+}
+
+#define DEFAULT_REJECT(result) \
+    ((result).default_desc = compiler_default_reject(SCHEMA_DEFAULT_UNSUPPORTED, SCHEMA_DEFAULT_REASON_SYNTAX))
+#define DEFAULT_FORWARD(result, source) ((result).default_desc = (source).default_desc)
+#define DEFAULT_INTEGER(result, number) ((result).default_desc = compiler_default_integer(number))
+#define DEFAULT_FLOAT(result, number) ((result).default_desc = compiler_default_float(number))
+#define DEFAULT_STRING(result, str) ((result).default_desc = compiler_default_string(str))
+#define DEFAULT_NEGATE(result, source) ((result).default_desc = compiler_default_negate((source).default_desc))
+#define DEFAULT_END(source) compiler_default_end((source).default_desc)
+#define DEFAULT_LIST_ADD(list, value) compiler_default_list_add(list, (value).default_desc)
+#define DEFAULT_CONTAINER(result, list, kind) ((result).default_desc = compiler_default_container(list, kind))
+#define DEFAULT_WIDTH(result, width) ((result).default_desc = compiler_default_mapping_width((width).default_desc))
+#else
+#define DEFAULT_REJECT(result) ((void)0)
+#define DEFAULT_FORWARD(result, source) ((void)0)
+#define DEFAULT_INTEGER(result, number) ((void)0)
+#define DEFAULT_FLOAT(result, number) ((void)0)
+#define DEFAULT_STRING(result, str) ((void)0)
+#define DEFAULT_NEGATE(result, source) ((void)0)
+#define DEFAULT_END(source) ((void)0)
+#define compiler_default_pack() true
+#define DEFAULT_CONTAINER(result, list, kind) ((void)0)
+#define DEFAULT_WIDTH(result, width) ((void)0)
+#define DEFAULT_LIST_ADD(list, value) compiler_default_list_add(list)
+
+static struct default_list_s
+compiler_default_list (p_int width)
+{
+    return (struct default_list_s){ .count = 0, .width = width };
+}
+
+static struct default_list_s
+compiler_default_list_add (struct default_list_s list)
+{
+    list.count++;
+    return list;
+}
+
+static struct default_list_s
+compiler_default_list_join (struct default_list_s left, struct default_list_s right)
+{
+    left.count += right.count;
+    return left;
+}
+#endif
 
 #define byte_to_mem_block(n, b) \
     ((void)((mem_block[n].current_size == mem_block[n].max_size \
@@ -3643,27 +4328,55 @@ inherit_visibility_flags (funflag_t orig, funflag_t modifier)
 } /* inherit_visibility_flags() */
 
 /*-------------------------------------------------------------------------*/
-static INLINE void
-i_add_arg_type (fulltype_t type)
+static bool
+reserve_argument_types (size_t count)
 
-/* Add another function argument type to the argument type stack.
- * The reference of <type> is adopted.
- */
+/* Keep the old argument stack rooted until replacement storage succeeds. */
 
 {
     mem_block_t *mbp = &type_of_arguments;
-
-    if (mbp->current_size + sizeof type > mbp->max_size)
+    size_t required = mbp->current_size + count * sizeof(fulltype_t);
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (compile_update_test_fail(COMPILE_TEST_ARGUMENT_STACK))
     {
-        mbp->max_size *= 2;
-        mbp->block = rexalloc((char *)mbp->block, mbp->max_size);
+        lex_close("Out of memory for argument stack");
+        return false;
     }
+#endif
+    if (required > mbp->max_size)
+    {
+        size_t capacity = mbp->max_size * 2;
+        char *block;
+        if (capacity < required)
+            capacity = required;
+        block = rexalloc(mbp->block, capacity);
+        if (!block)
+        {
+            lex_close("Out of memory for argument types");
+            return false;
+        }
+        mbp->block = block;
+        mbp->max_size = capacity;
+    }
+    return true;
+}
 
-    *(fulltype_t*)(mbp->block + mbp->current_size) = type;
-    mbp->current_size += sizeof(fulltype_t);
-} /* i_add_arg_type() */
+static INLINE bool
+i_add_arg_type (fulltype_t type)
 
-#define add_arg_type(t) i_add_arg_type(t)
+/* Adopt the type only on success. Parser callers still own their intact
+ * RHS on failure, so they can return through normal semantic cleanup.
+ */
+
+{
+    if (!reserve_argument_types(1))
+        return false;
+    *(fulltype_t*)(type_of_arguments.block + type_of_arguments.current_size) = type;
+    type_of_arguments.current_size += sizeof(fulltype_t);
+    return true;
+}
+
+#define add_arg_type(t) do { if (!i_add_arg_type(t)) { yylen = 0; YYABORT; } } while (0)
 
 /*-------------------------------------------------------------------------*/
 static INLINE void
@@ -4593,33 +5306,71 @@ free_all_local_names (void)
         free_shared_identifier(p);
     }
 
-    while (current_number_of_locals > 0 && local_variables)
+    /* Cancellation may leave inline closures open. Their saved frames
+     * still own the outer local/context types. Clear each released slot:
+     * while parsing explicit contexts the two views can alias.
+     */
+    for (;;)
     {
-        int dbg;
+        A_LOCAL_VARIABLES_t *owned_locals = local_variables;
 
-        current_number_of_locals--;
-        free_fulltype(local_variables[current_number_of_locals].type);
-
-        dbg = local_variables[current_number_of_locals].dbg;
-        if (dbg >= 0)
+        if (current_inline && current_inline->parse_context)
         {
-            if (LOCAL_VARIABLE_DBG(dbg).code_start != CURRENT_PROGRAM_SIZE)
-                LOCAL_VARIABLE_DBG(dbg).code_end = CURRENT_PROGRAM_SIZE;
-            else if (LOCAL_VARIABLE_DBG_COUNT == dbg + 1)
+            block_scope_t *scope = &block_scope[current_inline->block_depth];
+
+            /* Explicit context initializers temporarily use local slots
+             * in the enclosing frame. Their extra references are separate
+             * from both that frame's locals and the closure's context.
+             * The closure's argument locals remain in its own block.
+             */
+            for (int i = 0; i < scope->num_locals; i++)
             {
-                free_mstring(LOCAL_VARIABLE_DBG(dbg).name);
-                free_lpctype(LOCAL_VARIABLE_DBG(dbg).type);
-                mem_block[A_LOCAL_VARIABLES_DBG].current_size -= sizeof(A_LOCAL_VARIABLES_DBG_t);
+                fulltype_t *type = &local_variables[scope->first_local + i].type;
+                free_fulltype(*type);
+                type->t_type = NULL;
+            }
+            owned_locals = context_variables + MAX_LOCAL;
+        }
+        while (current_number_of_locals > 0 && owned_locals)
+        {
+            int dbg;
+
+            current_number_of_locals--;
+            free_fulltype(owned_locals[current_number_of_locals].type);
+            owned_locals[current_number_of_locals].type.t_type = NULL;
+
+            dbg = owned_locals[current_number_of_locals].dbg;
+            if (dbg >= 0)
+            {
+                if (LOCAL_VARIABLE_DBG(dbg).code_start != CURRENT_PROGRAM_SIZE)
+                    LOCAL_VARIABLE_DBG(dbg).code_end = CURRENT_PROGRAM_SIZE;
+                else if (LOCAL_VARIABLE_DBG_COUNT == dbg + 1)
+                {
+                    free_mstring(LOCAL_VARIABLE_DBG(dbg).name);
+                    free_lpctype(LOCAL_VARIABLE_DBG(dbg).type);
+                    mem_block[A_LOCAL_VARIABLES_DBG].current_size -= sizeof(A_LOCAL_VARIABLES_DBG_t);
+                }
             }
         }
-    }
 
-    /* Free also types of context variables. */
-    if (context_variables && context_variables != &(LOCAL_VARIABLE(0)))
-    {
-        int i;
-        for (i=0; i<MAX_LOCAL; i++)
-            free_fulltype(context_variables[i].type);
+        /* Free also types of context variables. */
+        if (context_variables && context_variables != &(LOCAL_VARIABLE(0)))
+        {
+            int i;
+            for (i=0; i<MAX_LOCAL; i++)
+            {
+                free_fulltype(context_variables[i].type);
+                context_variables[i].type.t_type = NULL;
+            }
+        }
+        if (!current_inline)
+            break;
+
+        current_number_of_locals = current_inline->num_locals;
+        local_variables = &(LOCAL_VARIABLE(current_inline->full_local_var_start));
+        context_variables = &(LOCAL_VARIABLE(current_inline->full_context_var_start));
+        current_inline = current_inline->prev < 0
+                       ? NULL : &(INLINE_CLOSURE(current_inline->prev));
     }
 
     all_locals = NULL;
@@ -4698,6 +5449,19 @@ add_local_name (ident_t *ident, fulltype_t type, int depth)
  */
 
 {
+    if (!ident)
+    {
+        compile_update_memory_failed();
+        yyerror("Out of memory for local identifier");
+        free_fulltype(type);
+        return NULL;
+    }
+    if (pragma_save_local_names
+     && !reserve_mem_block(A_LOCAL_VARIABLES_DBG, sizeof(A_LOCAL_VARIABLES_DBG_t)))
+    {
+        free_fulltype(type);
+        return NULL;
+    }
     if (type.t_type == lpctype_void)
     {
         yyerrorf( "Illegal to define variable '%s' as type 'void'"
@@ -4705,7 +5469,10 @@ add_local_name (ident_t *ident, fulltype_t type, int depth)
     }
 
     if (current_number_of_locals >= MAX_LOCAL) /* size of type recording array */
+    {
         yyerror("Too many local variables");
+        free_fulltype(type);
+    }
 
     else
     {
@@ -4729,6 +5496,14 @@ if (current_inline && current_inline->block_depth+2 == block_depth
                        , get_txt(ident->name));
             }
             ident = make_shared_identifier_mstr(ident->name, I_TYPE_LOCAL, depth);
+        }
+
+        if (!ident)
+        {
+            compile_update_memory_failed();
+            yyerror("Out of memory for local identifier");
+            free_fulltype(type);
+            return NULL;
         }
 
         /* Initialize the ident */
@@ -4849,6 +5624,12 @@ printf("DEBUG: add_context_name('%s', num %d) depth %d, context %d\n",
             /* We're overlaying some other definition, but that's ok.
              */
             ident = insert_shared_identifier_mstr(ident->name, I_TYPE_LOCAL, depth);
+            if (!ident)
+            {
+                compile_update_memory_failed();
+                yyerror("Out of memory for context identifier");
+                return NULL;
+            }
             assert (ident->type == I_TYPE_UNKNOWN);
         }
 
@@ -5020,6 +5801,11 @@ check_for_context_local (ident_t *ident, lpctype_t ** pType)
                      ident->u.local.context >= 0
                      ? CONTEXT_VARIABLE_BASE + ident->u.local.context
                      : ident->u.local.num);
+                if (!ident)
+                {
+                    context_variables = save_context_variables;
+                    return NULL;
+                }
             }
 
             if (!next_closure)
@@ -5289,6 +6075,8 @@ store_argument_types ( int num_arg )
         {
             int i;
 
+            if (!reserve_mem_block(A_ARGUMENT_TYPES, num_arg * sizeof(A_ARGUMENT_TYPES_t)))
+                return INDEX_START_NONE;
             for (i = 0; i < num_arg; i++)
             {
                 ADD_ARGUMENT_TYPE(ref_lpctype(local_variables[i].type.t_type));
@@ -5308,9 +6096,22 @@ add_global_name (ident_t *name)
  */
 
 {
+    if (!name)
+    {
+        compile_update_memory_failed();
+        yyerror("Out of memory for global identifier");
+        return NULL;
+    }
     if (name->type != I_TYPE_UNKNOWN
      && name->type != I_TYPE_GLOBAL)
         name = insert_shared_identifier_mstr(name->name, I_TYPE_GLOBAL, 0);
+
+    if (!name)
+    {
+        compile_update_memory_failed();
+        yyerror("Out of memory for global identifier");
+        return NULL;
+    }
 
     switch (name->type)
     {
@@ -5327,7 +6128,19 @@ add_global_name (ident_t *name)
              */
             if (name->u.global.variable == I_GLOBAL_VARIABLE_WORLDWIDE)
             {
-                efun_shadow_t *sh = xalloc(sizeof(efun_shadow_t));
+                efun_shadow_t *sh;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+                if (compile_update_test_fail(COMPILE_TEST_SHADOW_STORAGE))
+                    sh = NULL;
+                else
+#endif
+                    sh = xalloc(sizeof(efun_shadow_t));
+                if (!sh)
+                {
+                    compile_update_memory_failed();
+                    yyerror("Out of memory for shadowed efun identifier");
+                    return NULL;
+                }
                 sh->shadow = name;
                 sh->next = all_efun_shadows;
                 all_efun_shadows = sh;
@@ -5741,10 +6554,19 @@ define_new_function ( Bool complete, ident_t *p, int num_arg, int num_local
 
     /* It's a new function! */
 
+    p = add_global_name(p);
+    if (!p || !RESERVE_FUNCTIONS(1)
+     || !reserve_mem_block(A_ARGUMENT_INDEX, sizeof(A_ARGUMENT_INDEX_t)))
+        return -1;
+
     if (mstreq(p->name, STR_HEART_BEAT))
         heart_beat = FUNCTION_COUNT;
 
     /* Fill in the function_t */
+#ifdef USE_BLUEPRINT_UPDATE
+    fun.schema_argument_start = UINT_MAX;
+    fun.schema_kind = SCHEMA_FUNCTION_GENERATED;
+#endif
     fun.name      = p->name;
     fun.offset.pc = offset;
     fun.flags     = flags;
@@ -5763,7 +6585,6 @@ define_new_function ( Bool complete, ident_t *p, int num_arg, int num_local
 
     num = FUNCTION_COUNT;
 
-    p = add_global_name(p);
     p->u.global.function = num;
 
     /* Store the function_t in the functions area */
@@ -5849,6 +6670,12 @@ define_variable (ident_t *name, fulltype_t type)
     }
 
     name = add_global_name(name);
+    if (!name
+     || !reserve_mem_block(flags & TYPE_MOD_VIRTUAL ? A_VIRTUAL_VAR : A_VARIABLES,
+                           sizeof(variable_t))
+     || (!(flags & TYPE_MOD_VIRTUAL)
+      && !reserve_mem_block(A_GLOBAL_VARIABLES, sizeof(A_GLOBAL_VARIABLES_t))))
+        return NULL;
     /* Prepare the new variable_t */
 
     if (flags & TYPE_MOD_NOSAVE)
@@ -5882,6 +6709,12 @@ define_variable (ident_t *name, fulltype_t type)
 
     type.t_flags = flags;
 
+#ifdef USE_BLUEPRINT_UPDATE
+    /* Programs are swapped as raw blocks: initialize the padding introduced
+     * by the declaration marker as well as the marker itself.
+     */
+    memset(&dummy, 0, sizeof(dummy));
+#endif
     dummy.name = ref_mstring(name->name);
     dummy.type = ref_fulltype(type);
 
@@ -5917,6 +6750,9 @@ redeclare_variable (ident_t *name, fulltype_t type, int n)
     variable_t *variable;
 
     name = add_global_name(name);
+
+    if (!name)
+        return;
 
     /* The variable is hidden, do nothing else */
     if (flags & NAME_HIDDEN)
@@ -6022,7 +6858,8 @@ get_initialized_variable (ident_t *p)
 
 /*-------------------------------------------------------------------------*/
 static int
-define_global_variable (ident_t* name, fulltype_t actual_type, Bool with_init)
+define_global_variable (ident_t* name, fulltype_t actual_type, Bool with_init,
+                        const code_location_t *location UNUSED)
 
 /* This is called directly from a parser rule: <type> <name>
  * if with_init is true, then an initialization of this variable will follow.
@@ -6046,7 +6883,23 @@ define_global_variable (ident_t* name, fulltype_t actual_type, Bool with_init)
         actual_type.t_flags |= VAR_INITIALIZED;
 
     name = define_variable(name, actual_type);
+    if (!name)
+        return -1;
     i = name->u.global.variable;
+#ifdef USE_BLUEPRINT_UPDATE
+    /* Hidden insertions need not update the visible identifier index. */
+    uint32_t default_record = compiler_default_declaration(actual_type, with_init, location);
+    if (actual_type.t_flags & TYPE_MOD_VIRTUAL)
+    {
+        V_VARIABLE(V_VARIABLE_COUNT - 1)->schema_declared = true;
+        V_VARIABLE(V_VARIABLE_COUNT - 1)->schema_default = default_record;
+    }
+    else
+    {
+        NV_VARIABLE(NV_VARIABLE_COUNT - 1)->schema_declared = true;
+        NV_VARIABLE(NV_VARIABLE_COUNT - 1)->schema_default = default_record;
+    }
+#endif
 
 #ifdef DEBUG
     if (name->type != I_TYPE_GLOBAL || i == I_GLOBAL_VARIABLE_OTHER)
@@ -6139,6 +6992,12 @@ init_global_variable (int i, ident_t* name, fulltype_t actual_type
  */
 
 {
+#ifdef USE_BLUEPRINT_UPDATE
+    if (active_default && pragma_rtt_checks && pragma_save_types
+     && actual_type.t_type != lpctype_mixed && actual_type.t_type != lpctype_unknown)
+        ((struct schema_default_s *)mem_block[A_SCHEMA_DEFAULT_RECORDS].block)
+            [active_default - 1].flags = SCHEMA_DEFAULT_RTT_CHECK;
+#endif
     add_type_check(actual_type.t_type, TYPECHECK_VAR_INIT);
 
     PREPARE_INSERT(4)
@@ -6216,6 +7075,14 @@ get_function_information (function_t * fun_p, program_t * prog, int ix)
     int inhfx;
     function_t * header = get_function_header_extended(prog, ix, &inhprogp, &inhfx);
 
+#ifdef USE_BLUEPRINT_UPDATE
+    /* Inherited headers use their defining program's argument table. If a
+     * later compiler pass turns this entry into an own undefined stub, the
+     * missing local evidence must remain explicit.
+     */
+    fun_p->schema_argument_start = UINT_MAX;
+    fun_p->schema_kind = header->schema_kind;
+#endif
     fun_p->name = header->name;
     fun_p->type = ref_lpctype(header->type);
 
@@ -6226,7 +7093,7 @@ get_function_information (function_t * fun_p, program_t * prog, int ix)
 } /* get_function_information() */
 
 /*-------------------------------------------------------------------------*/
-static void
+static Bool
 def_function_typecheck (fulltype_t returntype, ident_t * ident, Bool is_inline)
 
 /* Called after parsing the '<type> <functionname>' part of a function
@@ -6243,7 +7110,8 @@ def_function_typecheck (fulltype_t returntype, ident_t * ident, Bool is_inline)
 {
     if (is_inline)
     {
-        new_inline_closure();
+        if (!new_inline_closure())
+            return MY_FALSE;
         enter_block_scope(); /* Scope for context */
         enter_block_scope(); /* Argument scope */
     }
@@ -6282,6 +7150,7 @@ def_function_typecheck (fulltype_t returntype, ident_t * ident, Bool is_inline)
         def_function_returntype = returntype;
         def_function_ident = ident;
     }
+    return MY_TRUE;
 } /* def_function_typecheck() */
 
 /*-------------------------------------------------------------------------*/
@@ -6326,7 +7195,7 @@ def_function_argument_check (bool is_inline)
 } /* def_function_argument_check() */
 
 /*-------------------------------------------------------------------------*/
-static void
+static Bool
 def_function_prototype (int num_args, Bool is_inline)
 
 /* Called after parsing '<type> <name> ( <args> ) of a function definition,
@@ -6362,6 +7231,33 @@ def_function_prototype (int num_args, Bool is_inline)
     fun = define_new_function( MY_FALSE, ident, num_args, 0, 0
                              , NAME_UNDEFINED|NAME_PROTOTYPE|(coroutine?TYPE_MOD_COROUTINE:0)
                              , returntype);
+    if (fun < 0)
+        return MY_FALSE;
+
+#ifdef USE_BLUEPRINT_UPDATE
+    /* Capture the actual declaration independently of compiler type checking.
+     * Inherited headers resolve their own table through their defining program.
+     * Repeated prototypes may leave unused scalar entries, never extra roots.
+     */
+    FUNCTION(fun)->schema_argument_start = GET_BLOCK_COUNT(A_SCHEMA_ARGUMENTS);
+    FUNCTION(fun)->schema_kind = is_inline ? SCHEMA_FUNCTION_INLINE
+                                          : SCHEMA_FUNCTION_NAMED;
+    for (int arg = 0; arg < num_args; arg++)
+    {
+        struct schema_argument_s entry;
+        lpctype_t *type = local_variables[arg].type.t_type;
+        int index = get_type_index(type ? type : lpctype_mixed);
+        if (index < 0)
+        {
+            yyerror("Too many schema argument types");
+            break;
+        }
+        memset(&entry, 0, sizeof(entry));
+        entry.type_index = index;
+        entry.flags = local_variables[arg].type.t_flags;
+        add_to_mem_block(A_SCHEMA_ARGUMENTS, &entry, sizeof(entry));
+    }
+#endif
 
     /* Store the data */
     if (is_inline)
@@ -6372,6 +7268,7 @@ def_function_prototype (int num_args, Bool is_inline)
     {
         def_function_num_args = num_args;
     }
+    return MY_TRUE;
 } /* def_function_prototype() */
 
 /*-------------------------------------------------------------------------*/
@@ -6730,11 +7627,41 @@ define_struct (bool proto, ident_t *p, const char * prog_name, funflag_t flags, 
      *
      * Fill in the struct_def_t.
      */
+    if (!reserve_mem_block(A_STRUCT_DEFS, sizeof(sdef)))
+        return -1;
     if (stype)
         sdef.type = ref_struct_type(stype);
     else
-        sdef.type = struct_new_prototype(ref_mstring(p->name)
-                                       , new_unicode_tabled(prog_name));
+    {
+        string_t *program_name;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        if (compile_update_test_fail(COMPILE_TEST_STRUCT_NAME))
+            program_name = NULL;
+        else
+#endif
+            program_name = new_unicode_tabled(prog_name);
+        if (!program_name)
+        {
+            compile_update_memory_failed();
+            yyerror("Out of memory for struct program name");
+            return -1;
+        }
+        sdef.type = struct_new_prototype(ref_mstring(p->name), program_name);
+    }
+    if (!sdef.type)
+    {
+        compile_update_memory_failed();
+        yyerror("Out of memory for struct definition");
+        return -1;
+    }
+    type = get_struct_type(sdef.type);
+    if (!type)
+    {
+        free_struct_type(sdef.type);
+        return -1;
+    }
+    if (!stype && compiler_type_context)
+        sdef.type->unpublished = MY_TRUE;
     sdef.flags = proto ? (flags | NAME_PROTOTYPE)
                        : (flags & ~NAME_PROTOTYPE);
     sdef.inh = STRUCT_INH_LOCAL;
@@ -6742,16 +7669,20 @@ define_struct (bool proto, ident_t *p, const char * prog_name, funflag_t flags, 
     num = STRUCT_COUNT;
 
     p = add_global_name(p);
+    if (!p)
+    {
+        free_lpctype(type);
+        free_struct_type(sdef.type);
+        return -1;
+    }
     p->u.global.struct_id = num;
 
     /* Store the definition in the struct area */
     ADD_STRUCT_DEF(&sdef);
 
     /* We keep this reference until the end of compilation. */
-    type = get_struct_type(sdef.type);
-
-    update_struct_type(type, sdef.type);
-    type->t_struct.def_idx = num;
+    /* type was acquired before adopting the definition. */
+    set_compiler_struct_index(type, num);
 
     return num;
 } /* define_struct() */
@@ -6824,6 +7755,12 @@ add_struct_type (struct_type_t *stype, lpctype_t *lpctype)
             return -1;
         }
 
+        if (!reserve_mem_block(A_STRUCT_DEFS, sizeof(sdef)))
+        {
+            free_lpctype(lpctype);
+            return -1;
+        }
+
         sdef.type = ref_struct_type(stype);
         sdef.flags = NAME_HIDDEN;
         sdef.inh = STRUCT_INH_SEFUN;
@@ -6831,7 +7768,7 @@ add_struct_type (struct_type_t *stype, lpctype_t *lpctype)
         ADD_STRUCT_DEF(&sdef);
     }
 
-    lpctype->t_struct.def_idx = id;
+    set_compiler_struct_index(lpctype, id);
     /* Note we keep the reference of lpctype
      * for epilog() to free it.
      */
@@ -6864,6 +7801,9 @@ find_struct ( ident_t * ident, efun_override_t override )
     else if (name == NULL)
             return -1;
 
+    if (!name)
+        return -1;
+
     switch (override)
     {
         default:
@@ -6880,9 +7820,11 @@ find_struct ( ident_t * ident, efun_override_t override )
 
                         struct_type_t *st = str->u.strct->type;
                         lpctype_t *lt = get_struct_type(st); /* Freed by epilog_closure() */
+                        if (!lt)
+                            return -1;
 
                         update_struct_type(lt, st);
-                        lt->t_struct.def_idx = LAMBDA_STRUCTS_COUNT;
+                        set_compiler_struct_index(lt, LAMBDA_STRUCTS_COUNT);
 
                         assign_svalue_no_free(&ref_str, str); /* Add a reference. */
                         name->u.global.struct_id = LAMBDA_STRUCTS_COUNT;
@@ -6903,18 +7845,20 @@ find_struct ( ident_t * ident, efun_override_t override )
                          && !(prog->struct_defs[idx].flags & (TYPE_MOD_PRIVATE|NAME_HIDDEN)))
                         {
                             lpctype_t *lt = get_struct_type(st);
+                            if (!lt)
+                                return -1;
 
-                            if (lt->t_struct.def_idx < LAMBDA_STRUCTS_COUNT
-                             && LAMBDA_STRUCT(lt->t_struct.def_idx).index.kind == LAMBDA_IDENT_OBJECT
-                             && LAMBDA_STRUCT(lt->t_struct.def_idx).type == st)
+                            if (compiler_struct_index(lt) < LAMBDA_STRUCTS_COUNT
+                             && LAMBDA_STRUCT(compiler_struct_index(lt)).index.kind == LAMBDA_IDENT_OBJECT
+                             && LAMBDA_STRUCT(compiler_struct_index(lt)).type == st)
                             {
-                                name->u.global.struct_id = lt->t_struct.def_idx;
+                                name->u.global.struct_id = compiler_struct_index(lt);
                                 free_lpctype(lt);
                             }
                             else
                             {
                                 update_struct_type(lt, st);
-                                lt->t_struct.def_idx = LAMBDA_STRUCTS_COUNT;
+                                set_compiler_struct_index(lt, LAMBDA_STRUCTS_COUNT);
 
                                 name->u.global.struct_id = LAMBDA_STRUCTS_COUNT;
                                 ADD_LAMBDA_STRUCT((lambda_struct_ident_t){
@@ -6959,7 +7903,8 @@ find_struct ( ident_t * ident, efun_override_t override )
                     if (sefun_id >= count)
                     {
                         /* Fill up the A_SEFUN_STRUCT_DEFS block. */
-                        RESERVE_SEFUN_STRUCT_DEFS(sefun_id - count);
+                        if (!RESERVE_SEFUN_STRUCT_DEFS(sefun_id - count + 1))
+                            return -1;
                         for(; count <= sefun_id; count++)
                             ADD_SEFUN_STRUCT_DEF(USHRT_MAX);
                     }
@@ -6967,8 +7912,10 @@ find_struct ( ident_t * ident, efun_override_t override )
                     /* Let's see if we already got this struct somehow. */
                     stype = simul_efun_object->prog->struct_defs[sefun_id].type;
                     lpctype = get_struct_type(stype);
+                    if (!lpctype)
+                        return -1;
 
-                    id = lpctype->t_struct.def_idx;
+                    id = compiler_struct_index(lpctype);
                     if (id != USHRT_MAX
                      && (string_context ? LAMBDA_STRUCT(id).type : STRUCT_DEF(id).type) == stype)
                     {
@@ -7008,7 +7955,9 @@ find_struct ( ident_t * ident, efun_override_t override )
                     lpctype_t *lpctype = get_struct_type(stype);
                     int new_id;
 
-                    id = lpctype->t_struct.def_idx;
+                    if (!lpctype)
+                        return -1;
+                    id = compiler_struct_index(lpctype);
                     if (id != USHRT_MAX
                      && (string_context ? LAMBDA_STRUCT(id).type : STRUCT_DEF(id).type) == stype)
                     {
@@ -7087,6 +8036,8 @@ add_struct_member ( string_t *name, lpctype_t *type
     {
         struct_member_t member;
 
+        if (!reserve_mem_block(A_STRUCT_MEMBERS, sizeof(member)))
+            return;
         member.name = ref_mstring(name);
         member.type = ref_lpctype(type);
         ADD_STRUCT_MEMBER(&member);
@@ -7103,43 +8054,23 @@ finish_struct ( int32 prog_id)
 
 {
     struct_def_t *pdef;
-    struct_type_t *base;
-    string_t *name, *prog_name;
 
     pdef = &STRUCT_DEF(current_struct);
 
-    /* Retrieve the .base pointer so that the error handling won't
-     * get confused about it.
-     * Also get a safety copy of the name.
+    /* Keep the prototype and its attached base stable for every compiler
+     * type reference. A failed fill adopts none of the member references.
      */
-    base = pdef->type->base;
-    pdef->type->base = NULL;
-    name = ref_mstring(struct_t_name(pdef->type));
-    prog_name = ref_mstring(struct_t_pname(pdef->type));
-
-    /* Fill in the prototype */
-    pdef->type = struct_fill_prototype(pdef->type
-                                      , prog_id
-                                      , base
-                                      , STRUCT_MEMBER_COUNT
-                                      , &STRUCT_MEMBER(0)
-                                      );
-
-    if (pdef->type)
+    if (!struct_fill_prototype(pdef->type, prog_id, pdef->type->base,
+                               STRUCT_MEMBER_COUNT, &STRUCT_MEMBER(0)))
     {
-        /* Success: Free the safety copies */
-        free_mstring(name);
-        free_mstring(prog_name);
-    }
-    else
-    {
-        /* Failure: Recreate the prototype as the old one got deleted */
-        pdef->type = struct_new_prototype(name, prog_name);
+        for (size_t i = 0; i < STRUCT_MEMBER_COUNT; i++)
+            free_struct_member_data(&STRUCT_MEMBER(i));
+        mem_block[A_STRUCT_MEMBERS].current_size = 0;
+        compile_update_memory_failed();
+        yyerror("Out of memory for struct members");
     }
 
-    /* Clear the STRUCT_MEMBER block - the definitions have already
-     * been adopted or cleared by the struct_fill_prototype().
-     */
+    /* Member references were either adopted or freed above. */
     mem_block[A_STRUCT_MEMBERS].current_size = 0;
 } /* finish_struct() */
 
@@ -7214,8 +8145,19 @@ create_struct_literal ( int sidx, struct_type_t * stype, int length, struct_init
 
     consumed = 0;
 
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (compile_update_test_fail(COMPILE_TEST_STRUCT_LITERAL))
+        block = NULL;
+    else
+#endif
     block = xalloc( struct_t_size(stype) * sizeof(*flags)
                   + length * sizeof(*ix));
+    if (!block)
+    {
+        compile_update_memory_failed();
+        yyerror("Out of memory for named struct initializer");
+        return MY_FALSE;
+    }
     flags = (Bool *)block;
     ix = (int *)((char *)block + struct_t_size(stype) * sizeof(*flags));
 
@@ -7338,7 +8280,7 @@ get_struct_index (lpctype_t* stype)
  */
 
 {
-    unsigned short idx = stype->t_struct.def_idx;
+    unsigned short idx = compiler_struct_index(stype);
     if (idx == USHRT_MAX)
     {
         if (string_context)
@@ -7356,17 +8298,17 @@ get_struct_index (lpctype_t* stype)
 
             for (idx = 0; idx < prog->num_structs; idx++)
             {
-                if ((stype->t_struct.def == NULL)
+                if ((compiler_struct_definition(stype) == NULL)
                   ? (prog->struct_defs[idx].type->name == stype->t_struct.name)
-                  : (prog->struct_defs[idx].type == stype->t_struct.def))
+                  : (prog->struct_defs[idx].type == compiler_struct_definition(stype)))
                 {
-                    if (stype->t_struct.def == NULL)
+                    if (compiler_struct_definition(stype) == NULL)
                         update_struct_type(stype, prog->struct_defs[idx].type);
 
-                    stype->t_struct.def_idx = LAMBDA_STRUCTS_COUNT;
+                    set_compiler_struct_index(stype, LAMBDA_STRUCTS_COUNT);
                     ADD_LAMBDA_STRUCT((lambda_struct_ident_t){
                         .index = {.kind = LAMBDA_IDENT_OBJECT, .object_index = idx},
-                        .type = ref_struct_type(stype->t_struct.def)});
+                        .type = ref_struct_type(compiler_struct_definition(stype))});
                     ref_lpctype(stype); /* Freed by epilog_closure(). */
 
                     return idx;
@@ -7380,21 +8322,23 @@ get_struct_index (lpctype_t* stype)
             struct_def_t sdef;
 
             /* Do we know the exact definition from the name? */
-            if (stype->t_struct.def == NULL)
+            if (compiler_struct_definition(stype) == NULL)
                 return -2;
 
             /* Add this as a hidden struct to our program. */
             idx = STRUCT_COUNT;
             if (idx == USHRT_MAX)
                 return -2; /* Not enough space to do so. */
+            if (!reserve_mem_block(A_STRUCT_DEFS, sizeof(sdef)))
+                return -2;
 
-            sdef.type = ref_struct_type(stype->t_struct.def);
+            sdef.type = ref_struct_type(compiler_struct_definition(stype));
             sdef.flags = NAME_HIDDEN;
             sdef.inh = STRUCT_INH_USAGE;
 
             ADD_STRUCT_DEF(&sdef);
             ref_lpctype(stype); /* Epilog will free this. */
-            stype->t_struct.def_idx = idx;
+            set_compiler_struct_index(stype, idx);
             return idx;
         }
     }
@@ -7542,7 +8486,7 @@ get_struct_member_result_type (lpctype_t* structure, string_t* member_name, bool
             }
             else
             {
-                struct_type_t *pdef = unionmember->t_struct.def;
+                struct_type_t *pdef = compiler_struct_definition(unionmember);
                 if (pdef == NULL)
                 {
                     int idx;
@@ -7553,7 +8497,7 @@ get_struct_member_result_type (lpctype_t* structure, string_t* member_name, bool
                     idx = get_struct_index(unionmember);
                     if (idx < 0)
                         break;
-                    pdef = unionmember->t_struct.def;
+                    pdef = compiler_struct_definition(unionmember);
                     assert(pdef != NULL);
                 }
 
@@ -7735,20 +8679,25 @@ struct_epilog (void)
          */
         for (int struct_idx = 0; (size_t)struct_idx < STRUCT_COUNT; struct_idx++)
         {
-            if (struct_idx != i)
+            if (struct_idx != i
+             && (!compiler_type_context || STRUCT_DEF(struct_idx).type->unpublished))
                 struct_type_update(STRUCT_DEF(struct_idx).type, pSType, pOld);
         }
 
+        if (compiler_type_context)
+            update_struct_type(pSType->name->lpctype, pOld);
         free_struct_type(pSType);
         STRUCT_DEF(i).type = ref_struct_type(pOld);
     } /* for(i) */
 
-    /* Publish all struct types defined in this program.
-     * It is safe to publish types twice.
+    /* Ordinary compilation publishes its local definitions immediately.
+     * A private candidate retains its unpublished local struct_defs entries
+     * as publication actions for a later commit. Publishing these entries
+     * requires only flag/current pointer stores, with no allocation.
      */
     for (i = 0; (size_t)i < STRUCT_COUNT; i++)
     {
-        if (STRUCT_DEF(i).inh == STRUCT_INH_LOCAL)
+        if (!compiler_type_context && STRUCT_DEF(i).inh == STRUCT_INH_LOCAL)
             struct_publish_type(STRUCT_DEF(i).type);
     } /* for(i) */
 
@@ -7778,7 +8727,7 @@ struct_epilog (void)
 /* =========================   Inline Closures   =-======================= */
 
 /*-------------------------------------------------------------------------*/
-static void
+static Bool
 new_inline_closure (void)
 
 /* Create a new inline closure structure and push it on top of the stack.
@@ -7838,6 +8787,19 @@ printf("DEBUG:   local types: %"PRIuMPINT", context types: %"PRIuMPINT"\n",
        ict.full_local_var_start, ict.full_context_var_start);
 #endif /* DEBUG_INLINES */
 
+    if (!reserve_mem_block(A_INLINE_CLOSURE, sizeof(ict)))
+        return MY_FALSE;
+    current_inline = ict.prev < 0 ? NULL : &(INLINE_CLOSURE(ict.prev));
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (compile_update_test_fail(COMPILE_TEST_INLINE_LOCALS))
+    {
+        lex_close("Out of memory for inline locals");
+        return MY_FALSE;
+    }
+#endif
+    if (!reserve_mem_block(A_LOCAL_VARIABLES, 2 * MAX_LOCAL * sizeof(A_LOCAL_VARIABLES_t)))
+        return MY_FALSE;
+
     /* Extend the type memblocks */
     {
         mp_uint type_count = LOCAL_VARIABLE_COUNT;
@@ -7862,6 +8824,7 @@ printf("DEBUG:   type ptrs: %p, %p\n",
     /* Add the structure to the memblock */
     ADD_INLINE_CLOSURE(&ict);
     current_inline = &(INLINE_CLOSURE(INLINE_CLOSURE_COUNT-1));
+    return MY_TRUE;
 } /* new_inline_closure() */
 
 /*-------------------------------------------------------------------------*/
@@ -8035,6 +8998,12 @@ insert_pending_inline_closures (void)
     mp_uint remove_lv_dbg_start = 0;
     inline_closure_t *last_ict = &(INLINE_CLOSURE(INLINE_CLOSURE_COUNT));
 
+    /* Every moved debug descriptor owns its references only once. Reserve
+     * enough destination space before starting any shallow-copy transfer.
+     */
+    if (!reserve_mem_block(A_LOCAL_VARIABLES_DBG, mem_block[A_LOCAL_VARIABLES_DBG].current_size))
+        return;
+
 #ifdef DEBUG_INLINES
 if (INLINE_CLOSURE_COUNT != 0) printf("DEBUG: insert_inline_closures(): %"
                                       PRIuMPINT" pending\n", 
@@ -8184,6 +9153,8 @@ prepare_inline_closure (lpctype_t *returntype, bool coroutine)
         }
 
         ident = add_global_name(make_shared_identifier(name, I_TYPE_UNKNOWN, 0));
+        if (!ident)
+            return MY_FALSE;
     }
     else
         ident = NULL;
@@ -8195,7 +9166,8 @@ prepare_inline_closure (lpctype_t *returntype, bool coroutine)
     funtype = get_fulltype(returntype);
     funtype.t_flags |= TYPE_MOD_NO_MASK | TYPE_MOD_PRIVATE;
 
-    def_function_typecheck(funtype, ident, MY_TRUE);
+    if (!def_function_typecheck(funtype, ident, MY_TRUE))
+        return MY_FALSE;
     current_inline->coroutine = coroutine;
 #ifdef DEBUG_INLINES
 printf("DEBUG: New inline closure name: '%s'\n", name);
@@ -8231,7 +9203,8 @@ printf("DEBUG: inline_closure_prototype(%d)\n", num_args);
 #endif /* DEBUG_INLINES */
     def_function_argument_check(true);
     if (!string_context && !compiling_decltype)
-        def_function_prototype(num_args, MY_TRUE);
+        if (!def_function_prototype(num_args, MY_TRUE))
+            return MY_FALSE;
 
 #ifdef DEBUG_INLINES
 printf("DEBUG:   current_inline->depth: %d: %d\n", current_inline->block_depth, block_scope[current_inline->block_depth-1].num_locals);
@@ -8260,7 +9233,11 @@ printf("DEBUG:   program size: %"PRIuMPINT" align to %"PRIuMPINT"\n",
     current_inline->start_line = stored_lines;
     stored_bytes = CURRENT_PROGRAM_SIZE; /* Ignore the alignment. */
     
-    if (realloc_a_program(FUNCTION_HDR_SIZE))
+    if (
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        !compile_update_test_fail(COMPILE_TEST_INLINE_HEADER) &&
+#endif
+        realloc_a_program(FUNCTION_HDR_SIZE))
     {
         CURRENT_PROGRAM_SIZE += FUNCTION_HDR_SIZE;
     }
@@ -8268,7 +9245,9 @@ printf("DEBUG:   program size: %"PRIuMPINT" align to %"PRIuMPINT"\n",
     {
         yyerrorf("Out of memory: program size %"PRIuMPINT"\n"
                 , mem_block[A_PROGRAM].current_size + FUNCTION_HDR_SIZE);
-        finish_inline_closure(MY_TRUE);
+        /* The argument scope is still open. Leave the active frame to
+         * parser abort cleanup, as for a failed prototype above.
+         */
         return MY_FALSE;
     }
 
@@ -8474,6 +9453,7 @@ printf("DEBUG:     -> F_CONTEXT_CLOSURE %d %d %d\n", current_inline->function
 
             /* Initialize the slots for the context variables. */
             memset(values - context->num_locals, 0, context->num_locals * sizeof(svalue_t));
+            closure_register_dependencies(&l->base, CLOSURE_LAMBDA);
 
             /* References have been adopted. */
             GET_BLOCK_SIZE(A_LAMBDA_VALUES) = lambda_values_offset * sizeof(A_LAMBDA_VALUES_t);
@@ -8581,6 +9561,7 @@ store_prog_string (string_t *str)
             yyerrorf("Out of memory for new program string (%zu bytes).",
                     sizeof(string_t *) + sizeof(int));
             last_string_is_new = MY_FALSE;
+            free_mstring(str);
             return -1;
         }
     }
@@ -8866,6 +9847,8 @@ lookup_function (ident_t *ident, char* super, efun_override_t override)
 
 {
     ident = add_global_name(ident);
+    if (!ident)
+        return false;
 
     if (string_context && !super
      && ident->type == I_TYPE_GLOBAL
@@ -8986,6 +9969,8 @@ lookup_global_variable (ident_t *ident)
         }
 
         ident = add_global_name(ident);
+        if (!ident)
+            return false;
 
         if (string_context->var_lookup)
         {
@@ -9270,6 +10255,9 @@ get_global_variable_lvalue (ident_t *ident)
       /* Often used to save the current break/continue address.
        */
 
+    struct default_list_s default_list;
+      /* Literal counts and non-owning default-description list IDs. */
+
     p_uint address;
       /* Address of an instruction. */
 
@@ -9317,6 +10305,9 @@ get_global_variable_lvalue (ident_t *ident)
         fulltype_t type;   /* Type of the expression */
         uint32     start;  /* Startaddress of the expression */
         bool       needs_use; /* Warn, when not used. */
+#ifdef USE_BLUEPRINT_UPDATE
+        struct default_descriptor_s default_desc; /* Non-owning arena ID. */
+#endif
     } rvalue;
       /* Just a simple expression. */
 
@@ -9327,6 +10318,9 @@ get_global_variable_lvalue (ident_t *ident)
         uint32         start;    /* Startaddress of the instruction */
         bool           needs_use;/* Warn, when not used. */
         lvalue_block_t lvalue;   /* Code of the expression as an lvalue */
+#ifdef USE_BLUEPRINT_UPDATE
+        struct default_descriptor_s default_desc; /* Non-owning arena ID. */
+#endif
     }
     lrvalue;
       /* Used for expressions which may return a rvalue or lvalues.
@@ -9534,7 +10528,11 @@ get_global_variable_lvalue (ident_t *ident)
 %destructor { free_lpctype($$);       } <lpctype>
 %destructor { free_fulltype($$);      } <fulltype>
 %destructor { free_lpctype($$.type);  } <lvalue>
-%destructor { free_fulltype($$.type); } <rvalue> <lrvalue> <struct_init_member>
+%destructor { free_fulltype($$.type); } <rvalue> <lrvalue>
+%destructor { free_fulltype($$.type); free_mstring($$.name); } <struct_init_member>
+%destructor { free_struct_initializers($$.list); } <struct_init_list>
+%destructor { free_mstring($$); } identifier struct_member_name
+%destructor { free_mstring($$); } call_other_name
 %destructor { free_fulltype($$.type1);
               free_fulltype($$.type2); } <index>
 %destructor { free_lpctype($$.expr_type); } <foreach_expression>
@@ -9598,10 +10596,10 @@ get_global_variable_lvalue (ident_t *ident)
 %type <number> switch_label
   /* 1 for default, 0 otherwise. */
 
-%type <number> expr_list arg_expr arg_expr_list arg_expr_list2 expr_list2
+%type <number> arg_expr arg_expr_list arg_expr_list2
   /* Number of expressions in an expression list */
 
-%type <number> m_expr_values
+%type <default_list> expr_list expr_list2 m_expr_values
   /* Number of values for a mapping entry (ie the 'width') */
 
 %type <number> L_ASSIGN
@@ -9618,7 +10616,7 @@ get_global_variable_lvalue (ident_t *ident)
    * [1]: address of the branch-offset of the if
    */
 
-%type <numbers> m_expr_list m_expr_list2
+%type <default_list> m_expr_list m_expr_list2
   /* [0]: number of entries in a mapping literal
    * [1]: width of the mapping literal
    */
@@ -9864,7 +10862,9 @@ function_def:
 
       {
           check_identifier($2);
-          def_function_typecheck($1, add_global_name($2), MY_FALSE);
+          ident_t *ident = add_global_name($2);
+          if (!ident || !def_function_typecheck($1, ident, MY_FALSE))
+              YYABORT;
       }
 
       '(' argument ')'
@@ -9875,7 +10875,8 @@ function_def:
           function_t *funp;
 
           def_function_argument_check(false);
-          def_function_prototype($5.num, MY_FALSE);
+          if (!def_function_prototype($5.num, MY_FALSE))
+              YYABORT;
 
           /* Remember the current size if we need to revert. */
           $<address>3 = CURRENT_PROGRAM_SIZE;
@@ -10130,7 +11131,9 @@ printf("DEBUG: After inline_opt_type: program size %"PRIuMPINT"\n", CURRENT_PROG
 
           if (!prepare_inline_closure($3, $1))
           {
-              free_lpctype($3);
+              /* This midrule has not adopted the prefix's return type;
+               * normal parser cleanup still owns that reference.
+               */
               YYACCEPT;
           }
       }
@@ -10250,10 +11253,7 @@ printf("DEBUG: After inline_opt_context: program size %"PRIuMPINT"\n", CURRENT_P
           }
 
           if (!inline_closure_prototype($5.num))
-          {
-              free_lpctype($3);
-              YYACCEPT;
-          }
+              YYACCEPT; /* The prefix still owns its return type. */
 
           $<number>$ = reserve_default_value_block($5.num_opt, $5.start);
           if (!$<number>$)
@@ -10310,6 +11310,7 @@ printf("DEBUG: After inline block: program size %"PRIuMPINT"\n", CURRENT_PROGRAM
              ins_f_code(F_FUNCALL);
              ins_f_code(F_RESTORE_ARG_FRAME);
          }
+          DEFAULT_REJECT($$);
       }
 
 
@@ -10332,7 +11333,9 @@ printf("DEBUG: After L_BEGIN_INLINE: program size %"PRIuMPINT"\n", CURRENT_PROGR
 
               sprintf(name, "$%d", i);
               ident = make_shared_identifier(name, I_TYPE_UNKNOWN, 0);
-              add_local_name(ident, get_fulltype(lpctype_mixed), block_depth);
+              ident = add_local_name(ident, get_fulltype(lpctype_mixed), block_depth);
+              if (!ident)
+                  YYABORT;
               use_variable(ident, VAR_USAGE_READWRITE);
           }
 
@@ -10383,6 +11386,7 @@ printf("DEBUG: After L_END_INLINE: program size %"PRIuMPINT"\n", CURRENT_PROGRAM
                                     .is_empty =         $3.is_empty         && $4.is_empty,
                                     .warned_dead_code = $3.warned_dead_code || $4.warned_dead_code,
                                   });
+          DEFAULT_REJECT($$);
       }
 
 ; /* inline_func */
@@ -10405,7 +11409,9 @@ inline_opt_args:
 
               sprintf(name, "$%d", i);
               ident = make_shared_identifier(name, I_TYPE_UNKNOWN, 0);
-              add_local_name(ident, get_fulltype(lpctype_mixed), block_depth);
+              ident = add_local_name(ident, get_fulltype(lpctype_mixed), block_depth);
+              if (!ident)
+                  YYABORT;
               use_variable(ident, VAR_USAGE_READWRITE);
           }
 
@@ -10699,12 +11705,12 @@ inheritance:
                   filename = alloca(strlen(current_loc.file->name)+2);
                   *filename = '/';
                   strcpy(filename+1, current_loc.file->name);
-                  push_c_string(inter_sp, filename);
+                  compile_push_c_string(filename);
               }
               else
-                  push_c_string(inter_sp, current_loc.file->name);
+                  compile_push_c_string(current_loc.file->name);
 
-              res = apply_master(STR_INHERIT_FILE, 2);
+              res = compile_apply_master(STR_INHERIT_FILE, 2);
 
               if (res && !(res->type == T_NUMBER && !res->u.number))
               {
@@ -10732,8 +11738,14 @@ inheritance:
                   /* Ok, now replace the parsed string with the name
                    * we just got.
                    */
+                  string_t *replacement = new_tabled(cp, res->u.str->info.unicode);
+                  if (!replacement)
+                  {
+                      yyerror("Out of memory for inherited filename");
+                      YYACCEPT;
+                  }
                   free_mstring(last_string_constant);
-                  last_string_constant = new_tabled(cp, res->u.str->info.unicode);
+                  last_string_constant = replacement;
               }
               /* else: no result - use the string as it is */
           }
@@ -10749,8 +11761,18 @@ inheritance:
 
           /* Look up the inherited object and swap it in.
            */
-          ob = find_object(last_string_constant);
-          if (ob == 0)
+          ob = NULL;
+          if (compile_update_is_active())
+          {
+              inherit_prog = compile_update_find_program(last_string_constant);
+              if (!inherit_prog)
+              {
+                  yyerrorf("Unpinned or ambiguous inherited program '%s'.",
+                           get_txt(last_string_constant));
+                  YYACCEPT;
+              }
+          }
+          else if ((ob = find_object(last_string_constant)) == 0)
           {
               inherit_prog = NULL;
               if (compile_check_is_active())
@@ -11112,6 +12134,8 @@ single_basic_non_void_type:
               else
                   $$ = get_struct_type(STRUCT_DEF(num).type);
           }
+          if (!$$)
+              $$ = lpctype_any_struct;
       }
     | L_STRUCT L_MIXED
       {
@@ -11333,6 +12357,7 @@ opt_default_value:
         $$.name = NULL;
         $$.type = get_fulltype(NULL);
         $$.needs_use = false;
+          DEFAULT_REJECT($$);
       }
     | L_ASSIGN expr0
       {
@@ -11345,6 +12370,7 @@ opt_default_value:
         $$.type = $2.type;
         $$.needs_use = false;
         free_lvalue_block($2.lvalue);
+          DEFAULT_REJECT($$);
       }
 ; /* opt_default_value */
 
@@ -11362,7 +12388,7 @@ name_list:
               $1.t_type = lpctype_mixed;
           }
 
-          define_global_variable($2, $1, MY_FALSE);
+          define_global_variable($2, $1, MY_FALSE, &@2);
           $$ = $1;
       }
 
@@ -11378,13 +12404,14 @@ name_list:
               $1.t_type = lpctype_mixed;
           }
 
-          $<number>$ = define_global_variable($2, $1, MY_TRUE);
+          $<number>$ = define_global_variable($2, $1, MY_TRUE, &@2);
       }
 
       L_ASSIGN expr0
       {
           use_variable($5.name, VAR_USAGE_READ);
           init_global_variable($<number>3, $2, $1, $4, $5.type, &@5);
+          DEFAULT_END($5);
           free_fulltype($5.type);
           free_lvalue_block($5.lvalue);
           $$ = $1;
@@ -11397,7 +12424,7 @@ name_list:
           type.t_flags = $1.t_flags;
 
           check_identifier($4);
-          define_global_variable($4, type, MY_FALSE);
+          define_global_variable($4, type, MY_FALSE, &@4);
           free_fulltype(type);
           $$ = $1;
       }
@@ -11411,7 +12438,7 @@ name_list:
           type.t_flags = $1.t_flags;
 
           check_identifier($4);
-          $<number>$ = define_global_variable($4, type, MY_TRUE); 
+          $<number>$ = define_global_variable($4, type, MY_TRUE, &@4);
           free_fulltype(type);
       }
 
@@ -11423,6 +12450,7 @@ name_list:
 
           use_variable($7.name, VAR_USAGE_READ);
           init_global_variable($<number>5, $4, type, $6, $7.type, &@7);
+          DEFAULT_END($7);
 
           free_fulltype(type);
           free_fulltype($7.type);
@@ -11517,7 +12545,8 @@ local_name_list:
       basic_type L_IDENTIFIER
       {
           check_identifier($2);
-          define_local_variable($2, $1, NULL, $2->type == I_TYPE_LOCAL, MY_FALSE);
+          if (!define_local_variable($2, $1, NULL, $2->type == I_TYPE_LOCAL, MY_FALSE))
+          { yylen = 0; YYABORT; }
 
           $$ = $1;
       }
@@ -11525,6 +12554,8 @@ local_name_list:
       {
           check_identifier($2);
           $2 = define_local_variable($2, $1, &$<lvalue>$, $2->type == I_TYPE_LOCAL, MY_TRUE);
+          if (!$2)
+              YYABORT;
       }
       L_ASSIGN expr0
       {
@@ -11539,8 +12570,10 @@ local_name_list:
       {
           lpctype_t* type = get_array_type_with_depth($1, $3);
           check_identifier($4);
-          define_local_variable($4, type, NULL, $4->type == I_TYPE_LOCAL, MY_FALSE);
+          ident_t *ident = define_local_variable($4, type, NULL, $4->type == I_TYPE_LOCAL, MY_FALSE);
           free_lpctype(type);
+          if (!ident)
+          { yylen = 0; YYABORT; }
 
           $$ = $1;
       }
@@ -11550,6 +12583,8 @@ local_name_list:
           check_identifier($4);
           $4 = define_local_variable($4, type, &$<lvalue>$, $4->type == I_TYPE_LOCAL, MY_TRUE);
           free_lpctype(type);
+          if (!$4)
+              YYABORT;
       }
       L_ASSIGN expr0
       {
@@ -11790,6 +12825,8 @@ while:
            * has been compiled, the code will be put back in.
            */
           expression = yalloc(length+2);
+          if (!expression)
+              YYABORT;
           memcpy(expression, mem_block[A_PROGRAM].block+addr, length);
           if (last_expression == CURRENT_PROGRAM_SIZE - 1
            && expression[length-1] == F_NOT
@@ -12101,6 +13138,8 @@ for:
           start = $<number>6;
           length = CURRENT_PROGRAM_SIZE - start;
           expression = yalloc(length+2);
+          if (!expression)
+              YYABORT;
           memcpy(expression, mem_block[A_PROGRAM].block + start, length );
 
           /* Add the branch instruction */
@@ -12144,6 +13183,8 @@ for:
           insert_pop_value();
           length = CURRENT_PROGRAM_SIZE - $<number>6;
           $<expression>$.p = yalloc(length);
+          if (!$<expression>$.p)
+              YYABORT;
           if (length)
               memcpy( $<expression>$.p
                     , mem_block[A_PROGRAM].block + $<number>6
@@ -12663,7 +13704,9 @@ foreach_var_decl:  /* Generate the code for one lvalue */
               }
               else
               {
-                  ADD_ARGUMENT_TYPE($1.type); // Adapt ref
+                  if (!reserve_mem_block(A_ARGUMENT_TYPES, sizeof(A_ARGUMENT_TYPES_t)))
+                  { yylen = 0; YYABORT; }
+                  ADD_ARGUMENT_TYPE($1.type); // Adopt ref
               }
           }
           else
@@ -13368,6 +14411,7 @@ comma_expr:
         $$.name = $1.name;
         $$.needs_use = $1.needs_use;
         free_lvalue_block($1.lvalue);
+          DEFAULT_FORWARD($$, $1);
       }
     | comma_expr
       {
@@ -13386,6 +14430,7 @@ comma_expr:
 
           free_fulltype($1.type);
           free_lvalue_block($4.lvalue);
+          DEFAULT_REJECT($$);
       }
 ; /* comma_expr */
 
@@ -13398,6 +14443,7 @@ opt_expr:
           $$.name = NULL;
           $$.needs_use = false;
           ins_f_code(F_CONST0);
+          DEFAULT_REJECT($$);
       }
     | ',' expr0
       {
@@ -13406,6 +14452,7 @@ opt_expr:
           $$.name = $2.name;
           $$.needs_use = $2.needs_use;
           free_lvalue_block($2.lvalue);
+          DEFAULT_REJECT($$);
       }
 ; /* opt_expr */
 
@@ -13722,6 +14769,7 @@ expr0:
 
           free_lpctype($1.type);
           free_fulltype($4.type);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -13736,6 +14784,7 @@ expr0:
           $$.needs_use = false;
           free_fulltype($3.type);
           free_lvalue_block($3.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -13856,6 +14905,7 @@ expr0:
           free_lvalue_block($7.lvalue);
           free_lvalue_block($4.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -13892,6 +14942,7 @@ expr0:
           free_fulltype($4.type);
           free_lvalue_block($4.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       } /* LOR */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -13926,7 +14977,8 @@ expr0:
           free_fulltype($1.type);
           free_lvalue_block($4.lvalue);
           free_lvalue_block($1.lvalue);
-       } /* LAND */
+          DEFAULT_REJECT($$);
+      } /* LAND */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
     | expr0 '|' expr0
@@ -13952,6 +15004,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_OR);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -13978,6 +15031,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_XOR);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14004,6 +15058,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_AND);
+          DEFAULT_REJECT($$);
       } /* end of '&' code */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14037,6 +15092,7 @@ expr0:
           $$.name = NULL;
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14070,6 +15126,7 @@ expr0:
           $$.name = NULL;
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14095,6 +15152,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_IN);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14121,6 +15179,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_GT);
+          DEFAULT_REJECT($$);
       }
     | expr0 L_GE  expr0
       {
@@ -14145,6 +15204,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_GE);
+          DEFAULT_REJECT($$);
       }
     | expr0 '<'  expr0
       {
@@ -14169,6 +15229,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_LT);
+          DEFAULT_REJECT($$);
       }
     | expr0 L_LE  expr0
       {
@@ -14193,6 +15254,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_LE);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14220,6 +15282,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_LSH);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14246,6 +15309,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_f_code(F_RSH);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14272,6 +15336,7 @@ expr0:
           free_lvalue_block($1.lvalue);
 
           ins_byte(F_RSHL);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14385,6 +15450,7 @@ expr0:
           free_fulltype($4.type);
           free_lvalue_block($4.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       } /* '+' */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14410,6 +15476,7 @@ expr0:
           free_fulltype($3.type);
           free_lvalue_block($3.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       } /* '-' */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14434,6 +15501,7 @@ expr0:
           free_fulltype($3.type);
           free_lvalue_block($3.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       } /* '*' */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14458,6 +15526,7 @@ expr0:
           free_fulltype($3.type);
           free_lvalue_block($3.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       }
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
     | expr0 '/' expr0
@@ -14481,6 +15550,7 @@ expr0:
           free_fulltype($3.type);
           free_lvalue_block($3.lvalue);
           free_lvalue_block($1.lvalue);
+          DEFAULT_REJECT($$);
       } /* '/' */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14530,6 +15600,7 @@ expr0:
 
           free_fulltype($2.type);
           free_lvalue_block($2.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14609,6 +15680,7 @@ expr0:
 
           free_fulltype($2.type);
           free_lvalue_block($2.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14636,6 +15708,7 @@ expr0:
           $$.needs_use = false;
 
           free_lpctype($2.type);
+          DEFAULT_REJECT($$);
       }
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
     | L_NOT expr0
@@ -14652,6 +15725,7 @@ expr0:
 
           free_fulltype($2.type);
           free_lvalue_block($2.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14671,6 +15745,7 @@ expr0:
 
           free_fulltype($2.type);
           free_lvalue_block($2.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14716,6 +15791,7 @@ expr0:
 
           free_fulltype($2.type);
           free_lvalue_block($2.lvalue);
+          DEFAULT_NEGATE($$, $2);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14741,6 +15817,7 @@ expr0:
           $$.needs_use = false;
 
           free_lpctype($1.type);
+          DEFAULT_REJECT($$);
       } /* post-inc */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14767,6 +15844,7 @@ expr0:
           $$.needs_use = false;
 
           free_lpctype($1.type);
+          DEFAULT_REJECT($$);
       } /* post-dec */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14791,6 +15869,7 @@ expr0:
           $$.name = $1.name;
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14858,6 +15937,7 @@ expr0:
           free_lpctype($1.type);
           free_fulltype($3.type);
           free_lvalue_block($3.lvalue);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14865,6 +15945,7 @@ expr0:
       {
 %line
           $$ = $1;
+          DEFAULT_FORWARD($$, $1);
       }
 
 ; /* expr0 */
@@ -14923,6 +16004,7 @@ expr4:
           $$.type =   $1.type;
           $$.name =   NULL;
           $$.needs_use = $1.needs_use;
+          DEFAULT_REJECT($$);
       }
     | inline_func    %prec '~'
       {
@@ -14931,6 +16013,7 @@ expr4:
           $$.type =   $1.type;
           $$.name =   NULL;
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
     | catch          %prec '~'
       {
@@ -14939,6 +16022,7 @@ expr4:
           $$.type =   $1.type;
           $$.name =   NULL;
           $$.needs_use = false;
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -14948,6 +16032,7 @@ expr4:
 
           string_t *p;
 %line
+          DEFAULT_STRING($$, last_lex_string);
           p = last_lex_string;
           last_lex_string = NULL;
           $$.start = last_expression = CURRENT_PROGRAM_SIZE;
@@ -14973,6 +16058,7 @@ expr4:
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name =   NULL;
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
 
     | L_BYTES
@@ -14981,6 +16067,7 @@ expr4:
 
           string_t *p;
 %line
+          DEFAULT_STRING($$, last_lex_string);
           p = last_lex_string;
           last_lex_string = NULL;
           $$.start = last_expression = CURRENT_PROGRAM_SIZE;
@@ -15041,6 +16128,7 @@ expr4:
               $$.type = get_fulltype_flags(lpctype_int, TYPE_MOD_LITERAL);
           }
           CURRENT_PROGRAM_SIZE = current;
+          DEFAULT_INTEGER($$, $1);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15123,6 +16211,7 @@ expr4:
           ins_short(ix);
           ins_short(inhIndex);
           $$.type = get_fulltype_flags(lpctype_closure, TYPE_MOD_LITERAL);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15157,6 +16246,7 @@ expr4:
               ins_short(sefun + CLOSURE_SIMUL_EFUN_OFFS);
               ins_short(0);
           }
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15186,6 +16276,7 @@ expr4:
               ins_byte(quotes);
           }
           $$.type = get_fulltype_flags(lpctype_symbol, TYPE_MOD_LITERAL);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15206,6 +16297,7 @@ expr4:
           ins_uint16 ( exponent );
 #endif  /* FLOAT_FORMAT_2 */
           $$.type = get_fulltype_flags(lpctype_float, TYPE_MOD_LITERAL);
+          DEFAULT_FLOAT($$, $1);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15228,6 +16320,7 @@ expr4:
               ins_f_code(F_LAMBDA_CONSTANT);
               ins_short($1);
           }
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15240,6 +16333,7 @@ expr4:
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name = $2.name;
           $$.needs_use = $2.needs_use;
+          DEFAULT_FORWARD($$, $2);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15248,14 +16342,15 @@ expr4:
           /* Generate an array */
 
           ins_f_code(F_AGGREGATE);
-          ins_short($4);
-          if (max_array_size && $4 > (p_int)max_array_size)
+          ins_short($4.count);
+          if (max_array_size && $4.count > (p_int)max_array_size)
               yyerror("Illegal array size");
-          $$.type = get_aggregate_type($4);
+          $$.type = get_aggregate_type($4.count);
           $$.start = $3;
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name =   NULL;
           $$.needs_use = true;
+          DEFAULT_CONTAINER($$, $4, SCHEMA_DEFAULT_ARRAY);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15268,11 +16363,11 @@ expr4:
 
           int quotes;
 
-          pop_arg_stack($3);
+          pop_arg_stack($3.count);
 
           ins_f_code(F_AGGREGATE);
-          ins_short($3);
-          if (max_array_size && $3 > (p_int)max_array_size)
+          ins_short($3.count);
+          if (max_array_size && $3.count > (p_int)max_array_size)
               yyerror("Illegal array size");
           $$.type = get_fulltype_flags(lpctype_quoted_array, TYPE_MOD_LITERAL);
           $$.start = $2;
@@ -15283,6 +16378,7 @@ expr4:
           do {
                 ins_f_code(F_QUOTE);
           } while (--quotes);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15310,6 +16406,7 @@ expr4:
 
           free_fulltype($6.type);
           free_lvalue_block($6.lvalue);
+          DEFAULT_WIDTH($$, $6);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15319,24 +16416,24 @@ expr4:
 
           mp_int num_keys;
 
-          pop_arg_stack($4[0]);
-          num_keys = $4[0] / ($4[1]+1);
+          pop_arg_stack($4.count);
+          num_keys = $4.count / ($4.width+1);
 
-          if ((num_keys|$4[1]) & ~0xffff)
+          if ((num_keys|$4.width) & ~0xffff)
               yyerror("cannot handle more than 65535 keys/values "
                       "in mapping aggregate");
 
-          if ( (num_keys | $4[1]) &~0xff)
+          if ( (num_keys | $4.width) &~0xff)
           {
               ins_f_code(F_M_AGGREGATE);
               ins_short(num_keys);
-              ins_short($4[1]);
+              ins_short($4.width);
           }
           else
           {
               ins_f_code(F_M_CAGGREGATE);
               ins_byte(num_keys);
-              ins_byte($4[1]);
+              ins_byte($4.width);
           }
 
           $$.type = get_fulltype_flags(lpctype_mapping, TYPE_MOD_LITERAL);
@@ -15344,6 +16441,7 @@ expr4:
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name =   NULL;
           $$.needs_use = true;
+          DEFAULT_CONTAINER($$, $4, SCHEMA_DEFAULT_MAPPING);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15355,6 +16453,7 @@ expr4:
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name =   NULL;
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
     | '(' '<' note_start error ')'
       {
@@ -15363,6 +16462,7 @@ expr4:
           $$.start = $3;
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name =   NULL;
+          DEFAULT_REJECT($$);
       }
     | '(' '<' struct_name '>'
       {
@@ -15445,11 +16545,13 @@ expr4:
               xfree(p);
           }
 
-          $$.type = get_fulltype_flags(get_struct_type(stype), TYPE_MOD_LITERAL);
+          lpctype_t *literal_type = get_struct_type(stype);
+          $$.type = get_fulltype_flags(literal_type ? literal_type : lpctype_any_struct, TYPE_MOD_LITERAL);
           $$.start = $6;
           $$.lvalue = (lvalue_block_t) {0, 0};
           $$.name =   NULL;
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15463,6 +16565,7 @@ expr4:
 
           ins_prog_type($2);
           free_lpctype($2);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15483,6 +16586,7 @@ expr4:
 
           ins_prog_type($4.type.t_type);
           free_fulltype($4.type);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15648,6 +16752,8 @@ expr4:
               lpctype_t *type;
 
               varident = check_for_context_local(varident, &type);
+              if (!varident)
+                  YYABORT;
 
               $$.type = get_fulltype(ref_lpctype(type));
 
@@ -15675,6 +16781,7 @@ expr4:
 
           $$.name = varident;
           $$.needs_use = true;
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15717,6 +16824,7 @@ expr4:
           ins_f_code($2.strict_member ? F_S_INDEX : F_SX_INDEX);
 
           free_fulltype($1.type);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15755,6 +16863,7 @@ expr4:
           free_fulltype($1.type);
           free_fulltype($2.type1);
           free_fulltype($2.type2);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15801,6 +16910,7 @@ expr4:
           free_fulltype($1.type);
           free_fulltype($2.type1);
           free_fulltype($2.type2);
+          DEFAULT_REJECT($$);
       } /* expr4 index_range */
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15836,6 +16946,7 @@ expr4:
 
           free_fulltype($1.type);
           free_fulltype($2.type1);
+          DEFAULT_REJECT($$);
       }
 
     /*- - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
@@ -15866,6 +16977,7 @@ expr4:
           free_fulltype($1.type);
           free_fulltype($2.type1);
           free_fulltype($2.type2);
+          DEFAULT_REJECT($$);
       } /* expr4 index_map_range */
 ; /* expr4 */
 
@@ -15996,6 +17108,8 @@ name_lvalue:
               /* Generate the lvalue for a local */
 
               varident = check_for_context_local(varident, &type);
+              if (!varident)
+                  YYABORT;
 
               $$.type = ref_lpctype(type);
               $$.lvalue = alloc_lvalue_block(2);
@@ -16285,6 +17399,8 @@ local_name_lvalue:
       {
           check_identifier($2);
           $2 = define_local_variable($2, $1, &$$, $2->type == I_TYPE_LOCAL, MY_TRUE);
+          if (!$2)
+          { yylen = 0; YYABORT; }
 
           ref_lpctype($$.type);
           free_lpctype($1);
@@ -17175,14 +18291,14 @@ index_map_expr:
  */
 
 expr_list:
-      /* empty */     { $$ = 0; }
+      /* empty */     { $$ = compiler_default_list(0); }
     | expr_list2      { $$ = $1; }
     | expr_list2 ','  { $$ = $1; }  /* Allow a terminating comma */
 ; /* expr_list */
 
 expr_list2:
-      expr0                 { $$ = 1;      add_arg_type($1.type); check_unknown_type($1.type.t_type); use_variable($1.name, VAR_USAGE_READ); free_lvalue_block($1.lvalue); }
-    | expr_list2 ',' expr0  { $$ = $1 + 1; add_arg_type($3.type); check_unknown_type($3.type.t_type); use_variable($3.name, VAR_USAGE_READ); free_lvalue_block($3.lvalue); }
+      expr0                 { $$ = DEFAULT_LIST_ADD(compiler_default_list(0), $1); add_arg_type($1.type); check_unknown_type($1.type.t_type); use_variable($1.name, VAR_USAGE_READ); free_lvalue_block($1.lvalue); }
+    | expr_list2 ',' expr0  { $$ = DEFAULT_LIST_ADD($1, $3); add_arg_type($3.type); check_unknown_type($3.type.t_type); use_variable($3.name, VAR_USAGE_READ); free_lvalue_block($3.lvalue); }
 ; /* expr_list2 */
 
 
@@ -17309,18 +18425,18 @@ arg_expr:
 ; /* arg_expr */
 
 m_expr_list:
-      /* empty */          { $$[0] = 0; $$[1]= 1; }
+      /* empty */          { $$ = compiler_default_list(1); }
     | m_expr_list2      /* { $$ = $1; } */
     | m_expr_list2 ','  /* { $$ = $1; } Allow a terminating comma */
-    | expr_list2           { $$[0] = $1; $$[1] = 0; }
-    | expr_list2 ','       { $$[0] = $1; $$[1] = 0; }
+    | expr_list2           { $$ = $1; $$.width = 0; }
+    | expr_list2 ','       { $$ = $1; $$.width = 0; }
 ; /* m_expr_list */
 
 m_expr_list2:
       expr0  m_expr_values
       {
-          $$[0] = 1 + $2;
-          $$[1] = $2;
+          $$ = compiler_default_list_join(DEFAULT_LIST_ADD(compiler_default_list(0), $1), $2);
+          $$.width = $2.count;
           add_arg_type($1.type); /* order doesn't matter */
           check_unknown_type($1.type.t_type);
           use_variable($1.name, VAR_USAGE_READ);
@@ -17329,11 +18445,11 @@ m_expr_list2:
 
     | m_expr_list2 ',' expr0 m_expr_values
       {
-          if ($1[1] != $4) {
+          if ($1.width != $4.count) {
               yyerror("Inconsistent number of values in mapping literal");
           }
-          $$[0] = $1[0] + 1 + $4;
-          $$[1] = $1[1];
+          $$ = compiler_default_list_join($1,
+                compiler_default_list_join(DEFAULT_LIST_ADD(compiler_default_list(0), $3), $4));
           add_arg_type($3.type);
           check_unknown_type($3.type.t_type);
           use_variable($3.name, VAR_USAGE_READ);
@@ -17342,8 +18458,8 @@ m_expr_list2:
 ; /* m_expr_list2 */
 
 m_expr_values:
-      ':' expr0                { $$ = 1;      add_arg_type($2.type); check_unknown_type($2.type.t_type); use_variable($2.name, VAR_USAGE_READ); free_lvalue_block($2.lvalue); }
-    | m_expr_values ';' expr0  { $$ = $1 + 1; add_arg_type($3.type); check_unknown_type($3.type.t_type); use_variable($3.name, VAR_USAGE_READ); free_lvalue_block($3.lvalue); }
+      ':' expr0                { $$ = DEFAULT_LIST_ADD(compiler_default_list(0), $2); add_arg_type($2.type); check_unknown_type($2.type.t_type); use_variable($2.name, VAR_USAGE_READ); free_lvalue_block($2.lvalue); }
+    | m_expr_values ';' expr0  { $$ = DEFAULT_LIST_ADD($1, $3); add_arg_type($3.type); check_unknown_type($3.type.t_type); use_variable($3.name, VAR_USAGE_READ); free_lvalue_block($3.lvalue); }
 ; /* m_expr_values */
 
 
@@ -17386,7 +18502,7 @@ struct_member_name:
       { $$ = $1; }
 
     | L_STRING L_STRING
-      { fatal("presence of rule should prevent its reduction"); }
+      { $$ = NULL; fatal("presence of rule should prevent its reduction"); }
 
     | L_STRING
       {
@@ -17418,6 +18534,7 @@ opt_struct_init:
     | opt_struct_init2 ',' error
       {
           /* Allow the parser to resynchronize */
+          free_struct_initializers($1.list);
           $$.length = 0; $$.list = $$.last = NULL;
       }
 ; /* opt_struct_init */
@@ -17434,12 +18551,23 @@ opt_struct_init2:
           struct_init_t * p;
 
           p = xalloc(sizeof(*p));
+          if (!p)
+          {
+              free_mstring($1.name);
+              free_fulltype($1.type);
+              yyerror("Out of memory for struct initializer");
+              YYABORT;
+          }
           p->next = NULL;
           p->name = $1.name;
           p->type = $1.type;
           $$.length = 1;
           $$.list = p;
           $$.last = p;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+          if (compile_update_test_fail(COMPILE_TEST_PRESSURE_STRUCT_INIT))
+              test_stack_gap_failure();
+#endif
       }
 
     | opt_struct_init2 ',' struct_init
@@ -17447,6 +18575,14 @@ opt_struct_init2:
           struct_init_t * p;
 
           p = xalloc(sizeof(*p));
+          if (!p)
+          {
+              free_struct_initializers($1.list);
+              free_mstring($3.name);
+              free_fulltype($3.type);
+              yyerror("Out of memory for struct initializer");
+              YYABORT;
+          }
           p->next = NULL;
           p->name = $3.name;
           p->type = $3.type;
@@ -18198,6 +19334,10 @@ function_call:
           string_t *name;
           int sefun;
 
+          /* The prefix remains on the parser stack until the final action.
+           * Early exits must leave its type reference for parser cleanup.
+           */
+
           /* Don't need <expr4> as an lvalue. */
           free_lvalue_block($1.lvalue);
 
@@ -18213,11 +19353,14 @@ function_call:
               bytecode_t *p, *q;
               p_int left;
 
-              if (!realloc_a_program(1))
+              if (
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+                  compile_update_test_fail(COMPILE_TEST_CALL_PREFIX) ||
+#endif
+                  !realloc_a_program(1))
               {
                   yyerrorf("Out of memory: program size %"PRIuMPINT"\n"
                           , mem_block[A_PROGRAM].current_size + 2);
-                  free_fulltype($1.type);
                   YYACCEPT;
               }
 
@@ -18242,7 +19385,6 @@ function_call:
           if (argument_level+1 == sizeof(function_call_info)/sizeof(function_call_info[0]))
           {
               yyerror("Functions nested too deeply.");
-              free_fulltype($1.type);
               YYACCEPT;
           }
           argument_level++;
@@ -18272,7 +19414,6 @@ function_call:
               {
                   yyerrorf("Out of memory: program size %"PRIuMPINT"\n"
                           , mem_block[A_PROGRAM].current_size + 2);
-                  free_fulltype($1.type);
                   YYACCEPT;
               }
 
@@ -18322,7 +19463,10 @@ function_call:
           {
               /* Push the function name (the expr4 is already on the stack)
                */
-              ins_prog_string(name);
+              /* The RHS remains on the parser stack while arguments are
+               * parsed. Retain its owner until the final action.
+               */
+              ins_prog_string(ref_mstring(name));
           } /* if (name) */
           /* otherwise the name was given by an expression for which
            * the code and value have been already generated.
@@ -18330,7 +19474,9 @@ function_call:
 
           if (!pragma_no_simul_efuns && sefun >= 0)
           {
-              /* Create argument type list for type checking. */
+              /* Reserve both entries before acquiring the additional ref. */
+              if (!reserve_argument_types(2))
+                  YYABORT;
               add_arg_type(ref_fulltype($1.type));
               add_arg_type(get_fulltype(lpctype_string));
           }
@@ -18397,6 +19543,8 @@ function_call:
                           {
                               yyerrorf("Out of memory: program size %"PRIuMPINT"\n"
                                       , mem_block[A_PROGRAM].current_size + i+2);
+                              free_mstring($3);
+                              free_fulltype($1.type);
                               YYACCEPT;
                           }
 
@@ -18513,6 +19661,7 @@ function_call:
           use_variable($1.name, VAR_USAGE_READ);
 
           free_fulltype($1.type);
+          free_mstring($3);
       }
     | coroutine_call
       {
@@ -18535,7 +19684,7 @@ call_other_name:
       { $$ = $1; }
 
     | L_STRING L_STRING
-      { fatal("presence of rule should prevent its reduction"); }
+      { $$ = NULL; fatal("presence of rule should prevent its reduction"); }
 
     | L_STRING
       {
@@ -18566,6 +19715,12 @@ function_name:
           check_identifier($1);
           if (fun->type == I_TYPE_LOCAL)
               fun = insert_shared_identifier_mstr(fun->name, I_TYPE_GLOBAL, 0);
+          if (!fun)
+          {
+              compile_update_memory_failed();
+              yyerror("Out of memory for function identifier");
+              YYABORT;
+          }
 
           $$.super = NULL;
           $$.real  = fun;
@@ -18574,7 +19729,9 @@ function_name:
     | L_COLON_COLON L_IDENTIFIER
       {
           check_identifier($2);
-          *($$.super = yalloc(1)) = '\0';
+          $$.super = yalloc(1);
+          if ($$.super)
+              *$$.super = '\0';
           $$.real  = $2;
       }
 
@@ -18586,6 +19743,12 @@ function_name:
           check_identifier($3);
           if (fun->type == I_TYPE_LOCAL)
               fun = insert_shared_identifier_mstr(fun->name, I_TYPE_GLOBAL, 0);
+          if (!fun)
+          {
+              compile_update_memory_failed();
+              yyerror("Out of memory for function identifier");
+              YYABORT;
+          }
 
           /* Attempt to call an efun directly even though there
            * is a nomask simul-efun for it?
@@ -18608,9 +19771,9 @@ function_name:
               if (string_context)
                   push_current_object(inter_sp, "nomask simul_efun");
               else
-                  push_c_string(inter_sp, current_loc.file->name);
+                  compile_push_c_string(current_loc.file->name);
               push_ref_string(inter_sp, fun->name);
-              res = apply_master(STR_PRIVILEGE, 3);
+              res = compile_apply_master(STR_PRIVILEGE, 3);
               if (!res || res->type != T_NUMBER || res->u.number < 0)
               {
                   yyerrorf("Privilege violation: nomask simul_efun %s"
@@ -18838,6 +20001,7 @@ catch:
           $$.type  = get_fulltype(lpctype_mixed);
           $$.name  = NULL;
           $$.needs_use = false;
+          DEFAULT_REJECT($$);
       }
 ; /* catch */
 
@@ -19021,6 +20185,9 @@ printf("DEBUG:   context name '%s'\n", get_txt(name->name));
         else
             q = add_local_name(name, get_fulltype(ref_lpctype(actual_type)), block_depth);
     }
+
+    if (!q)
+        return NULL;
 
     if (scope->clobbered)
     {
@@ -19338,6 +20505,8 @@ get_type_index (lpctype_t *t)
         if (idx > (long)USHRT_MAX)
             return -1;
 
+        if (!reserve_mem_block(A_TYPES, sizeof(A_TYPES_t)))
+            return -1;
         ADD_PROG_TYPE(ref_lpctype(t));
     }
 
@@ -20196,6 +21365,8 @@ copy_structs (program_t *from, funflag_t flags)
 
     for (struct_id = 0; struct_id < from->num_structs; struct_id++)
     {
+        if (compile_update_cancelled())
+            return;
         int id;
         ident_t *p;
         struct_def_t *pdef = from->struct_defs + struct_id;
@@ -20208,8 +21379,9 @@ copy_structs (program_t *from, funflag_t flags)
              * it later on.
              */
             if (pdef->type->name->lpctype != NULL
-             && pdef->type->name->lpctype->t_struct.def_idx == USHRT_MAX)
-                update_struct_type(pdef->type->name->lpctype, pdef->type);
+             && compiler_struct_index(pdef->type->name->lpctype) == USHRT_MAX)
+                if (!update_struct_type(pdef->type->name->lpctype, pdef->type))
+                    return;
 
             continue;
         }
@@ -20262,6 +21434,8 @@ copy_structs (program_t *from, funflag_t flags)
          * type with the one we inherited.
          */
         current_struct = define_struct( MY_FALSE, p, get_txt(struct_t_pname(pdef->type)), f, pdef->type);
+        if (current_struct < 0)
+            return;
         STRUCT_DEF(current_struct).inh = INHERIT_COUNT;
     }
 } /* copy_structs() */
@@ -20282,6 +21456,7 @@ inherit_functions (program_t *from, uint32 inheritidx)
 
 {
     function_t *fun_p;
+    size_t copied = 0;
 
     /* Make space for the inherited function structures */
     if(!RESERVE_FUNCTIONS(from->num_functions))
@@ -20295,6 +21470,9 @@ inherit_functions (program_t *from, uint32 inheritidx)
     {
         funflag_t  flags;
         int i2; /* The index of the real function */
+
+        if (compile_update_cancelled())
+            goto failed;
 
         flags = from->functions[i];
         fun_p->offset.inherit = inheritidx;
@@ -20322,6 +21500,7 @@ inherit_functions (program_t *from, uint32 inheritidx)
 
         /* Copy the function information */
         get_function_information(fun_p, from, i2);
+        copied++;
 
 
         /* Copy information about the types of the arguments, if it is
@@ -20339,7 +21518,8 @@ inherit_functions (program_t *from, uint32 inheritidx)
                 argindex = ARGTYPE_COUNT;
                 if (fun_p->num_arg)
                 {
-                    reserve_mem_block(A_ARGUMENT_TYPES, sizeof(A_ARGUMENT_TYPES_t) * fun_p->num_arg);
+                    if (!reserve_mem_block(A_ARGUMENT_TYPES, sizeof(A_ARGUMENT_TYPES_t) * fun_p->num_arg))
+                        goto failed;
                     for (int pos = 0; pos < fun_p->num_arg; pos++)
                         ADD_ARGUMENT_TYPE(ref_lpctype(from->types[from->argument_types[arg_type_idx+pos]]));
                 }
@@ -20354,11 +21534,25 @@ inherit_functions (program_t *from, uint32 inheritidx)
         /* Save the index where they started. Every function will have an
          * index where the type info of arguments starts.
          */
-        ADD_ARGUMENT_INDEX(argindex);
+        if (!add_to_mem_block(A_ARGUMENT_INDEX, &argindex, sizeof(argindex)))
+            goto failed;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        if (compile_update_test_fail(COMPILE_TEST_PRESSURE_INHERIT))
+            test_stack_gap_failure();
+#endif
 
     } /* for (inherited functions) pass 1 */
 
+    if (compile_update_cancelled())
+        goto failed;
     return true;
+
+failed:
+    /* The caller adopts the full block only on success. On failure make
+     * the partial function type references visible to epilog_free_all().
+     */
+    mem_block[A_FUNCTIONS].current_size += copied * sizeof(A_FUNCTIONS_t);
+    return false;
 }
 
 /*-------------------------------------------------------------------------*/
@@ -20375,6 +21569,9 @@ inherit_variable (variable_t *variable, funflag_t varmodifier, int redeclare)
 {
     ident_t *p;
 
+    if (compile_update_cancelled())
+        return false;
+
     p = make_global_identifier(get_txt(variable->name), I_TYPE_GLOBAL);
     if (!p)
         return false;
@@ -20385,8 +21582,9 @@ inherit_variable (variable_t *variable, funflag_t varmodifier, int redeclare)
     if (redeclare >= 0)
         redeclare_variable(p, vartype, VIRTUAL_VAR_TAG | redeclare);
     else
-        define_variable(p, vartype);
-    return true;
+        if (!define_variable(p, vartype))
+            return false;
+    return !compile_update_cancelled();
 
 } /* inherit_variable() */
 
@@ -21136,7 +22334,7 @@ inherit_virtual_variables (inherit_t *newinheritp, program_t *from, int first_fu
             if (inheritdup->inherit_duplicate)
                 continue; /* The original will come later. */
 
-            update_virtual_program(from
+            if (!update_virtual_program(from
                                   , newinheritp
                                   , inheritdup
                                   , last_variable_index - first_variable_index
@@ -21146,7 +22344,8 @@ inherit_virtual_variables (inherit_t *newinheritp, program_t *from, int first_fu
                                   , false
                                   , varmodifier
                                   , num_existing_inherits
-                                  );
+                                  ))
+                return false;
 
             found = true;
         }
@@ -21155,7 +22354,7 @@ inherit_virtual_variables (inherit_t *newinheritp, program_t *from, int first_fu
             /* Damn, we've inherited an old program.
              * We'll have to fix that one now.
              */
-            update_virtual_program(from
+            if (!update_virtual_program(from
                                   , inheritdup
                                   , newinheritp
                                   , last_inh_variable - first_inh_variable
@@ -21165,7 +22364,8 @@ inherit_virtual_variables (inherit_t *newinheritp, program_t *from, int first_fu
                                   , true
                                   , varmodifier
                                   , num_existing_inherits
-                                  );
+                                  ))
+                return false;
 
             /* Remember this, in case we meet some duplicates. */
             inheritorig = inheritdup;
@@ -21308,7 +22508,7 @@ inherit_program (program_t *from, funflag_t funmodifier, funflag_t varmodifier, 
                                                 * through the list. */
     uint32 first_func_index = FUNCTION_COUNT;  /* Index of the first inherited
                                                 * function. */
-    unsigned short* new_inherit_indices;       /* For each inherit entry in
+    unsigned short* new_inherit_indices = NULL; /* For each inherit entry in
                                                 * <from> remember the index
                                                 * in the current program.
                                                 */
@@ -21324,7 +22524,8 @@ inherit_program (program_t *from, funflag_t funmodifier, funflag_t varmodifier, 
      * so there wouldn't happen any reallocation and thus
      * no moving of our inherit entries later on.
      */
-    if (!RESERVE_INHERITS(INHERIT_COUNT + 2*from->num_inherited + 1))
+    if (compile_update_cancelled()
+     || !RESERVE_INHERITS(INHERIT_COUNT + 2*from->num_inherited + 1))
         return -1;
 
     /* For now, we mask out the INHERIT field in the flags and
@@ -21411,9 +22612,16 @@ inherit_program (program_t *from, funflag_t funmodifier, funflag_t varmodifier, 
 
     int inheritnum = from->num_inherited; /* Number of inherits.          */
     new_inherit_indices = xalloc(sizeof(*new_inherit_indices) * inheritnum);
+    if (!new_inherit_indices && inheritnum)
+    {
+        yyerror("Out of memory for inherit indices");
+        return -1;
+    }
 
     for (int inheritidx = 0; inheritidx < inheritnum; inheritidx++)
     {
+        if (compile_update_cancelled())
+            goto failed;
         inherit_t* inheritp = from->inherit + inheritidx;
         program_t* progp    = inheritp->prog;
 
@@ -21437,8 +22645,9 @@ inherit_program (program_t *from, funflag_t funmodifier, funflag_t varmodifier, 
 
         if (inheritp->inherit_mapped)
         {
-            if (!inheritp->inherit_duplicate)
-                inherit_obsoleted_variables(&newinherit, from, last_bound_variable, varmodifier);
+            if (!inheritp->inherit_duplicate
+             && !inherit_obsoleted_variables(&newinherit, from, last_bound_variable, varmodifier))
+                goto failed;
             newinherit.inherit_mapped = true;
             /* The corresponding updated_inherit entry will
              * be corrected in the loop below.
@@ -21451,9 +22660,10 @@ inherit_program (program_t *from, funflag_t funmodifier, funflag_t varmodifier, 
         {
             int next_bound_variable = inheritp->variable_index_offset + progp->num_variables - progp->num_virtual_variables;
 
-            inherit_virtual_variables(&newinherit, from,
+            if (!inherit_virtual_variables(&newinherit, from,
                 newinherit.function_index_offset - first_func_index,
-                inheritp->variable_index_offset, next_bound_variable, varmodifier, first_inh_index);
+                inheritp->variable_index_offset, next_bound_variable, varmodifier, first_inh_index))
+                goto failed;
 
             if (!inheritp->inherit_duplicate)
                 last_bound_variable = next_bound_variable;
@@ -21492,6 +22702,8 @@ inherit_program (program_t *from, funflag_t funmodifier, funflag_t varmodifier, 
      */
     for (int inheritidx = 0; inheritidx < inheritnum; inheritidx++)
     {
+        if (compile_update_cancelled())
+            goto failed;
         inherit_t *from_old_inheritp = from->inherit + inheritidx;
         inherit_t *cur_old_inheritp;
         int num_vars, num_funs;
@@ -21524,6 +22736,9 @@ inherit_program (program_t *from, funflag_t funmodifier, funflag_t varmodifier, 
     }
 
     xfree(new_inherit_indices);
+    new_inherit_indices = NULL;
+    if (compile_update_cancelled())
+        return -1;
 
     /* And now to something completely different, <from> itself. */
 
@@ -21548,8 +22763,9 @@ inherit_program (program_t *from, funflag_t funmodifier, funflag_t varmodifier, 
         frominherit.inherit_type = INHERIT_TYPE_VIRTUAL;
         frominherit.variable_index_offset = V_VARIABLE_COUNT;
 
-        inherit_virtual_variables(&frominherit, from, 0, last_bound_variable,
-            from->num_variables, varmodifier, first_inh_index);
+        if (!inherit_virtual_variables(&frominherit, from, 0, last_bound_variable,
+            from->num_variables, varmodifier, first_inh_index))
+            return -1;
     }
     else
     {
@@ -21558,7 +22774,7 @@ inherit_program (program_t *from, funflag_t funmodifier, funflag_t varmodifier, 
 
         for (int i = last_bound_variable; i < from->num_variables; i++)
             if (!inherit_variable(from->variables + i, varmodifier, -1))
-                break;
+                return -1;
     }
 
     /* Hey, we're done with the variables, now to the functions.
@@ -21584,6 +22800,8 @@ inherit_program (program_t *from, funflag_t funmodifier, funflag_t varmodifier, 
     fun_p = FUNCTION(first_func_index);
     for (int newix = 0; newix < from->num_functions; newix++)
     {
+        if (compile_update_cancelled())
+            return -1;
         int i = newix;                                 /* Index relative to the inherit
                                                         * Same as index into fun_p.
                                                         */
@@ -21638,6 +22856,8 @@ inherit_program (program_t *from, funflag_t funmodifier, funflag_t varmodifier, 
                 break;
 
             p = add_global_name(p);
+            if (!p)
+                goto failed;
             n = p->u.global.function;
 
             /* If the identifier is (also) an lfun, handle it, even if
@@ -21858,6 +23078,10 @@ inherit_program (program_t *from, funflag_t funmodifier, funflag_t varmodifier, 
 
     return initializer;
 
+failed:
+    xfree(new_inherit_indices);
+    return -1;
+
 } /* inherit_program() */
 
 /*-------------------------------------------------------------------------*/
@@ -22024,6 +23248,15 @@ store_include_info (char *name, char * filename, char delim, int depth)
 {
     mp_uint rc;
 
+    /* Reserve both transfers before acquiring local string references.
+     * A failed include is never represented by a plausible record index.
+     */
+    if (!reserve_mem_block(A_INCLUDES, sizeof(include_t))
+     || !reserve_mem_block(A_LINENUMBERS,
+            current_loc.line > stored_lines
+            ? (current_loc.line - stored_lines) / LI_MAXEMPTY + 2 : 1))
+        return INCLUDE_INFO_INVALID;
+
     /* Generate and store the plain include information */
     {
         include_t inc;
@@ -22039,6 +23272,7 @@ store_include_info (char *name, char * filename, char delim, int depth)
             if (tmp == NULL)
             {
                 yyerror("Out of stack memory: copy of filename");
+                return INCLUDE_INFO_INVALID;
             }
             else
             {
@@ -22051,8 +23285,8 @@ store_include_info (char *name, char * filename, char delim, int depth)
         inc.filename = new_unicode_tabled(filename);
         if (inc.filename == NULL)
         {
-            inc.filename = ref_mstring(STR_DEFAULT);
             yyerror("Out of memory: sharing include filename");
+            return INCLUDE_INFO_INVALID;
         }
 
         /* Surround the <name> with the delimiters, then
@@ -22062,7 +23296,9 @@ store_include_info (char *name, char * filename, char delim, int depth)
         tmp = alloca(len+3);
         if (tmp == NULL)
         {
+            free_mstring(inc.filename);
             yyerror("Out of stack memory: copy of name");
+            return INCLUDE_INFO_INVALID;
         }
         else
         {
@@ -22075,15 +23311,21 @@ store_include_info (char *name, char * filename, char delim, int depth)
             inc.name = new_unicode_tabled(tmp);
             if (inc.name == NULL)
             {
-                inc.name = ref_mstring(STR_DEFAULT);
+                free_mstring(inc.filename);
                 yyerror("Out of memory: sharing include name");
+                return INCLUDE_INFO_INVALID;
             }
         }
 
         /* Complete the structure and store it */
         inc.depth = depth;
         rc = INCLUDE_COUNT;
-        ADD_INCLUDE(&inc);
+        if (!add_to_mem_block(A_INCLUDES, &inc, sizeof(inc)))
+        {
+            free_mstring(inc.name);
+            free_mstring(inc.filename);
+            return INCLUDE_INFO_INVALID;
+        }
     }
 
     /* Store the information for the linenumber tracing */
@@ -22224,10 +23466,22 @@ get_simul_efun_index (string_t *name)
 {
     if (!pragma_no_simul_efuns)
     {
-        ident_t *id = make_shared_identifier_mstr(name, I_TYPE_UNKNOWN, 0);
+        ident_t *id;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        if (compile_update_test_fail(COMPILE_TEST_SETUP_IDENTIFIER))
+            id = NULL;
+        else
+#endif
+            id = make_shared_identifier_mstr(name, I_TYPE_UNKNOWN, 0);
 
         if (!id)
-            fatal("Out of memory: identifier '%s'.\n", get_txt(name));
+        {
+            if (!compile_update_is_active())
+                fatal("Out of memory: identifier '%s'.\n", get_txt(name));
+            compile_update_memory_failed();
+            yyerror("Out of memory for simul-efun identifier");
+            return -1;
+        }
 
         if (id->type != I_TYPE_UNKNOWN)
         {
@@ -22262,11 +23516,16 @@ prolog (const char * fname, Bool isMasterObj)
 {
     int i;
 
+    compiler_default_reset();
+    compiled_file = fname;
+
     /* Initialize the memory for the argument types */
     if (type_of_arguments.block == NULL)
     {
         type_of_arguments.max_size = 100;
         type_of_arguments.block = xalloc(type_of_arguments.max_size);
+        if (!type_of_arguments.block)
+            outofmemory("compiler argument type stack");
     }
     type_of_arguments.current_size = 0;
 
@@ -22292,17 +23551,35 @@ prolog (const char * fname, Bool isMasterObj)
 
     free_all_local_names();   /* In case of earlier error */
 
+    /* No area from a preceding compilation may remain an apparent owner
+     * while the new areas are only partly allocated.
+     */
+    memset(mem_block, 0, sizeof(mem_block));
+    local_variables = NULL;
+    context_variables = NULL;
+    case_state.free_block = NULL;
+    case_state.next_free = NULL;
+    if (compiler_file_state.active)
+        compiler_file_state.initialized = MY_TRUE;
+
     /* Initialize memory blocks where the result of the compilation
      * will be stored.
      */
     for (i = 0; i < NUMAREAS; i++)
     {
         mem_block[i].block = xalloc(START_BLOCK_SIZE);
+        if (!mem_block[i].block)
+            outofmemory("compiler memory area");
         mem_block[i].current_size = 0;
         mem_block[i].max_size = START_BLOCK_SIZE;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        if (i == 3 && compile_update_test_fail(COMPILE_TEST_PROLOG))
+            errorf("Injected compiler setup failure.\n");
+#endif
     }
 
-    extend_mem_block(A_LOCAL_VARIABLES, MAX_LOCAL * sizeof(A_LOCAL_VARIABLES_t));
+    if (!extend_mem_block(A_LOCAL_VARIABLES, MAX_LOCAL * sizeof(A_LOCAL_VARIABLES_t)))
+        outofmemory("compiler local variables");
     memset(&LOCAL_VARIABLE(0), 0, LOCAL_VARIABLE_COUNT * sizeof(A_LOCAL_VARIABLES_t));
 
     local_variables = &(LOCAL_VARIABLE(0));
@@ -22390,10 +23667,18 @@ epilog_cleanup (void)
  */
 
 {
+    compiler_default_reset();
 #ifdef DEBUG
     if (num_parse_error == 0 && type_of_arguments.current_size != 0)
         fatal("Failed to deallocate argument type stack\n");
 #endif
+
+    /* Reduced arguments transfer their types out of the parser stack.
+     * After an aborted list, its numeric semantic value owns no types;
+     * release the remaining entries here, after parser destruction.
+     */
+    while (type_of_arguments.current_size)
+        pop_arg_stack(1);
 
     if (last_string_constant)
     {
@@ -22442,7 +23727,61 @@ epilog_cleanup (void)
 
     remove_unknown_identifier();
 
+    if (compiler_file_state.active)
+        compiler_file_state.basic_cleaned = MY_TRUE;
+
 } /* epilog_cleanup() */
+
+/*-------------------------------------------------------------------------*/
+static void
+free_compiler_areas (void)
+
+/* Release raw storage after its references have been released or adopted. */
+
+{
+    for (int i = 0; i < NUMAREAS; i++)
+    {
+        xfree(mem_block[i].block);
+        memset(&mem_block[i], 0, sizeof(mem_block[i]));
+    }
+    local_variables = NULL;
+    context_variables = NULL;
+}
+
+static void
+clean_compiler_structs (void)
+
+/* Each stored definition owns one extra type reference for its scratch
+ * index. Remember progress independently of the program's struct refs.
+ */
+
+{
+    size_t i = compiler_file_state.active ? compiler_file_state.structs_cleaned : 0;
+    for (; i < STRUCT_COUNT; i++)
+    {
+        lpctype_t *type = STRUCT_DEF(i).type->name->lpctype;
+        clean_struct_type(type);
+        set_compiler_struct_index(type, USHRT_MAX);
+        free_lpctype(type);
+        if (compiler_file_state.active)
+            compiler_file_state.structs_cleaned = i + 1;
+    }
+}
+
+static void
+free_provisional_program (program_t *prog)
+
+/* Its copied fields still borrow all compiler-area references. */
+
+{
+    if (prog->name)
+        free_mstring(prog->name);
+    if (prog->line_numbers)
+        xfree(prog->line_numbers);
+    xfree(prog);
+    if (compiler_file_state.active)
+        compiler_file_state.provisional = NULL;
+}
 
 /*-------------------------------------------------------------------------*/
 static void
@@ -22477,6 +23816,12 @@ epilog_free_all (void)
                        , GET_BLOCK(A_STRUCT_DEFS)
                        );
 
+    /* An interrupted parse or a failed append may still own the regular
+     * variables separately from the virtual-variable area.
+     */
+    do_free_sub_strings(0, NULL, NV_VARIABLE_COUNT, GET_BLOCK(A_VARIABLES),
+                        0, NULL, 0, NULL);
+
     /* Free the type information */
     for (size_t i = 0; i < PROG_TYPE_COUNT; i++)
         free_lpctype(PROG_TYPE(i));
@@ -22510,11 +23855,7 @@ epilog_free_all (void)
 
     compiled_prog = NULL;
 
-    for (int i = 0; i < NUMAREAS; i++)
-        xfree(mem_block[i].block);
-
-    local_variables = NULL;
-    context_variables = NULL;
+    free_compiler_areas();
     return;
 } /* epilog_free_all() */
 
@@ -22540,6 +23881,9 @@ epilog (void)
     mp_int       num_function_names;
     program_t   *prog;
 
+    if (compile_update_cancelled())
+        goto canceled;
+
     /* If the parse was successful, Make sure that all structs are defined and
      * reactivate old structs where possible.
      * If an error occurs, num_parse_error is incremented and epilog() will
@@ -22561,12 +23905,12 @@ epilog (void)
         yyerror("Too many virtual variables");
     }
 
-    add_to_mem_block(
+    if (add_to_mem_block(
         A_VIRTUAL_VAR,
         mem_block[A_VARIABLES].block,
         mem_block[A_VARIABLES].current_size
-    );
-    mem_block[A_VARIABLES].current_size = 0;
+    ))
+        mem_block[A_VARIABLES].current_size = 0;
 
     /* Define the __INIT function, but only if there was any code
      * to initialize.
@@ -22597,6 +23941,9 @@ epilog (void)
     } /* if (has initializer) */
 
     epilog_cleanup();
+
+    if (compile_update_cancelled())
+        goto canceled;
 
     /* Check the string block. We don't have to count the include file names
      * as those won't be accessed from the program code.
@@ -22782,6 +24129,9 @@ epilog (void)
              * the function's flags.
              */
             flags = f->flags;
+#ifdef USE_BLUEPRINT_UPDATE
+            add_to_mem_block(A_SCHEMA_FUNCTION_FLAGS, &flags, sizeof(flags));
+#endif
             f->flags = flags & NAME_INHERITED ?
               (flags & ~INHERIT_MASK)  | (f->offset.inherit & INHERIT_MASK) :
               (flags & ~FUNSTART_MASK) | (f->offset.pc & FUNSTART_MASK);
@@ -22944,9 +24294,13 @@ epilog (void)
     } /* if (parse successful) */
 
     /* Save argument types into A_TYPES. */
+    if (compile_update_cancelled())
+        goto canceled;
     if (pragma_save_types)
     {
-        extend_mem_block(A_ARGUMENT_TYPE_INDEX, ARGTYPE_COUNT * sizeof(A_ARGUMENT_TYPE_INDEX_t));
+        if (!extend_mem_block(A_ARGUMENT_TYPE_INDEX,
+                              ARGTYPE_COUNT * sizeof(A_ARGUMENT_TYPE_INDEX_t)))
+            goto canceled;
         for (i = 0; i < ARGTYPE_COUNT; i++)
             ARGUMENT_TYPE_INDEX(i) = get_type_index(ARGUMENT_TYPE(i));
     }
@@ -22962,13 +24316,7 @@ epilog (void)
     /* Remove the concrete struct definition from the lpctype object
      * and free the reference we took.
      */
-    for (i = 0; (size_t)i < STRUCT_COUNT; i++)
-    {
-        lpctype_t *t = STRUCT_DEF(i).type->name->lpctype;
-        clean_struct_type(t);
-        t->t_struct.def_idx = USHRT_MAX;
-        free_lpctype(t);
-    }
+    clean_compiler_structs();
 
     /* Now create the program structure */
     switch (0) { default:
@@ -23012,6 +24360,10 @@ epilog (void)
 }
 #endif /* 0 */
 
+#ifdef USE_BLUEPRINT_UPDATE
+        if (schema_generation == PINT_MAX)
+            yyerror("Blueprint schema generation identifiers exhausted");
+#endif
         /* On error, don't create anything */
         if (num_parse_error > 0 || inherit_file)
             break;
@@ -23020,6 +24372,8 @@ epilog (void)
          * Right now, we allocate everything in one block.
          */
 
+        if (!compiler_default_pack())
+            goto canceled;
         size = align(sizeof (program_t));
 
         for (i = 0; i< NUMPAREAS; i++)
@@ -23034,6 +24388,8 @@ epilog (void)
         size += align(num_lwo_calls * sizeof *prog->lwo_call_cache);
 
         /* Get the program structure */
+        if (compile_update_cancelled())
+            goto canceled;
         if ( !(p = xalloc(size)) )
         {
             yyerrorf("Out of memory: program structure (%"PRIdPINT" bytes)", 
@@ -23043,15 +24399,23 @@ epilog (void)
 
         prog = (program_t *)p;
         *prog = NULL_program;
+        if (compiler_file_state.active)
+            compiler_file_state.provisional = prog;
 
         /* Set up the program structure */
         if ( !(prog->name = new_unicode_tabled(current_loc.file->name)) )
         {
-            xfree(prog);
+            free_provisional_program(prog);
             yyerrorf("Out of memory: filename '%s'", current_loc.file->name);
             break;
         }
         prog->blueprint = NULL;
+        if (compile_update_cancelled())
+            goto canceled;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        if (compile_update_test_fail(COMPILE_TEST_PROVISIONAL))
+            errorf("Injected provisional program failure.\n");
+#endif
         prog->total_size = size;
         prog->ref = 0;
         prog->heart_beat = heart_beat;
@@ -23067,10 +24431,11 @@ epilog (void)
                     | (uses_non_lightweight_efuns ? P_USE_NONLW_EFUNS : 0)
                     ;
 
+#ifdef USE_BLUEPRINT_UPDATE
+        prog->schema_generation = ++schema_generation;
+#endif
         prog->load_time = current_time;
 
-        total_prog_block_size += prog->total_size + mstrsize(prog->name);
-        total_num_prog_blocks += 1;
         p += align(sizeof (program_t));
 
         /* Add the program code
@@ -23255,6 +24620,28 @@ epilog (void)
             prog->type_start = NULL;
         }
 
+#ifdef USE_BLUEPRINT_UPDATE
+        prog->schema_function_flags = (A_SCHEMA_FUNCTION_FLAGS_t *)p;
+        /* The last scalar entry may leave pointer-alignment padding. */
+        memset(p, 0, align(mem_block[A_SCHEMA_FUNCTION_FLAGS].current_size));
+        if (mem_block[A_SCHEMA_FUNCTION_FLAGS].current_size)
+            memcpy(p, mem_block[A_SCHEMA_FUNCTION_FLAGS].block,
+                      mem_block[A_SCHEMA_FUNCTION_FLAGS].current_size);
+        p += align(mem_block[A_SCHEMA_FUNCTION_FLAGS].current_size);
+        prog->num_schema_arguments = GET_BLOCK_COUNT(A_SCHEMA_ARGUMENTS);
+        if (prog->num_schema_arguments)
+        {
+            prog->schema_arguments = (A_SCHEMA_ARGUMENTS_t *)p;
+            memcpy(p, mem_block[A_SCHEMA_ARGUMENTS].block,
+                      mem_block[A_SCHEMA_ARGUMENTS].current_size);
+            p += align(mem_block[A_SCHEMA_ARGUMENTS].current_size);
+        }
+        prog->schema_defaults = p;
+        prog->schema_defaults_size = mem_block[A_SCHEMA_DEFAULTS].current_size;
+        memcpy(p, mem_block[A_SCHEMA_DEFAULTS].block, prog->schema_defaults_size);
+        p += align(prog->schema_defaults_size);
+#endif
+
         /* Add the lightweight object call cache.
          */
         if (num_lwo_calls)
@@ -23278,20 +24665,20 @@ epilog (void)
 
             if ( !(prog->line_numbers = xalloc(linenumber_size)) )
             {
-                total_prog_block_size -= prog->total_size + mstrsize(prog->name)+1;
-                total_num_prog_blocks -= 1;
-                xfree(prog);
+                free_provisional_program(prog);
                 yyerrorf("Out of memory: linenumber structure (%zu bytes)"
                         , linenumber_size);
                 break;
             }
-            total_prog_block_size += linenumber_size;
             prog->line_numbers->size = linenumber_size;
             if (mem_block[A_LINENUMBERS].current_size)
                 memcpy( prog->line_numbers->line_numbers
                       , mem_block[A_LINENUMBERS].block
                       , mem_block[A_LINENUMBERS].current_size);
         }
+
+        if (compile_update_cancelled())
+            goto canceled;
 
         /* Correct the variable index offsets */
         fix_variable_index_offsets(prog);
@@ -23307,14 +24694,6 @@ epilog (void)
             if ( (f->flags & (NAME_INHERITED)))
                 free_lpctype(f->type);
 
-        for (i = 0; i < NUMAREAS; i++)
-        {
-            xfree(mem_block[i].block);
-        }
-
-        local_variables = NULL;
-        context_variables = NULL;
-
         /* Reference the program and all inherits, but avoid multiple
          * referencing when an object inherits more than one object
          * and one of the inherited is already loaded and not the
@@ -23326,14 +24705,41 @@ epilog (void)
             reference_prog(prog->inherit[i].prog, "inheritance");
         }
 
-        /* Return the value */
+        total_prog_block_size += prog->total_size + mstrsize(prog->name)
+                              + prog->line_numbers->size;
+        total_num_prog_blocks++;
+
+        /* Adopt all copied references before releasing any raw compiler
+         * storage. Abort thereafter frees a whole program exactly once.
+         */
         compiled_prog = prog;
+        if (compiler_file_state.active)
+        {
+            compiler_file_state.provisional = NULL;
+            compiler_file_state.adopted = MY_TRUE;
+        }
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        if (compile_update_test_fail(COMPILE_TEST_ADOPTED))
+            errorf("Injected adopted program failure.\n");
+#endif
+        free_compiler_areas();
         return;
     }
 
     /* If we come here, the program couldn't be created - just
      * free all memory.
      */
+    epilog_free_all();
+    return;
+
+canceled:
+    if (!num_parse_error)
+        num_parse_error = 1;
+    if (!compiler_file_state.basic_cleaned)
+        epilog_cleanup();
+    clean_compiler_structs();
+    if (compiler_file_state.provisional)
+        free_provisional_program(compiler_file_state.provisional);
     epilog_free_all();
 
 } /* epilog() */
@@ -23419,6 +24825,8 @@ epilog_closure (int num_args)
         GET_BLOCK_SIZE(A_LAMBDA_VALUES) = 0;
         GET_BLOCK_SIZE(A_LAMBDA_VALUES_NEXT) = 0;
 
+        closure_register_dependencies(&l->base, CLOSURE_LAMBDA);
+
         break;
     }
 
@@ -23436,7 +24844,7 @@ epilog_closure (int num_args)
 
         t = LAMBDA_STRUCT(i).type->name->lpctype;
         clean_struct_type(t);
-        t->t_struct.def_idx = USHRT_MAX;
+        set_compiler_struct_index(t, USHRT_MAX);
         free_lpctype(t);
     }
 
@@ -23447,21 +24855,78 @@ epilog_closure (int num_args)
 
 /*-------------------------------------------------------------------------*/
 void
-compile_file (int fd, const char * fname,  Bool isMasterObj)
+abort_compile_file_context (void)
+
+/* Release a private compiler's registered owners before clear_state()
+ * invalidates diagnostic locations and pops the enclosing context handler.
+ * Semantic actions return normally on expected allocation failures; this
+ * handles native exceptions at the explicitly owned preparation stages.
+ */
+
+{
+    if (!compiler_file_state.active)
+        return;
+
+    if (compiler_file_state.initialized)
+    {
+        if (compiler_file_state.adopted)
+            free_compiler_areas();
+        else
+        {
+            if (!num_parse_error)
+                num_parse_error = 1;
+            if (!compiler_file_state.basic_cleaned)
+                epilog_cleanup();
+            clean_compiler_structs();
+            if (compiler_file_state.provisional)
+                free_provisional_program(compiler_file_state.provisional);
+            epilog_free_all();
+        }
+        compiler_file_state.initialized = MY_FALSE;
+    }
+    if (compiler_file_state.lexer_started)
+    {
+        end_new_file();
+        compiler_file_state.lexer_started = MY_FALSE;
+    }
+    compiler_type_context = NULL;
+    compiler_file_state.active = MY_FALSE;
+} /* abort_compile_file_context() */
+
+void
+compile_file_context (int fd, const char *fname, Bool isMasterObj,
+                      lpctype_context_t *context)
 
 /* Compile an LPC file. See the head comment for instructions.
  */
 
 {
+    assert(!compiler_file_state.active);
+    memset(&compiler_file_state, 0, sizeof(compiler_file_state));
+    compiler_file_state.active = context != NULL;
+    compiler_type_context = context;
     prolog(fname, isMasterObj);
+    compiler_file_state.lexer_started = compiler_file_state.active;
     start_new_file(fd, fname);
     pragma_no_simul_efuns = isMasterObj;
     yyparse();
     /* If the parse failed, either num_parse_error != 0
      * or inherit_file != NULL here.
      */
+    if (compile_update_cancelled() && !num_parse_error)
+        num_parse_error = 1;
     epilog();
+    compiler_file_state.initialized = MY_FALSE;
     end_new_file();
+    compiler_file_state.lexer_started = MY_FALSE;
+    compiler_type_context = NULL;
+    compiler_file_state.active = MY_FALSE;
+} /* compile_file_context() */
+
+void
+compile_file (int fd, const char *fname, Bool isMasterObj)
+{
+    compile_file_context(fd, fname, isMasterObj, NULL);
 } /* compile_file() */
 
 /*-------------------------------------------------------------------------*/

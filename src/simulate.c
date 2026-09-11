@@ -58,6 +58,7 @@
 #include "mregex.h"
 #include "mstrings.h"
 #include "object.h"
+#include "program_update.h"
 #include "otable.h"
 #ifdef USE_TLS
 #include "pkg-tls.h"
@@ -1117,6 +1118,12 @@ errorf (const char *fmt, ...)
 
     if (do_save_error)
     {
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        /* Deferred native compilation has no current_prog. Secure LPC
+         * hooks suspend the guard before entering this reporting path.
+         */
+        assert(!get_stack_gap_guard());
+#endif
         save_error(emsg_buf, get_txt(file), line_number);
     }
 
@@ -1151,6 +1158,7 @@ errorf (const char *fmt, ...)
         int a;
         object_t *save_cmd;
         object_t *culprit = NULL;
+        stack_gap_guard_t *native_guard;
 
 
         if (!published_catch)
@@ -1203,7 +1211,13 @@ errorf (const char *fmt, ...)
         a++;
 
         save_cmd = command_giver;
+        /* Native compiler recovery may have restored its release guard
+         * while reset_machine() popped the compiler handler. Error-report
+         * hooks run ordinary LPC and must never inherit that guard.
+         */
+        native_guard = set_stack_gap_guard(NULL);
         apply_master(STR_RUNTIME, a);
+        set_stack_gap_guard(native_guard);
         command_giver = save_cmd;
 
         if (culprit)
@@ -1229,7 +1243,9 @@ errorf (const char *fmt, ...)
             push_number(inter_sp, error_caught ? 1 : 0);
             a++;
 
+            native_guard = set_stack_gap_guard(NULL);
             svp = apply_master(STR_HEART_ERROR, a);
+            set_stack_gap_guard(native_guard);
             command_giver = save_cmd;
             if (svp && (svp->type != T_NUMBER || svp->u.number) )
             {
@@ -1837,12 +1853,44 @@ typedef struct compile_check_context_s
     compile_check_diag_t *diag;
     size_t num_diag;
     size_t max_diag;
+    size_t diagnostic_bytes;
     compile_check_program_t *programs;
     size_t num_programs;
     size_t max_programs;
+    program_t *expected; /* Borrowed from the globally rooted update request. */
+    lpctype_context_t types;
+    Bool callback_failed;
+    Bool resource_failed;
+    compile_check_diag_t emergency; /* Reserved before entering the parser. */
+    stack_gap_guard_t *guard;       /* Borrowed from the rooted native owner. */
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    int test_failure;
+    int test_countdown;
+#endif
 } compile_check_context_t;
 
 static compile_check_context_t *active_compile_check_context;
+
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+bool
+compile_update_test_fail (int point)
+{
+    if (active_compile_check_context
+     && active_compile_check_context->guard
+     && get_stack_gap_guard() == active_compile_check_context->guard
+     && active_compile_check_context->test_failure == point)
+    {
+        if (active_compile_check_context->test_countdown > 0)
+        {
+            active_compile_check_context->test_countdown--;
+            return false;
+        }
+        active_compile_check_context->test_failure = 0;
+        return true;
+    }
+    return false;
+}
+#endif
 
 typedef struct compile_check_cleanup_s
 {
@@ -1863,6 +1911,163 @@ compile_check_is_active (void)
 {
     return active_compile_check_context != NULL;
 } /* compile_check_is_active() */
+
+/*-------------------------------------------------------------------------*/
+bool
+compile_update_is_active (void)
+{
+    return active_compile_check_context && active_compile_check_context->expected;
+}
+
+bool
+compile_update_cancelled (void)
+
+/* Checkpoints finish local transfers and return through normal parser
+ * cleanup. This is not permission to continue arbitrary compiler work.
+ */
+
+{
+    compile_check_context_t *ctx = active_compile_check_context;
+    if (!ctx || !ctx->expected)
+        return false;
+    if (get_stack_gap_guard() == ctx->guard)
+        assert_stack_gap();
+    if (stack_gap_guard_failed())
+        ctx->resource_failed = MY_TRUE;
+    return ctx->resource_failed || ctx->callback_failed || ctx->types.failed;
+}
+
+void
+compile_update_memory_failed (void)
+{
+    if (compile_update_is_active())
+        active_compile_check_context->resource_failed = MY_TRUE;
+}
+
+void
+compile_push_c_n_string (const char *text, size_t length)
+
+/* Publish only initialized VM slots. A failed argument becomes zero and
+ * the following compiler hook wrapper discards the whole argument list.
+ */
+
+{
+    string_t *string;
+    if (!compile_update_is_active())
+    {
+        push_c_n_string(inter_sp, text, length);
+        return;
+    }
+    if (compile_update_cancelled())
+    {
+        push_number(inter_sp, 0);
+        return;
+    }
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (compile_update_test_fail(COMPILE_TEST_HOOK_ARGUMENT))
+        string = NULL;
+    else
+#endif
+        string = new_n_unicode_mstring(text, length);
+    if (!string)
+    {
+        active_compile_check_context->resource_failed = MY_TRUE;
+        push_number(inter_sp, 0);
+        return;
+    }
+    push_string(inter_sp, string);
+}
+
+void
+compile_push_c_string (const char *text)
+{
+    compile_push_c_n_string(text, strlen(text));
+}
+
+svalue_t *
+compile_apply_master (string_t *function, int num_arg)
+{
+    svalue_t *result;
+    stack_gap_guard_t *guard;
+    if (compile_update_is_active()
+     && (!master_ob || (master_ob->flags & O_DESTRUCTED)))
+        compile_update_callback_failed();
+    if (compile_update_cancelled())
+    {
+        inter_sp = pop_n_elems(num_arg, inter_sp);
+        return NULL;
+    }
+    guard = set_stack_gap_guard(NULL);
+    result = apply_master(function, num_arg);
+    set_stack_gap_guard(guard);
+#ifdef USE_BLUEPRINT_UPDATE
+    if (compile_update_is_active() && !program_update_compilation_valid())
+        compile_update_callback_failed();
+#endif
+    return result;
+}
+
+svalue_t *
+compile_apply_lambda (svalue_t *closure, int num_arg, svalue_t *bind_ob)
+{
+    svalue_t *result;
+    stack_gap_guard_t *guard;
+    if (compile_update_cancelled())
+    {
+        inter_sp = pop_n_elems(num_arg, inter_sp);
+        return NULL;
+    }
+    guard = set_stack_gap_guard(NULL);
+    result = secure_apply_lambda_ob(closure, num_arg, bind_ob);
+    set_stack_gap_guard(guard);
+    if (!result)
+        compile_update_callback_failed();
+#ifdef USE_BLUEPRINT_UPDATE
+    if (compile_update_is_active() && !program_update_compilation_valid())
+        compile_update_callback_failed();
+#endif
+    return result;
+}
+
+void
+compile_update_callback_failed (void)
+
+/* Called only for an error escaping a secure compiler/master callback.
+ * Do not allocate or reenter LPC from an error recovery path.
+ */
+
+{
+    if (compile_update_is_active())
+        active_compile_check_context->callback_failed = MY_TRUE;
+}
+
+program_t *
+compile_update_find_program (string_t *name)
+
+/* Resolve only programs in the exact captured source graph. A name shared
+ * by different generations is ambiguous; never select an ambient object.
+ * The expected root independently owns every parent throughout hooks.
+ */
+
+{
+    program_t *expected = active_compile_check_context->expected;
+    program_t *found = NULL;
+    const char *normalized = make_name_sane(get_txt(name), false, true);
+    size_t i;
+    if (!normalized)
+        return NULL;
+    for (i = 0; i < expected->num_inherited; i++)
+    {
+        program_t *parent = expected->inherit[i].prog;
+        if (!strcmp(get_txt(parent->name), normalized))
+        {
+            if (found && found != parent)
+                return NULL;
+            found = parent;
+        }
+    }
+    return found;
+} /* compile_update_find_program() */
 
 /*-------------------------------------------------------------------------*/
 static const char *compile_check_diag_filename(const char *fname);
@@ -1968,9 +2173,31 @@ compile_check_add_diag (compile_check_context_t *ctx, const char *file
     const char *file_text;
     const char *message_text;
 
+    if (ctx->expected && ctx->resource_failed)
+        return;
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (compile_update_test_fail(COMPILE_TEST_PRESSURE_DIAGNOSTIC))
+        test_stack_gap_failure();
+    if (compile_update_test_fail(COMPILE_TEST_DIAGNOSTIC))
+        goto resource_failure;
+#endif
     file_text = file != NULL ? file : "";
     message_text = message != NULL ? message : "";
 
+#ifdef USE_BLUEPRINT_UPDATE
+    if (ctx->expected)
+    {
+        size_t bytes = strlen(file_text) + strlen(message_text);
+        if (ctx->num_diag == BLUEPRINT_UPDATE_MAX_DIAGNOSTICS
+         || bytes > BLUEPRINT_UPDATE_MAX_DIAGNOSTIC_BYTES - ctx->diagnostic_bytes)
+        {
+            program_update_compile_failure("COMPILE_DIAGNOSTIC_LIMIT",
+                "Compiler diagnostic limit exceeded; evidence is incomplete.");
+            goto resource_failure;
+        }
+        ctx->diagnostic_bytes += bytes;
+    }
+#endif
     if (ctx->num_diag == ctx->max_diag)
     {
         size_t new_max;
@@ -1979,12 +2206,20 @@ compile_check_add_diag (compile_check_context_t *ctx, const char *file
         new_max = ctx->max_diag ? 2 * ctx->max_diag : 4;
         if (new_max <= ctx->max_diag
          || new_max > (size_t)-1 / sizeof(*ctx->diag))
+        {
+            if (ctx->expected)
+                goto resource_failure;
             outofmem(sizeof(*ctx->diag), "compile check diagnostics");
+        }
 
         new_size = new_max * sizeof(*ctx->diag);
         new_diag = rexalloc(ctx->diag, new_size);
         if (new_diag == NULL)
+        {
+            if (ctx->expected)
+                goto resource_failure;
             outofmem(new_size, "compile check diagnostics");
+        }
 
         ctx->diag = new_diag;
         ctx->max_diag = new_max;
@@ -1992,12 +2227,18 @@ compile_check_add_diag (compile_check_context_t *ctx, const char *file
 
     file_str = new_unicode_mstring(file_text);
     if (file_str == NULL)
+    {
+        if (ctx->expected)
+            goto resource_failure;
         outofmem(strlen(file_text), "compile check diagnostic file");
+    }
 
     message_str = new_unicode_mstring(message_text);
     if (message_str == NULL)
     {
         free_mstring(file_str);
+        if (ctx->expected)
+            goto resource_failure;
         outofmem(strlen(message_text), "compile check diagnostic message");
     }
 
@@ -2006,6 +2247,12 @@ compile_check_add_diag (compile_check_context_t *ctx, const char *file
     ctx->diag[ctx->num_diag].warning = warning;
     ctx->diag[ctx->num_diag].message = message_str;
     ctx->num_diag++;
+    return;
+
+resource_failure:
+    /* The emergency record is already owned by ctx. No diagnostic allocation
+     * may unwind a partially executed semantic action. */
+    ctx->resource_failed = MY_TRUE;
 } /* compile_check_add_diag() */
 
 /*-------------------------------------------------------------------------*/
@@ -2028,6 +2275,35 @@ compile_check_record_diagnostic (Bool warning, const char *file, int line
         what = "";
     if (context == NULL)
         context = "";
+
+    if (active_compile_check_context->expected && *context == '\0')
+    {
+        /* The source-aware renderer already bounds and terminates this
+         * message. Copy it directly so a second, smaller buffer cannot
+         * turn a long warning into a candidate compilation failure.
+         * The collector still enforces the aggregate diagnostic budget.
+         */
+        diag_file = file ? compile_check_diag_source_filename(file) : NULL;
+        compile_check_add_diag(active_compile_check_context, diag_file, line,
+                               warning, what);
+        return;
+    }
+
+    if (active_compile_check_context->expected)
+    {
+        char bounded_message[8192];
+        int length = snprintf(bounded_message, sizeof(bounded_message),
+                              "%s%s", what, context);
+        if (length < 0 || (size_t)length >= sizeof(bounded_message))
+        {
+            active_compile_check_context->resource_failed = MY_TRUE;
+            return;
+        }
+        diag_file = file ? compile_check_diag_source_filename(file) : NULL;
+        compile_check_add_diag(active_compile_check_context, diag_file, line,
+                               warning, bounded_message);
+        return;
+    }
 
     what_len = strlen(what);
     context_len = strlen(context);
@@ -2176,6 +2452,11 @@ compile_check_free (compile_check_context_t *ctx)
 
     if (ctx->diag != NULL)
         xfree(ctx->diag);
+    if (ctx->emergency.file)
+        free_mstring(ctx->emergency.file);
+    if (ctx->emergency.message)
+        free_mstring(ctx->emergency.message);
+    memset(&ctx->emergency, 0, sizeof(ctx->emergency));
 
     ctx->diag = NULL;
     ctx->num_diag = 0;
@@ -2211,11 +2492,14 @@ compile_check_cleanup (error_handler_t *arg)
 {
     compile_check_cleanup_t *cleanup = (compile_check_cleanup_t *)arg;
 
-    compile_check_restore_active_context(cleanup);
-
     if (cleanup->compiler_started)
     {
-        if (current_loc.file != NULL)
+        if (cleanup->ctx.expected)
+        {
+            set_stack_gap_guard(cleanup->ctx.guard);
+            abort_compile_file_context();
+        }
+        else if (current_loc.file != NULL)
             end_new_file();
 
         total_lines = 0;
@@ -2233,12 +2517,22 @@ compile_check_cleanup (error_handler_t *arg)
         }
     }
 
+    compile_check_restore_active_context(cleanup);
+
     if (cleanup->fd >= 0)
     {
         (void)close(cleanup->fd);
         cleanup->fd = -1;
     }
 
+    free_lpctype_context(&cleanup->ctx.types);
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (cleanup->ctx.test_failure == COMPILE_TEST_PRESSURE_CLEANUP)
+    {
+        cleanup->ctx.test_failure = 0;
+        test_stack_gap_failure();
+    }
+#endif
     compile_check_free(&cleanup->ctx);
     xfree(cleanup);
 } /* compile_check_cleanup() */
@@ -2260,9 +2554,21 @@ push_compile_check_cleanup (void)
     cleanup->ctx.diag = NULL;
     cleanup->ctx.num_diag = 0;
     cleanup->ctx.max_diag = 0;
+    cleanup->ctx.diagnostic_bytes = 0;
     cleanup->ctx.programs = NULL;
     cleanup->ctx.num_programs = 0;
     cleanup->ctx.max_programs = 0;
+    cleanup->ctx.expected = NULL;
+    cleanup->ctx.types.entries = NULL;
+    cleanup->ctx.types.failed = MY_FALSE;
+    cleanup->ctx.callback_failed = MY_FALSE;
+    cleanup->ctx.resource_failed = MY_FALSE;
+    cleanup->ctx.guard = get_stack_gap_guard();
+    memset(&cleanup->ctx.emergency, 0, sizeof(cleanup->ctx.emergency));
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    cleanup->ctx.test_failure = 0;
+    cleanup->ctx.test_countdown = 0;
+#endif
     cleanup->previous_active_context = NULL;
     cleanup->fd = -1;
     cleanup->compiler_started = MY_FALSE;
@@ -2288,6 +2594,7 @@ dry_compile_object_file (const char *lname, compile_check_cleanup_t *cleanup
     char *fname;
     compile_check_context_t *ctx = &cleanup->ctx;
     compile_check_program_t *program_entry = NULL;
+    size_t program_index = 0;
     Bool program_entry_activated = MY_FALSE;
     Bool ok = MY_FALSE;
 
@@ -2337,6 +2644,7 @@ dry_compile_object_file (const char *lname, compile_check_cleanup_t *cleanup
     else
         program_entry = compile_check_add_program_entry(ctx, name);
 
+    program_index = program_entry - ctx->programs;
     program_entry->active = MY_TRUE;
     program_entry_activated = MY_TRUE;
 
@@ -2380,7 +2688,8 @@ dry_compile_object_file (const char *lname, compile_check_cleanup_t *cleanup
         cleanup->previous_active_context = active_compile_check_context;
         cleanup->active_context_set = MY_TRUE;
         active_compile_check_context = ctx;
-        compile_file(cleanup->fd, fname, MY_FALSE);
+        compile_file_context(cleanup->fd, fname, MY_FALSE,
+                             ctx->expected ? &ctx->types : NULL);
         compile_check_restore_active_context(cleanup);
 
         update_compile_av(total_lines);
@@ -2452,7 +2761,8 @@ dry_compile_object_file (const char *lname, compile_check_cleanup_t *cleanup
             continue;
         }
 
-        if (num_parse_error > 0)
+        if (num_parse_error > 0 || ctx->callback_failed || ctx->resource_failed
+         || ctx->types.failed)
             goto cleanup;
 
         if (compiled_prog == NULL)
@@ -2463,7 +2773,7 @@ dry_compile_object_file (const char *lname, compile_check_cleanup_t *cleanup
             goto cleanup;
         }
 
-        program_entry->prog = compiled_prog;
+        ctx->programs[program_index].prog = compiled_prog;
         compiled_prog = NULL;
         ok = MY_TRUE;
         break;
@@ -2471,7 +2781,7 @@ dry_compile_object_file (const char *lname, compile_check_cleanup_t *cleanup
 
 cleanup:
     if (program_entry_activated)
-        program_entry->active = MY_FALSE;
+        ctx->programs[program_index].active = MY_FALSE;
 
     if (cleanup->fd >= 0)
     {
@@ -2499,6 +2809,138 @@ cleanup:
 
     return ok;
 } /* dry_compile_object_file() */
+
+#ifdef USE_BLUEPRINT_UPDATE
+/*-------------------------------------------------------------------------*/
+void
+compile_update_candidate (string_t *origin, program_t *expected, program_t **result)
+
+/* Compile one source file without object registration or type publication.
+ * The caller roots expected independently. Transfer the successful program
+ * into the caller's independently rooted slot before disposing the context.
+ */
+
+{
+    compile_check_cleanup_t *cleanup = push_compile_check_cleanup();
+    assert(*result == NULL);
+    cleanup->ctx.expected = expected;
+    cleanup->ctx.emergency.file = ref_mstring(origin);
+    cleanup->ctx.emergency.message = new_unicode_mstring(
+        "Insufficient resources while compiling update candidate.");
+    if (!cleanup->ctx.emergency.message)
+        outofmemory("reserved update compiler diagnostic");
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+    if (!strcmp(get_txt(origin), "/defaults_target"))
+    {
+        FILE *input = fopen("defaults-compiler-fault", "r");
+        if (input)
+        {
+            int point, countdown;
+            if (fscanf(input, "%d %d", &point, &countdown) == 2
+             && point >= COMPILE_TEST_DEFAULT_CAPTURE && point <= COMPILE_TEST_DEFAULT_PACK
+             && countdown >= 0)
+            {
+                cleanup->ctx.test_failure = point;
+                cleanup->ctx.test_countdown = countdown;
+            }
+            fclose(input);
+        }
+    }
+    if (access("staging_fault_diagnostic", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_DIAGNOSTIC;
+    if (access("staging_fault_type_context", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_TYPE_CONTEXT;
+    if (access("staging_fault_prolog", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_PROLOG;
+    if (access("staging_fault_provisional", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_PROVISIONAL;
+    if (access("staging_fault_adopted", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_ADOPTED;
+    if (access("staging_fault_type_allocation", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_TYPE_ALLOCATION;
+    if (access("staging_fault_source_name", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_SOURCE_NAME;
+    if (access("staging_fault_include_input", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_INCLUDE_INPUT;
+    if (access("staging_fault_pressure_diagnostic", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_PRESSURE_DIAGNOSTIC;
+    if (access("staging_fault_pressure_inherit", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_PRESSURE_INHERIT;
+    if (access("staging_fault_preprocessor_string", F_OK) == 0)
+    {
+        cleanup->ctx.test_failure = COMPILE_TEST_PREPROCESSOR_STRING;
+        cleanup->ctx.test_countdown = 1;
+    }
+    if (access("staging_fault_preprocessor_append", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_PREPROCESSOR_APPEND;
+    if (access("staging_fault_hook_argument", F_OK) == 0)
+    {
+        cleanup->ctx.test_failure = COMPILE_TEST_HOOK_ARGUMENT;
+        cleanup->ctx.test_countdown = 1;
+    }
+    if (access("staging_fault_pressure_struct_init", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_PRESSURE_STRUCT_INIT;
+    if (access("staging_fault_pressure_cleanup", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_PRESSURE_CLEANUP;
+    if (access("staging_fault_function_storage", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_FUNCTION_STORAGE;
+    if (access("staging_fault_variable_storage", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_VARIABLE_STORAGE;
+    if (access("staging_fault_type_storage", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_TYPE_STORAGE;
+    if (access("staging_fault_argument_storage", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_ARGUMENT_STORAGE;
+    if (access("staging_fault_shadow_storage", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_SHADOW_STORAGE;
+    if (access("staging_fault_local_identifier", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_LOCAL_IDENTIFIER;
+    if (access("staging_fault_local_debug", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_LOCAL_DEBUG;
+    if (access("staging_fault_struct_member", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_STRUCT_MEMBER;
+    if (access("staging_fault_inline_storage", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_INLINE_STORAGE;
+    if (access("staging_fault_struct_name", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_STRUCT_NAME;
+    if (access("staging_fault_argument_stack", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_ARGUMENT_STACK;
+    if (access("staging_fault_inline_locals", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_INLINE_LOCALS;
+    if (access("staging_fault_bytes_keyword", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_BYTES_KEYWORD;
+    if (access("staging_fault_setup_identifier", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_SETUP_IDENTIFIER;
+    if (access("staging_fault_call_prefix", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_CALL_PREFIX;
+    if (access("staging_fault_inline_header", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_INLINE_HEADER;
+    if (access("staging_fault_argument_index", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_ARGUMENT_INDEX;
+    if (access("staging_fault_struct_literal", F_OK) == 0)
+        cleanup->ctx.test_failure = COMPILE_TEST_STRUCT_LITERAL;
+    if (access("staging_fault_struct_fill", F_OK) == 0)
+    {
+        cleanup->ctx.test_failure = COMPILE_TEST_STRUCT_FILL;
+        cleanup->ctx.test_countdown = 1; /* Fail the derived struct. */
+    }
+#endif
+    if (dry_compile_object_file(get_txt(origin), cleanup, 0))
+    {
+        *result = cleanup->ctx.programs[0].prog;
+        cleanup->ctx.programs[0].prog = NULL;
+    }
+    if (cleanup->ctx.resource_failed || cleanup->ctx.types.failed)
+        program_update_compile_failure("COMPILE_RESOURCE_FAILED", "Insufficient resources compiling the candidate.");
+    else if (cleanup->ctx.callback_failed)
+        program_update_compile_failure("COMPILE_CALLBACK_FAILED", "Compiler callback failed or invalidated the request.");
+    for (size_t i = 0; i < cleanup->ctx.num_diag; i++)
+    {
+        compile_check_diag_t *diag = &cleanup->ctx.diag[i];
+        program_update_compile_diagnostic(diag->file, diag->line, diag->warning, diag->message);
+    }
+    pop_stack(); /* Compiler context, including private type scratch. */
+} /* compile_update_candidate() */
+#endif
 
 /*-------------------------------------------------------------------------*/
 static object_t *
@@ -3392,6 +3834,9 @@ destruct (object_t *ob)
 #ifdef USE_PYTHON
     python_call_hook_object(PYTHON_HOOK_ON_OBJECT_DESTRUCTED, false, ob);
 #endif /* USE_PYTHON */
+#ifdef USE_BLUEPRINT_UPDATE
+    program_update_owner_destructed(ob);
+#endif
     ob->time_reset = 0;
 
     /* We need the object in memory */
@@ -3518,6 +3963,9 @@ destruct (object_t *ob)
     ob->contains = NULL;
     ob->flags &= ~O_ENABLE_COMMANDS;
     ob->flags |= O_DESTRUCTED;  /* must come last! */
+#ifdef USE_BLUEPRINT_UPDATE
+    program_dependencies_clear(ob);
+#endif
     if (command_giver == ob)
         command_giver = NULL;
 
@@ -5899,6 +6347,7 @@ f_set_driver_hook (svalue_t *sp)
             driver_hook[n] = *sp;
             driver_hook[n].x.closure_type = CLOSURE_LAMBDA;
             put_ref_object(&(driver_hook[n].u.lambda->base.ob), master_ob, "hook closure");
+            closure_register_dependencies(&driver_hook[n].u.lambda->base, CLOSURE_LAMBDA);
             break;
         }
         /* FALLTHROUGH */
@@ -6404,4 +6853,3 @@ put_limits (svalue_t* svp, bool def)
 } /* query_limits() */
 
 /***************************************************************************/
-

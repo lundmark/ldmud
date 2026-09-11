@@ -64,6 +64,7 @@
 #include "mregex.h"
 #include "mstrings.h"
 #include "object.h"
+#include "program_update.h"
 #include "otable.h"
 #include "pkg-python.h"
 #include "random.h"
@@ -610,8 +611,7 @@ cleanup_stuff (void)
             l = driver_hook[i].u.lambda;
             if (l->base.ob.type != T_OBJECT || l->base.ob.u.ob != master_ob)
             {
-                free_svalue(&(l->base.ob));
-                put_ref_object(&(l->base.ob), master_ob, "backend");
+                closure_set_bound_object(&l->base, CLOSURE_LAMBDA, svalue_object(master_ob));
             }
         }
     }
@@ -808,6 +808,9 @@ backend (void)
 
             if (game_is_being_shut_down)
             {
+#ifdef USE_BLUEPRINT_UPDATE
+                program_update_shutdown();
+#endif
                 command_giver = NULL;
                 clear_current_object();
                 return;
@@ -1018,6 +1021,9 @@ backend (void)
         if (time_to_call_heart_beat)
         {
             struct timeval cur_time;
+#ifdef USE_BLUEPRINT_UPDATE
+            program_update_detach();
+#endif
             gettimeofday(&cur_time, NULL);
             // Round the time. This prevents problems with tv_sec fluctuating between
             // values very near of whole seconds (e.g. .99999s and .000001s) which
@@ -1039,6 +1045,9 @@ backend (void)
              * correctly timed.
              */
             next_call_out_cycle();
+#ifdef USE_BLUEPRINT_UPDATE
+            program_update_process();
+#endif
 
             /* Do the timed events */
             if (!synch_heart_beats

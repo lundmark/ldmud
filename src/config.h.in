@@ -388,6 +388,16 @@
  */
 @cdef_use_json@ USE_JSON
 
+/* Experimental deferred blueprint update requests. */
+@cdef_blueprint_update@ USE_BLUEPRINT_UPDATE
+#define BLUEPRINT_UPDATE_MAX_INFLIGHT @val_blueprint_update_inflight@
+#define BLUEPRINT_UPDATE_MAX_OWNER @val_blueprint_update_owner@
+#define BLUEPRINT_UPDATE_MAX_TARGETS @val_blueprint_update_targets@
+#define BLUEPRINT_UPDATE_MAX_SCAN_OBJECTS @val_blueprint_update_scan_objects@
+#define BLUEPRINT_UPDATE_MAX_VARIABLE_SLOTS @val_blueprint_update_variable_slots@
+#define BLUEPRINT_UPDATE_MAX_BYTES @val_blueprint_update_bytes@
+#define BLUEPRINT_UPDATE_MAX_LITERAL_DEPTH @val_blueprint_update_literal_depth@
+
 /* Define this if you want Python support (assuming that your host
  * actually offers this).
  */

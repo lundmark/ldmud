@@ -568,6 +568,7 @@ struct_new_prototype ( string_t *name, string_t *prog_name )
         pSType->name = pSName;
         pSType->unique_name = NULL;
         pSType->prog_id = 0;
+        pSType->unpublished = MY_FALSE;
         pSType->num_members = 0;
         pSType->member = NULL;
         pSType->base = NULL;
@@ -593,10 +594,9 @@ struct_fill_prototype ( struct_type_t   *type
 
 /* Complete the struct prototype <type> with the given data and return
  * its pointer. If <member> is NULL, the member entries are left empty.
- * The references from the data are adopted, and the result is the
- * new typeobject with one reference.
- * When an error occurs, NULL is returned and the input data is freed,
- * including the prototype.
+ * On success the base and member references are adopted; the prototype's
+ * reference count is unchanged. On allocation failure NULL is returned
+ * and the prototype and all input references remain unchanged.
  */
 
 {
@@ -611,7 +611,14 @@ struct_fill_prototype ( struct_type_t   *type
 #endif
 
     if (num_members != 0)
+    {
+#if defined(DEBUG) && defined(BLUEPRINT_UPDATE_TESTING)
+        if (compile_update_test_fail(COMPILE_TEST_STRUCT_FILL))
+            pMembers = NULL;
+        else
+#endif
         pMembers = xalloc(STRUCT_TYPE_MEMBER_MEMSIZE(num_members));
+    }
     else
         pMembers = NULL;
 
@@ -637,23 +644,7 @@ struct_fill_prototype ( struct_type_t   *type
     }
     else
     {
-        free_struct_name(type->name);
-
-        if (base)
-            free_struct_type(base);
-
-        if (member != NULL)
-        {
-            for (num = 0; num < num_members; num++)
-            {
-                free_struct_member_data(&member[num]);
-            }
-        }
-
-        xfree(type);
-
-        num_struct_type--;
-        size_struct_type -= STRUCT_TYPE_MEMSIZE;
+        return NULL;
     }
 
     return type;
@@ -679,10 +670,21 @@ struct_new_type ( string_t        *name
     struct_type_t * pSType;
 
     pSType = struct_new_prototype(name, prog_name);
-    if (pSType != NULL)
-        pSType = struct_fill_prototype(pSType, prog_id, base, num_members, member);
+    if (pSType != NULL
+     && struct_fill_prototype(pSType, prog_id, base, num_members, member))
+        return pSType;
 
-    return pSType;
+    /* Neither a failed prototype allocation nor a failed fill adopts
+     * these references. The name arguments were consumed by new_prototype.
+     */
+    if (pSType)
+        free_struct_type(pSType);
+    if (base)
+        free_struct_type(base);
+    if (member)
+        for (int num = 0; num < num_members; num++)
+            free_struct_member_data(&member[num]);
+    return NULL;
 } /* struct_new_type() */
 
 /*-------------------------------------------------------------------------*/
@@ -722,6 +724,7 @@ struct_publish_type ( struct_type_t * pSType )
         fatal("prototype typeobject passed to struct_publish_type().\n");
 #endif
 
+    pSType->unpublished = MY_FALSE;
     pSType->name->current = pSType;
 } /* struct_publish_type() */
 
@@ -1399,8 +1402,9 @@ count_struct_type_ref (struct_type_t * pSType)
 
         count_struct_name_ref(pSType->name);
         /* If we're a newer definition, remember us in the name. */
-        if (!pSType->name->current
-          || pSType->name->current->prog_id < pSType->prog_id)
+        if (!pSType->unpublished
+         && (!pSType->name->current
+          || pSType->name->current->prog_id < pSType->prog_id))
             pSType->name->current = pSType;
 
         if (pSType->unique_name)
@@ -1898,4 +1902,3 @@ f_struct_info (svalue_t *sp)
 } /* f_struct_info() */
 
 /***************************************************************************/
-

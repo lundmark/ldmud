@@ -11,6 +11,7 @@
 #include "driver.h"
 #include "typedefs.h"
 #include "svalue.h"
+#include "program_update.h"
 
 /* --- Coroutine Configuration --- */
 enum
@@ -68,6 +69,9 @@ struct coroutine_s
 {
     int ref;                        /* Reference count.               */
     enum coroutine_state state;     /* State of the coroutine.        */
+#ifdef USE_BLUEPRINT_UPDATE
+    program_dependency_t dependency;
+#endif
 
     svalue_t ob;                    /* The corresponding object.      */
     program_t *prog;                /* Current program.               */

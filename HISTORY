@@ -4,12 +4,21 @@ the host system.
 
 For a detailed list of all changes see the file CHANGELOG.
 
+Unreleased
     - New Efuns:
        + Optional async_write() and async_save_object() provide bounded FIFO
          background file writes with deferred completion callbacks. Object
          serialization remains synchronous. Enable with --enable-use-async-io
          and install the ldmud-async-io companion executable with the driver.
          Orderly shutdown drains accepted requests after notify_shutdown().
+       + Optional update_blueprint() and update_blueprint_result() perform
+         deferred, atomic blueprint updates while preserving object identity
+         and live state, including variable addition, removal, and reordering.
+         Supported named native and Python handles follow current declarations;
+         incompatible dependencies reject the complete selected cohort.
+    - Mudlib Support:
+       + Added a reusable blueprint update coordinator with explicit operator
+         policy, bounded polling, and per-instance diagnostic reports.
 
 07-Jul-2025 (LDMud Team) -- 3.6.8
     - Fixed Crashes:
